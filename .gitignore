@@ -1,0 +1,11 @@
+# Python bytecode and local test caches
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# Local environment and operating system artifacts
+.env
+.env.*
+!.env.example
+.DS_Store

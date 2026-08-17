@@ -1,0 +1,17 @@
+{
+  "name": "delivery-task-planner",
+  "version": "0.1.0",
+  "description": "Create delivery projects, stages, modules, and dependency-aware tasks, and write them to the Universe delivery board. Task execution starts only from the delivery board.",
+  "author": {
+    "name": "Universe Team"
+  },
+  "skills": "./skills/",
+  "mcpServers": {
+    "delivery-task-planner": {
+      "command": "python3",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/server.py"
+      ]
+    }
+  }
+}

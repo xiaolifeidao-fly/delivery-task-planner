@@ -1,0 +1,4 @@
+interface:
+  display_name: "需求测试用例与总体测试"
+  short_description: "并行设计需求测试用例，按指令执行跨任务总体真实验收与报告"
+  default_prompt: "Use $delivery-requirement-testing to design requirement test cases first, then run the overall acceptance test when instructed."

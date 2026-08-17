@@ -1,0 +1,4 @@
+interface:
+  display_name: "需求原型"
+  short_description: "生成、拆分并迭代需求 HTML 原型"
+  default_prompt: "使用 $requirement-prototype 为当前需求生成或修改拆分的 HTML 原型。"

@@ -1,0 +1,25 @@
+{
+  "name": "delivery-task-planner",
+  "version": "0.1.0+codex.20260817142518",
+  "description": "Create delivery structures and plan dependency-aware tasks.",
+  "author": {
+    "name": "Universe Team"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Delivery Task Planner",
+    "shortDescription": "Create projects and plan linked delivery tasks.",
+    "longDescription": "Create delivery projects, stages, modules, and tasks. Turn requirements into staged, dependency-aware task plans and write them to the delivery board. Task execution starts only from the delivery board.",
+    "developerName": "Universe Team",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "\u62c6\u89e3\u9700\u6c42\u5e76\u5199\u5165\u4efb\u52a1\u9762\u677f",
+      "\u521b\u5efa\u9879\u76ee\u3001\u9636\u6bb5\u6216\u6a21\u5757"
+    ]
+  },
+  "mcpServers": "./.mcp.json"
+}
