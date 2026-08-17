@@ -2997,27 +2997,16 @@ class ExecutionBridge:
 
     @staticmethod
     def _resolve_task_board_api(explicit_url: str, origin: str, token: str, program_id: int) -> str:
-        """Prefer a stable backend endpoint over a browser development proxy."""
-        candidates: list[str] = []
-        if explicit_url:
-            candidates.append(explicit_url)
-        parsed = urlparse(origin)
-        if parsed.hostname in {"localhost", "127.0.0.1", "::1"}:
-            candidates.extend(["http://127.0.0.1:8691", "http://127.0.0.1:10001"])
-        candidates.append(origin)
-        seen: set[str] = set()
+        """Use the configured bridge target, never a browser-provided address."""
+        del explicit_url, origin
+        candidates = [planner.bridge_api_url()]
         last_error: Exception | None = None
         for candidate in candidates:
-            if not candidate:
-                continue
             try:
                 normalized = planner.normalize_api_url(candidate)
             except planner.ToolFailure as exc:
                 last_error = exc
                 continue
-            if normalized in seen:
-                continue
-            seen.add(normalized)
             config = {
                 "api_url": normalized,
                 "key": token,

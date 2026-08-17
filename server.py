@@ -35,6 +35,9 @@ RUNTIME_TOKEN_HEADER_ENV = "DELIVERY_TASK_BOARD_TOKEN_HEADER"
 RUNTIME_USER_ID_ENV = "DELIVERY_TASK_BOARD_USER_ID"
 RUNTIME_API_URL_ENV = "DELIVERY_TASK_BOARD_API_URL"
 RUNTIME_WRITE_MODE_ENV = "DELIVERY_TASK_BOARD_WRITE_MODE"
+# The bridge must not infer its panel target from a browser-provided Origin.
+# A user can replace this default with set_task_board_api_url in the MCP plugin.
+DEFAULT_BRIDGE_API_URL = "http://47.110.3.214:8691/api"
 
 
 class ToolFailure(Exception):
@@ -103,6 +106,24 @@ def load_config() -> dict[str, Any]:
     if not config.get("api_url") or not config.get("key"):
         raise ToolFailure("配置不完整，请重新初始化接口地址和用户 key。")
     return config
+
+
+def bridge_api_url() -> str:
+    """Return the persisted bridge target, falling back to the fixed default.
+
+    The browser bridge intentionally reads only its dedicated override. Existing
+    planning-plugin configurations without that field must not silently keep an
+    old local development endpoint alive.
+    """
+    config_path = CONFIG_PATH if CONFIG_PATH.exists() else LEGACY_CONFIG_PATH
+    if not config_path.exists():
+        return DEFAULT_BRIDGE_API_URL
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        override = str(config.get("bridge_api_url") or "").strip()
+        return normalize_api_url(override) if override else DEFAULT_BRIDGE_API_URL
+    except (OSError, json.JSONDecodeError, ToolFailure):
+        return DEFAULT_BRIDGE_API_URL
 
 
 def normalize_api_url(value: str) -> str:
@@ -319,6 +340,7 @@ def initialize(arguments: dict[str, Any]) -> dict[str, Any]:
         raise ToolFailure("header 名只能包含字母、数字和连字符。")
     config = {
         "api_url": normalize_api_url(str(arguments.get("api_url", ""))),
+        "bridge_api_url": normalize_api_url(str(arguments.get("api_url", ""))),
         "key": key,
         "key_header": key_header,
         "user_id": str(arguments.get("user_id") or "task-executor").strip(),
@@ -338,6 +360,27 @@ def initialize(arguments: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def update_api_url(arguments: dict[str, Any]) -> dict[str, Any]:
+    """Update the normal MCP and HTTPS bridge panel targets together."""
+    if os.environ.get(RUNTIME_TOKEN_ENV, "").strip() and os.environ.get(RUNTIME_API_URL_ENV, "").strip():
+        raise ToolFailure("任务面板桥接运行态不能修改共享接口地址，请在普通 @delivery-task-planner 会话中执行此操作。")
+    config = load_config()
+    api_url = normalize_api_url(str(arguments.get("api_url", "")))
+    updated = {**config, "api_url": api_url, "bridge_api_url": api_url}
+    if arguments.get("verify_connection", True):
+        programs = request_api(updated, "GET", "/delivery/programs") or []
+    else:
+        programs = []
+    save_config(updated)
+    return {
+        "configured": True,
+        "apiUrl": api_url,
+        "bridgeApiUrl": api_url,
+        "verified": bool(arguments.get("verify_connection", True)),
+        "projectCount": len(programs),
+    }
+
+
 def configuration() -> dict[str, Any]:
     config_path = CONFIG_PATH if CONFIG_PATH.exists() else LEGACY_CONFIG_PATH
     if not config_path.exists():
@@ -346,6 +389,7 @@ def configuration() -> dict[str, Any]:
     return {
         "configured": True,
         "apiUrl": config["api_url"],
+        "bridgeApiUrl": bridge_api_url(),
         "keyHeader": config.get("key_header", "token"),
         "userId": config.get("user_id", "task-executor"),
         "key": "***" + config["key"][-4:] if len(config["key"]) >= 4 else "***",
@@ -1368,6 +1412,21 @@ TOOLS = [
         "annotations": {"readOnlyHint": True},
     },
     {
+        "name": "set_task_board_api_url",
+        "title": "更新任务面板接口地址",
+        "description": "更新普通 MCP 规划和本地 HTTPS 桥接器共用的任务面板接口地址；默认验证连接后保存。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "api_url": {"type": "string", "description": "服务根地址或以 /api 结尾的 API 地址"},
+                "verify_connection": {"type": "boolean", "default": True},
+            },
+            "required": ["api_url"],
+            "additionalProperties": False,
+        },
+        "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True},
+    },
+    {
         "name": "list_task_board_projects",
         "title": "列出任务面板项目",
         "description": "读取用户可以选择的交付项目。执行任务拆解前必须先选项目。",
@@ -1568,6 +1627,8 @@ def call_tool(name: str, arguments: dict[str, Any]) -> Any:
         return initialize(arguments)
     if name == "get_task_board_configuration":
         return configuration()
+    if name == "set_task_board_api_url":
+        return update_api_url(arguments)
     if name == "list_task_board_projects":
         return list_projects()
     if name == "create_task_board_project":

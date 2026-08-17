@@ -948,15 +948,16 @@ class HttpBridgeTest(unittest.TestCase):
     def test_request_config_uses_current_token_without_persisting_it(self):
         executor = bridge.ExecutionBridge(Path.cwd())
         with (
+            patch.object(bridge.planner, "bridge_api_url", return_value="http://47.110.3.214:8691/api"),
             patch.object(bridge.planner, "request_api", return_value=[]),
             patch.object(bridge.planner, "project_context", return_value={"program": {"programId": 1, "bizLine": "whatsapp"}}),
         ):
             config = executor.request_config(
-                {"programId": 1, "userId": "local-admin"},
-                "http://localhost:7893",
+                {"programId": 1, "userId": "local-admin", "apiUrl": "https://untrusted.example.test"},
+                "https://untrusted.example.test",
                 "current-user-token",
             )
-        self.assertEqual("http://127.0.0.1:8691/api", config["api_url"])
+        self.assertEqual("http://47.110.3.214:8691/api", config["api_url"])
         self.assertEqual("current-user-token", config["key"])
         self.assertEqual(1, config["_project_id"])
         self.assertNotIn("_biz_line", config)

@@ -43,6 +43,29 @@ class DeliveryTaskPlannerTest(unittest.TestCase):
         config = save_config.call_args.args[0]
         self.assertNotIn("biz_line", config)
         self.assertNotIn("bizLine", result)
+        self.assertEqual("http://example.test/api", config["bridge_api_url"])
+
+    def test_bridge_api_url_defaults_to_the_fixed_remote_service(self):
+        with tempfile.TemporaryDirectory() as directory:
+            missing = Path(directory) / "missing.json"
+            with patch.object(server, "CONFIG_PATH", missing), patch.object(server, "LEGACY_CONFIG_PATH", missing):
+                self.assertEqual("http://47.110.3.214:8691/api", server.bridge_api_url())
+
+    def test_update_api_url_updates_the_bridge_target_without_requiring_the_key_again(self):
+        config = {"api_url": "http://old.test/api", "key": "secret", "key_header": "token", "user_id": "planner"}
+        with (
+            patch.object(server, "load_config", return_value=config),
+            patch.object(server, "request_api", return_value=[{"programId": 4}]) as request_api,
+            patch.object(server, "save_config") as save_config,
+        ):
+            result = server.update_api_url({"api_url": "https://board.example.test"})
+
+        saved = save_config.call_args.args[0]
+        self.assertEqual("https://board.example.test/api", saved["api_url"])
+        self.assertEqual("https://board.example.test/api", saved["bridge_api_url"])
+        self.assertEqual("secret", saved["key"])
+        self.assertEqual("https://board.example.test/api", request_api.call_args.args[0]["api_url"])
+        self.assertEqual("https://board.example.test/api", result["bridgeApiUrl"])
 
     def test_preview_mode_blocks_task_board_writes(self):
         with patch.dict(os.environ, {server.RUNTIME_WRITE_MODE_ENV: "preview"}):

@@ -1,6 +1,6 @@
 {
   "name": "delivery-task-planner",
-  "version": "0.1.0+codex.20260817150426",
+  "version": "0.1.0+codex.20260817152722",
   "description": "Create delivery structures and plan dependency-aware tasks.",
   "author": {
     "name": "Universe Team"

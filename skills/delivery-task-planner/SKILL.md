@@ -32,7 +32,8 @@ description: 在 Universe 交付任务面板中创建项目、里程碑、模块
 先调用 `get_task_board_configuration`。
 
 - 上述项目级约束适用于任务面板桥接运行态。普通 MCP 规划工作流未配置时，要求用户提供接口地址和用户 key；header 名默认使用现有控制台约定 `token`，除非用户明确指定其他 header。
-- 调用 `initialize_task_board` 保存配置并验证连接。
+- 首次配置时调用 `initialize_task_board` 保存配置并验证连接；它也会将本地 HTTPS 桥接器的任务面板地址设为同一个地址。
+- 已配置后，仅需切换任务面板服务地址时调用 `set_task_board_api_url`，不要求再次提供或展示用户 key。该地址会同时作用于普通 MCP 和本地 HTTPS 桥接器。
 - 不要在回复中重复、展示或记录完整 key。
 
 ## 2. 创建或确定项目结构
