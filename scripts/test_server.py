@@ -50,6 +50,9 @@ class DeliveryTaskPlannerTest(unittest.TestCase):
                 (server.create_tasks, {"program_id": 1, "tasks": []}),
                 (server.create_stage, {"program_id": 1, "stage_key": "s1", "title": "阶段"}),
                 (server.create_module, {"program_id": 1, "module_key": "api", "name": "接口"}),
+                (server.update_task, {"program_id": 1, "item_key": "task-a", "title": "更新"}),
+                (server.update_task_dependencies, {"program_id": 1, "item_key": "task-a", "depends_on_item_keys": []}),
+                (server.delete_task_dependencies, {"program_id": 1, "item_key": "task-a", "predecessor_item_keys": ["task-b"]}),
             ):
                 with self.assertRaisesRegex(server.ToolFailure, "预览阶段"):
                     tool(arguments)
@@ -479,6 +482,102 @@ class DeliveryTaskPlannerTest(unittest.TestCase):
         self.assertEqual(2, body["version"])
         self.assertEqual("completed", body["status"])
 
+    def test_update_task_reads_current_version_and_patches_planning_fields(self):
+        current = {"itemKey": "task-a", "version": 7, "dependsOnItemKeys": []}
+        updated = {"itemKey": "task-a", "version": 8, "title": "更新后的标题"}
+        with (
+            patch.object(server, "load_config", return_value={"api_url": "http://example.test/api", "key": "secret"}),
+            patch.object(server, "request_api", side_effect=[current, updated]) as request,
+        ):
+            result = server.update_task({
+                "program_id": 1,
+                "item_key": "task-a",
+                "title": "更新后的标题",
+                "description": "调整任务范围",
+                "benefit_tags": ["可维护性", "可维护性", "交付清晰"],
+                "comment": "根据评审意见调整",
+            })
+
+        self.assertEqual(7, result["previousVersion"])
+        self.assertEqual(8, result["version"])
+        self.assertEqual("/delivery/item", request.call_args_list[0].args[2])
+        self.assertEqual({"programId": 1, "itemKey": "task-a"}, request.call_args_list[0].kwargs["query"])
+        self.assertEqual("/delivery/item/patch", request.call_args_list[1].args[2])
+        body = request.call_args_list[1].kwargs["body"]
+        self.assertEqual(7, body["version"])
+        self.assertEqual(["可维护性", "交付清晰"], body["benefitTags"])
+        self.assertEqual("根据评审意见调整", body["comment"])
+
+    def test_update_task_requirement_synchronizes_primary_owner(self):
+        current = {"itemKey": "task-a", "version": 2, "dependsOnItemKeys": []}
+        requirement = {"requirementKey": "req-b", "owners": [{"id": "owner-b", "name": "新负责人"}]}
+        with (
+            patch.object(server, "load_config", return_value={"api_url": "http://example.test/api", "key": "secret"}),
+            patch.object(server, "request_api", side_effect=[current, requirement, {"itemKey": "task-a", "version": 3}]) as request,
+        ):
+            server.update_task({"program_id": 1, "item_key": "task-a", "requirement_key": "req-b"})
+
+        body = request.call_args_list[-1].kwargs["body"]
+        self.assertEqual("req-b", body["requirementKey"])
+        self.assertEqual("owner-b", body["ownerId"])
+        self.assertEqual("新负责人", body["ownerName"])
+
+    def test_update_task_dependencies_replaces_all_direct_dependencies(self):
+        current = {"itemKey": "task-c", "version": 4, "dependsOnItemKeys": ["task-a"]}
+        with (
+            patch.object(server, "load_config", return_value={"api_url": "http://example.test/api", "key": "secret"}),
+            patch.object(server, "request_api", side_effect=[current, {"itemKey": "task-c", "version": 5}]) as request,
+        ):
+            server.update_task_dependencies({
+                "program_id": 1,
+                "item_key": "task-c",
+                "depends_on_item_keys": ["task-a", "task-b", "task-a"],
+                "dependency_source_sides": {"task-a": "right", "task-b": "bottom"},
+                "dependency_target_sides": {"task-a": "left", "task-b": "top"},
+            })
+
+        body = request.call_args_list[-1].kwargs["body"]
+        self.assertEqual(["task-a", "task-b"], body["dependsOnItemKeys"])
+        self.assertEqual({"task-a": "right", "task-b": "bottom"}, body["dependencySourceSides"])
+        self.assertEqual({"task-a": "left", "task-b": "top"}, body["dependencyTargetSides"])
+
+    def test_delete_task_dependencies_preserves_remaining_dependency_anchors(self):
+        current = {
+            "itemKey": "task-c",
+            "version": 4,
+            "dependsOnItemKeys": ["task-a", "task-b"],
+            "dependencySourceSides": {"task-a": "right", "task-b": "bottom"},
+            "dependencyTargetSides": {"task-a": "left", "task-b": "top"},
+        }
+        with (
+            patch.object(server, "load_config", return_value={"api_url": "http://example.test/api", "key": "secret"}),
+            patch.object(server, "request_api", side_effect=[current, {"itemKey": "task-c", "version": 5}]) as request,
+        ):
+            result = server.delete_task_dependencies({
+                "program_id": 1,
+                "item_key": "task-c",
+                "predecessor_item_keys": ["task-b"],
+            })
+
+        body = request.call_args_list[-1].kwargs["body"]
+        self.assertEqual(["task-a"], body["dependsOnItemKeys"])
+        self.assertEqual({"task-a": "right"}, body["dependencySourceSides"])
+        self.assertEqual({"task-a": "left"}, body["dependencyTargetSides"])
+        self.assertEqual(["task-b"], result["removedPredecessorItemKeys"])
+
+    def test_delete_task_dependencies_rejects_nonexistent_edge(self):
+        current = {"itemKey": "task-c", "version": 4, "dependsOnItemKeys": ["task-a"]}
+        with (
+            patch.object(server, "load_config", return_value={"api_url": "http://example.test/api", "key": "secret"}),
+            patch.object(server, "request_api", return_value=current),
+        ):
+            with self.assertRaisesRegex(server.ToolFailure, "不是当前任务的依赖"):
+                server.delete_task_dependencies({
+                    "program_id": 1,
+                    "item_key": "task-c",
+                    "predecessor_item_keys": ["task-b"],
+                })
+
     def test_only_planning_and_structure_tools_are_registered(self):
         names = {tool["name"] for tool in server.TOOLS}
         self.assertTrue({
@@ -486,6 +585,9 @@ class DeliveryTaskPlannerTest(unittest.TestCase):
             "create_task_board_stage",
             "create_task_board_module",
             "create_task_board_tasks",
+            "update_task_board_task",
+            "update_task_board_task_dependencies",
+            "delete_task_board_task_dependencies",
         }.issubset(names))
         self.assertTrue({
             "bind_task_execution_session",

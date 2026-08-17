@@ -751,6 +751,265 @@ def create_tasks(arguments: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def task_item_key(value: Any, label: str = "任务键") -> str:
+    item_key = str(value or "").strip()
+    if not item_key:
+        raise ToolFailure(f"{label}不能为空。")
+    if len(item_key) > 64 or not re.fullmatch(r"[A-Za-z0-9._/-]+", item_key):
+        raise ToolFailure(f"{label}格式无效。")
+    return item_key
+
+
+def current_task(config: dict[str, Any], program_id: int, item_key: str) -> dict[str, Any]:
+    item = request_api(
+        config,
+        "GET",
+        "/delivery/item",
+        query={"programId": program_id, "itemKey": item_key},
+    )
+    if not isinstance(item, dict):
+        raise ToolFailure("任务详情接口返回格式错误。")
+    if str(item.get("itemKey") or "").strip() != item_key:
+        raise ToolFailure("任务详情接口返回了不匹配的任务键。")
+    version = item.get("version")
+    if isinstance(version, bool):
+        raise ToolFailure("任务详情缺少有效版本号，请刷新后重试。")
+    try:
+        if int(version) <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        raise ToolFailure("任务详情缺少有效版本号，请刷新后重试。") from None
+    return item
+
+
+def normalized_benefit_tags(values: Any) -> list[str]:
+    if not isinstance(values, list):
+        raise ToolFailure("benefit_tags 必须是数组。")
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        tag = str(value).strip()
+        if not tag or tag in seen:
+            continue
+        if len(tag) > MAX_BENEFIT_TAG_LENGTH:
+            raise ToolFailure(f"收益标签不能超过 {MAX_BENEFIT_TAG_LENGTH} 个字符。")
+        seen.add(tag)
+        result.append(tag)
+    if not result:
+        raise ToolFailure("至少需要一个收益标签。")
+    if len(result) > MAX_BENEFIT_TAGS:
+        raise ToolFailure(f"收益标签最多 {MAX_BENEFIT_TAGS} 个。")
+    return result
+
+
+def normalized_dependency_keys(values: Any, label: str) -> list[str]:
+    if not isinstance(values, list):
+        raise ToolFailure(f"{label}必须是数组。")
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        item_key = task_item_key(value, label)
+        if item_key not in seen:
+            seen.add(item_key)
+            result.append(item_key)
+    return result
+
+
+def normalized_dependency_sides(
+    values: Any,
+    dependencies: list[str],
+    label: str,
+) -> dict[str, str]:
+    if not isinstance(values, dict):
+        raise ToolFailure(f"{label}必须是以前置任务键为 key 的对象。")
+    allowed = {"", "top", "right", "bottom", "left"}
+    result: dict[str, str] = {}
+    for raw_item_key, raw_side in values.items():
+        item_key = task_item_key(raw_item_key, f"{label}中的任务键")
+        if item_key not in dependencies:
+            raise ToolFailure(f"{label}包含的任务 {item_key} 不在当前依赖列表中。")
+        side = str(raw_side or "").strip().lower()
+        if side not in allowed:
+            raise ToolFailure(f"{label}的连线方向只能是 top、right、bottom、left 或空字符串。")
+        result[item_key] = side
+    return result
+
+
+def task_dependency_sides(current: dict[str, Any], field: str) -> dict[str, Any]:
+    values = current.get(field) or {}
+    if not isinstance(values, dict):
+        raise ToolFailure(f"任务详情中的 {field} 格式错误。")
+    return values
+
+
+def task_patch_body(
+    program_id: int,
+    item_key: str,
+    current: dict[str, Any],
+    actor_name: str,
+) -> dict[str, Any]:
+    return {
+        "programId": program_id,
+        "itemKey": item_key,
+        "version": int(current["version"]),
+        "actorName": actor_name,
+    }
+
+
+def patch_task(config: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
+    updated = request_api(config, "POST", "/delivery/item/patch", body=body)
+    if not isinstance(updated, dict):
+        raise ToolFailure("任务更新接口返回格式错误。")
+    return {
+        "programId": body["programId"],
+        "itemKey": body["itemKey"],
+        "previousVersion": body["version"],
+        "version": updated.get("version"),
+        "task": updated,
+    }
+
+
+def update_task(arguments: dict[str, Any]) -> dict[str, Any]:
+    assert_write_allowed("更新任务")
+    program_id, _ = program_value_of(arguments)
+    item_key = task_item_key(arguments.get("item_key"))
+    config = load_config()
+    current = current_task(config, program_id, item_key)
+    actor_name = str(arguments.get("actor_name") or "task-planner").strip() or "task-planner"
+    body = task_patch_body(program_id, item_key, current, actor_name)
+    updated_fields = 0
+
+    text_fields = {
+        "title": "title",
+        "description": "description",
+        "due_date": "dueDate",
+        "note": "note",
+    }
+    for argument_name, api_name in text_fields.items():
+        if argument_name not in arguments:
+            continue
+        value = arguments[argument_name]
+        if not isinstance(value, str):
+            raise ToolFailure(f"{argument_name}必须是字符串。")
+        body[api_name] = value
+        updated_fields += 1
+
+    if "kind" in arguments:
+        kind = str(arguments["kind"] or "").strip()
+        if kind not in VALID_KINDS:
+            raise ToolFailure("kind 只能是 gap、capability 或 asset。")
+        body["kind"] = kind
+        updated_fields += 1
+    if "benefit_tags" in arguments:
+        body["benefitTags"] = normalized_benefit_tags(arguments["benefit_tags"])
+        updated_fields += 1
+    if "sort_order" in arguments:
+        value = arguments["sort_order"]
+        if isinstance(value, bool):
+            raise ToolFailure("sort_order 必须是整数。")
+        try:
+            body["sortOrder"] = int(value)
+        except (TypeError, ValueError):
+            raise ToolFailure("sort_order 必须是整数。") from None
+        updated_fields += 1
+    if "stage_key" in arguments:
+        stage_key = str(arguments["stage_key"] or "").strip()
+        require_option(
+            stage_key,
+            request_api(config, "GET", "/delivery/stages", query={"programId": program_id}) or [],
+            "stageKey",
+            "阶段",
+        )
+        body["stageKey"] = stage_key
+        updated_fields += 1
+    if "module_key" in arguments:
+        module_key = str(arguments["module_key"] or "").strip()
+        require_option(
+            module_key,
+            request_api(config, "GET", "/delivery/modules", query={"programId": program_id}) or [],
+            "moduleKey",
+            "模块",
+        )
+        body["moduleKey"] = module_key
+        updated_fields += 1
+    if "requirement_key" in arguments:
+        requirement_key = str(arguments["requirement_key"] or "").strip()
+        if len(requirement_key) > 64:
+            raise ToolFailure("requirement_key 不能超过 64 个字符。")
+        owner_id, owner_name = primary_requirement_owner(config, program_id, requirement_key)
+        body["requirementKey"] = requirement_key
+        body["ownerId"] = owner_id
+        body["ownerName"] = owner_name
+        updated_fields += 1
+
+    comment = str(arguments.get("comment") or "").strip()
+    if comment:
+        body["comment"] = comment
+    if updated_fields == 0 and not comment:
+        raise ToolFailure("至少提供一个需要更新的任务字段或 comment。")
+    return patch_task(config, body)
+
+
+def update_task_dependencies(arguments: dict[str, Any]) -> dict[str, Any]:
+    assert_write_allowed("更新任务依赖")
+    program_id, _ = program_value_of(arguments)
+    item_key = task_item_key(arguments.get("item_key"))
+    dependencies = normalized_dependency_keys(arguments.get("depends_on_item_keys"), "depends_on_item_keys")
+    config = load_config()
+    current = current_task(config, program_id, item_key)
+    actor_name = str(arguments.get("actor_name") or "task-planner").strip() or "task-planner"
+    body = task_patch_body(program_id, item_key, current, actor_name)
+    body["dependsOnItemKeys"] = dependencies
+    if "dependency_source_sides" in arguments:
+        body["dependencySourceSides"] = normalized_dependency_sides(
+            arguments["dependency_source_sides"], dependencies, "dependency_source_sides"
+        )
+    if "dependency_target_sides" in arguments:
+        body["dependencyTargetSides"] = normalized_dependency_sides(
+            arguments["dependency_target_sides"], dependencies, "dependency_target_sides"
+        )
+    comment = str(arguments.get("comment") or "").strip()
+    if comment:
+        body["comment"] = comment
+    return patch_task(config, body)
+
+
+def delete_task_dependencies(arguments: dict[str, Any]) -> dict[str, Any]:
+    assert_write_allowed("删除任务依赖")
+    program_id, _ = program_value_of(arguments)
+    item_key = task_item_key(arguments.get("item_key"))
+    removed = normalized_dependency_keys(arguments.get("predecessor_item_keys"), "predecessor_item_keys")
+    if not removed:
+        raise ToolFailure("至少提供一条要删除的前置任务依赖。")
+    config = load_config()
+    current = current_task(config, program_id, item_key)
+    current_dependencies = normalized_dependency_keys(current.get("dependsOnItemKeys") or [], "当前任务依赖")
+    missing = sorted(set(removed) - set(current_dependencies))
+    if missing:
+        raise ToolFailure("以下前置任务不是当前任务的依赖：" + "、".join(missing))
+    removed_set = set(removed)
+    remaining = [dependency for dependency in current_dependencies if dependency not in removed_set]
+    actor_name = str(arguments.get("actor_name") or "task-planner").strip() or "task-planner"
+    body = task_patch_body(program_id, item_key, current, actor_name)
+    body["dependsOnItemKeys"] = remaining
+    source_sides = task_dependency_sides(current, "dependencySourceSides")
+    target_sides = task_dependency_sides(current, "dependencyTargetSides")
+    body["dependencySourceSides"] = {
+        dependency: str(source_sides.get(dependency) or "")
+        for dependency in remaining
+    }
+    body["dependencyTargetSides"] = {
+        dependency: str(target_sides.get(dependency) or "")
+        for dependency in remaining
+    }
+    comment = str(arguments.get("comment") or "").strip()
+    if comment:
+        body["comment"] = comment
+    result = patch_task(config, body)
+    result["removedPredecessorItemKeys"] = removed
+    return result
+
+
 def requirement_document(
     task: dict[str, Any],
     program_id: int,
@@ -1236,6 +1495,71 @@ TOOLS = [
         },
         "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False},
     },
+    {
+        "name": "update_task_board_task",
+        "title": "更新任务面板任务",
+        "description": "更新一条已存在任务的规划字段。工具会先读取当前版本后再写入；任务所属需求变化时自动同步该需求的首位负责人。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "program_id": {"type": "integer", "minimum": 1, "description": "项目表数值主键；会话已绑定项目时可省略"},
+                "item_key": {"type": "string", "description": "要更新的任务键"},
+                "stage_key": {"type": "string", "description": "阶段键；传空字符串可清空"},
+                "module_key": {"type": "string", "description": "模块键；传空字符串可清空"},
+                "requirement_key": {"type": "string", "description": "所属需求键；传空字符串可解除关联"},
+                "kind": {"type": "string", "enum": ["gap", "capability", "asset"]},
+                "title": {"type": "string"},
+                "description": {"type": "string"},
+                "benefit_tags": {"type": "array", "minItems": 1, "maxItems": 3, "items": {"type": "string", "minLength": 1, "maxLength": 32}},
+                "due_date": {"type": "string", "description": "YYYY-MM-DD；传空字符串可清空"},
+                "note": {"type": "string"},
+                "sort_order": {"type": "integer"},
+                "comment": {"type": "string", "description": "可选变更说明，会记录到任务时间线"},
+                "actor_name": {"type": "string", "default": "task-planner"},
+            },
+            "required": ["item_key"],
+            "additionalProperties": False,
+        },
+        "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False},
+    },
+    {
+        "name": "update_task_board_task_dependencies",
+        "title": "更新任务面板任务依赖",
+        "description": "替换一条任务的全部直接前置依赖。服务端会验证前置任务归属和整张依赖图无环；传空数组可清空全部依赖。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "program_id": {"type": "integer", "minimum": 1, "description": "项目表数值主键；会话已绑定项目时可省略"},
+                "item_key": {"type": "string", "description": "后置任务键，即需要设置前置依赖的任务"},
+                "depends_on_item_keys": {"type": "array", "items": {"type": "string"}, "description": "完整的直接前置任务键列表"},
+                "dependency_source_sides": {"type": "object", "additionalProperties": {"type": "string", "enum": ["", "top", "right", "bottom", "left"]}, "description": "可选：以前置任务键为 key 的出线边"},
+                "dependency_target_sides": {"type": "object", "additionalProperties": {"type": "string", "enum": ["", "top", "right", "bottom", "left"]}, "description": "可选：以前置任务键为 key 的入线边"},
+                "comment": {"type": "string", "description": "可选变更说明，会记录到任务时间线"},
+                "actor_name": {"type": "string", "default": "task-planner"},
+            },
+            "required": ["item_key", "depends_on_item_keys"],
+            "additionalProperties": False,
+        },
+        "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False},
+    },
+    {
+        "name": "delete_task_board_task_dependencies",
+        "title": "删除任务面板任务依赖",
+        "description": "从一条任务中删除指定的直接前置依赖，并保留其余依赖及连线锚点。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "program_id": {"type": "integer", "minimum": 1, "description": "项目表数值主键；会话已绑定项目时可省略"},
+                "item_key": {"type": "string", "description": "后置任务键，即需要删除其前置依赖的任务"},
+                "predecessor_item_keys": {"type": "array", "minItems": 1, "items": {"type": "string"}, "description": "要删除的直接前置任务键"},
+                "comment": {"type": "string", "description": "可选变更说明，会记录到任务时间线"},
+                "actor_name": {"type": "string", "default": "task-planner"},
+            },
+            "required": ["item_key", "predecessor_item_keys"],
+            "additionalProperties": False,
+        },
+        "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False},
+    },
 ]
 
 
@@ -1256,6 +1580,12 @@ def call_tool(name: str, arguments: dict[str, Any]) -> Any:
         return get_context(arguments)
     if name == "create_task_board_tasks":
         return create_tasks(arguments)
+    if name == "update_task_board_task":
+        return update_task(arguments)
+    if name == "update_task_board_task_dependencies":
+        return update_task_dependencies(arguments)
+    if name == "delete_task_board_task_dependencies":
+        return delete_task_dependencies(arguments)
     raise ToolFailure(f"未知工具：{name}")
 
 
