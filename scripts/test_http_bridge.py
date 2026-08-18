@@ -175,6 +175,17 @@ class HttpBridgeTest(unittest.TestCase):
         self.assertNotIn("只输出一条覆盖整条需求的任务", split)
         self.assertIn("拆解成多条任务: 是", split)
 
+    def test_single_task_planning_writes_the_complete_requirement_to_its_task_document(self):
+        prompt = bridge.build_planning_prompt(
+            1, {"program": {"name": "Universe"}}, "确认并写入",
+            requirement={"requirementKey": "req-a", "splitTasks": False}, write_allowed=True,
+        )
+
+        self.assertIn("唯一业务任务（prototypeTask=false）", prompt)
+        self.assertIn("直接创建或覆盖到该任务返回的 requirementDocumentPath", prompt)
+        self.assertIn("不能只留在需求级大纲", prompt)
+        self.assertIn("预生成任务需求文档: 是（单任务模式强制写入）", prompt)
+
     def test_planning_payload_defaults_to_splitting_for_older_clients(self):
         self.assertTrue(bridge.planning_requirement_of({"requirementKey": "req-a"})["splitTasks"])
         self.assertFalse(

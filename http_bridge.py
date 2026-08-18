@@ -714,13 +714,24 @@ def build_planning_prompt(
         ]
         if prototype_enabled else []
     )
-    # 任务需求文档是任务级的唯一需求沉淀。需要时在确认写入后预生成草稿，
-    # 后续“梳理需求”阶段继续在同一文件上补全，而不是再维护一份任务大纲。
+    # 任务需求文档是任务级的唯一需求沉淀。单任务模式无需额外勾选预生成：
+    # 唯一任务就是这条需求的交付载体，确认写入后必须直接收到完整需求文档。
     pre_generate_task_documents = bool(
         requirement.get("preGenerateTaskDocuments", requirement.get("generateTaskOutline", False))
     )
+    task_document_required = pre_generate_task_documents or not split_tasks
     task_document_lines = (
         [
+            "本需求已关闭“拆解成多条任务”：确认写入后，create_task_board_tasks 返回的唯一业务任务（prototypeTask=false）"
+            "就是本条需求的交付载体。必须把本轮梳理出的完整需求文档直接创建或覆盖到该任务返回的 requirementDocumentPath"
+            "（即 `doc/<moduleKey>/<itemKey>/文档.md`），不能只留在需求级大纲或任务数据库的简短说明中。",
+            "这条规则不依赖“预生成任务需求文档”开关；若同时生成原型图，不要把需求正文写进 prototypeTask=true 的原型任务文档。",
+            "正文需完整保留本轮已确认的需求背景与目标、范围与非目标、工程事实与落点、设计要求、验收标准、测试准备及待确认项；"
+            "后续任务“梳理需求”和“动作执行”只读取并继续完善这一份文件。",
+            "写完后在总结里列出唯一业务任务键和实际写入的需求文档路径。",
+        ]
+        if write_allowed and not split_tasks
+        else [
             "本需求已启用“预生成任务需求文档”。create_task_board_tasks 返回每条任务的 moduleKey 和 itemKey 后，"
             "必须为本轮每条新建任务创建或覆盖 `doc/<moduleKey>/<itemKey>/文档.md`，一条任务一份，不能另建任务需求大纲。",
             "这份文件是后续任务“梳理需求”和“动作执行”共同读取的唯一需求文档；先写可实施初稿，"
@@ -731,6 +742,11 @@ def build_planning_prompt(
         if write_allowed and pre_generate_task_documents
         else (
             [
+                "本需求已关闭“拆解成多条任务”：确认写入后会为唯一业务任务直接写入完整需求文档；"
+                "本轮仍处于预览，尚未取得任务键，先不要创建任务需求文档。",
+            ]
+            if not split_tasks
+            else [
                 "任务确认写入后，会为每条新建任务预生成 `doc/<moduleKey>/<itemKey>/文档.md` 作为需求梳理初稿；"
                 "本轮只做预览，先不要创建这些文件。",
             ]
@@ -762,7 +778,7 @@ def build_planning_prompt(
         f"需求键 requirement_key: {requirement_key or '未指定'}",
         f"任务起始阶段 phase: {requirement.get('startPhase') or 'requirement'}",
         f"拆解成多条任务: {'是' if split_tasks else '否（只建一条任务）'}",
-        f"预生成任务需求文档: {'是' if pre_generate_task_documents else '否（由任务梳理阶段创建）'}",
+        f"预生成任务需求文档: {'是（单任务模式强制写入）' if not split_tasks else '是' if task_document_required else '否（由任务梳理阶段创建）'}",
         f"拆解后生成原型图: {'是' if prototype_enabled else '否'}",
         f"需求名称: {requirement.get('name') or '未命名'}",
         f"主负责人: {requirement.get('owners') or '未指定'}",
