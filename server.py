@@ -783,10 +783,11 @@ def create_tasks(arguments: dict[str, Any]) -> dict[str, Any]:
                 f"批量写入在任务 {ref} 处停止：{exc}；"
                 f"已创建 {json.dumps(created, ensure_ascii=False)}；未创建 {pending}"
             ) from exc
+        created_item_key = result.get("itemKey", task["item_key"]) if isinstance(result, dict) else task["item_key"]
         created.append(
             {
                 "ref": ref,
-                "itemKey": result.get("itemKey", task["item_key"]) if isinstance(result, dict) else task["item_key"],
+                "itemKey": created_item_key,
                 "title": task["title"],
                 "benefitTags": task["benefit_tags"],
                 "ownerId": owner_id,
@@ -796,6 +797,7 @@ def create_tasks(arguments: dict[str, Any]) -> dict[str, Any]:
                 "requirementKey": requirement_key,
                 "prototypeTask": bool(task.get("prototype_task")),
                 "dependsOnItemKeys": dependencies,
+                "requirementDocumentPath": f"doc/{str(task['module_key']).strip() or 'module'}/{created_item_key}/文档.md",
             }
         )
     return {

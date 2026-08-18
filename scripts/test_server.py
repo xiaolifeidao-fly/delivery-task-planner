@@ -375,6 +375,7 @@ class DeliveryTaskPlannerTest(unittest.TestCase):
         ):
             result = server.create_tasks({"program_id": 1, "tasks": [{"ref": "a", "title": "A", "benefit_tags": ["自动化收益"], "depends_on": []}]})
         self.assertEqual([{"programId": 1, "itemKey": "task-a"}], result["sessionBindingsPending"])
+        self.assertEqual("doc/module/task-a/文档.md", result["created"][0]["requirementDocumentPath"])
 
     def test_created_tasks_write_readable_requirement_document(self):
         context = {
@@ -388,7 +389,7 @@ class DeliveryTaskPlannerTest(unittest.TestCase):
             patch.object(server, "project_context", return_value=context),
             patch.object(server, "request_api", return_value={"itemKey": "task-a"}) as request,
         ):
-            server.create_tasks({
+            result = server.create_tasks({
                 "program_id": 1,
                 "tasks": [{
                     "ref": "a", "title": "Build endpoint", "description": "Create the endpoint.", "benefit_tags": ["接口复用"],
@@ -399,6 +400,7 @@ class DeliveryTaskPlannerTest(unittest.TestCase):
         self.assertIn("# Build endpoint", body["requirementDocument"])
         self.assertIn("## 验收标准", body["requirementDocument"])
         self.assertIn("- Tests pass", body["requirementDocument"])
+        self.assertEqual("doc/api/task-a/文档.md", result["created"][0]["requirementDocumentPath"])
 
     def test_created_tasks_inherit_the_requirement_primary_owner(self):
         context = {"program": {"programId": 1}, "stages": [], "modules": [], "items": []}

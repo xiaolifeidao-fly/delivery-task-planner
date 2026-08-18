@@ -128,45 +128,32 @@ class HttpBridgeTest(unittest.TestCase):
 
         self.assertIn("doc/requirements/req-a/需求大纲.md", prompt)
 
-    def test_task_outline_lives_under_its_requirement_and_survives_a_round_trip(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            workspace = Path(temporary)
-            relative = bridge.requirement_task_outline_path_of("req-a", "billing-7f3c")
-            missing = bridge.outline_document(workspace, relative)
-            written = bridge.write_outline_document(workspace, relative, "# 任务大纲\n\n目标\n")
-
-        self.assertEqual("doc/requirements/req-a/billing-7f3c/需求大纲.md", relative.as_posix())
-        self.assertFalse(missing["exists"])
-        self.assertTrue(written["exists"])
-        self.assertIn("目标", written["markdown"])
-
-    def test_task_outline_rejects_keys_that_escape_the_workspace(self):
-        with self.assertRaisesRegex(bridge.BridgeFailure, "需求标识无效"):
-            bridge.requirement_task_outline_path_of("../../etc", "task-1")
-        with self.assertRaisesRegex(bridge.BridgeFailure, "任务标识无效"):
-            bridge.requirement_task_outline_path_of("req-a", "../../etc")
-
-    def test_planning_prompt_carries_the_per_task_outline_directory_only_when_enabled(self):
+    def test_planning_prompt_pre_generates_task_documents_only_when_enabled(self):
         prompt = bridge.build_planning_prompt(
             1, {"program": {"name": "Universe"}}, "确认并写入",
-            requirement={"requirementKey": "req-a", "generateTaskOutline": True}, write_allowed=True,
+            requirement={"requirementKey": "req-a", "preGenerateTaskDocuments": True}, write_allowed=True,
         )
         without = bridge.build_planning_prompt(
             1, {"program": {"name": "Universe"}}, "确认并写入",
             requirement={"requirementKey": "req-a"}, write_allowed=True,
         )
 
-        self.assertIn("doc/requirements/req-a/<任务键>/需求大纲.md", prompt)
-        self.assertIn("每个任务生成需求大纲: 是", prompt)
-        self.assertNotIn("doc/requirements/req-a/<任务键>/需求大纲.md", without)
-        self.assertIn("每个任务生成需求大纲: 否（只写需求级大纲）", without)
+        self.assertIn("doc/<moduleKey>/<itemKey>/文档.md", prompt)
+        self.assertIn("预生成任务需求文档: 是", prompt)
+        self.assertNotIn("doc/<moduleKey>/<itemKey>/文档.md", without)
+        self.assertIn("预生成任务需求文档: 否（由任务梳理阶段创建）", without)
 
-    def test_planning_payload_defaults_to_no_task_outline_for_older_clients(self):
-        self.assertFalse(bridge.planning_requirement_of({"requirementKey": "req-a"})["generateTaskOutline"])
+    def test_planning_payload_defaults_to_no_pre_generated_task_documents(self):
+        self.assertFalse(bridge.planning_requirement_of({"requirementKey": "req-a"})["preGenerateTaskDocuments"])
+        self.assertTrue(
+            bridge.planning_requirement_of(
+                {"requirementKey": "req-a", "requirementPreGenerateTaskDocuments": True},
+            )["preGenerateTaskDocuments"]
+        )
         self.assertTrue(
             bridge.planning_requirement_of(
                 {"requirementKey": "req-a", "requirementGenerateTaskOutline": True},
-            )["generateTaskOutline"]
+            )["preGenerateTaskDocuments"]
         )
 
     def test_planning_prompt_forces_a_single_task_when_splitting_is_off(self):
@@ -1754,6 +1741,7 @@ class HttpBridgeTest(unittest.TestCase):
             patch.object(bridge.planner, "request_api", side_effect=request_api),
             patch.object(bridge, "AppServerClient", return_value=fake_client),
             patch.object(bridge.threading, "Thread") as thread,
+            patch.object(executor, "_migrate_legacy_task_outline") as migrate_legacy_outline,
         ):
             result = executor.execute(
                 {"bizLine": "whatsapp", "programId": 1, "task": {"itemKey": "a", "title": "A", "version": 2, "phase": "development", "status": "todo"}},
@@ -1769,6 +1757,7 @@ class HttpBridgeTest(unittest.TestCase):
         self.assertEqual("doing", requests[patch_index][2]["status"])
         self.assertEqual("development", requests[bind_index][2]["phase"])
         self.assertEqual(0, requests[bind_index][2]["progress"])
+        migrate_legacy_outline.assert_called_once()
         thread.return_value.start.assert_called_once()
 
     def test_completed_turn_marks_session_and_task_completed(self):
@@ -1966,6 +1955,45 @@ class HttpBridgeTest(unittest.TestCase):
             ):
                 with self.assertRaises(bridge.BridgeFailure):
                     executor.requirement_document(1, "a", config=self.runtime_config())
+
+    def test_requirement_document_editor_writes_the_same_workspace_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            executor = bridge.ExecutionBridge(workspace)
+            with patch.object(
+                executor,
+                "_task_detail",
+                return_value={"requirementDocumentPath": "doc/api/a/文档.md"},
+            ):
+                result = executor.save_requirement_document(1, "a", "# API 需求\n\n待梳理", config=self.runtime_config())
+
+            saved = workspace / "doc/api/a/文档.md"
+            self.assertTrue(result["exists"])
+            self.assertEqual("doc/api/a/文档.md", result["path"])
+            self.assertEqual("# API 需求\n\n待梳理\n", saved.read_text(encoding="utf-8"))
+
+    def test_legacy_task_outline_is_migrated_without_overwriting_the_new_document(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            executor = bridge.ExecutionBridge(workspace)
+            task = {
+                "requirementKey": "req-a",
+                "itemKey": "api-1",
+                "moduleKey": "api",
+                "requirementDocumentPath": "doc/api/api-1/文档.md",
+            }
+            legacy = workspace / "doc/requirements/req-a/api-1/需求大纲.md"
+            legacy.parent.mkdir(parents=True)
+            legacy.write_text("# 旧任务大纲\n\n保留这段内容", encoding="utf-8")
+
+            destination = executor._migrate_legacy_task_outline(task)
+
+            self.assertEqual((workspace / "doc/api/api-1/文档.md").resolve(), destination)
+            self.assertEqual("# 旧任务大纲\n\n保留这段内容", destination.read_text(encoding="utf-8"))
+            self.assertTrue(legacy.is_file())
+            destination.write_text("# 已完成的新文档\n", encoding="utf-8")
+            self.assertIsNone(executor._migrate_legacy_task_outline(task))
+            self.assertEqual("# 已完成的新文档\n", destination.read_text(encoding="utf-8"))
 
     def test_interrupted_turn_marks_session_and_task_blocked(self):
         requests = []

@@ -8,7 +8,7 @@ All six delivery-board skills are maintained here under `skills/`. Four cover th
 
 | Skill | Scope |
 | --- | --- |
-| `delivery-task-planner` | Break a requirement into tasks and write them to the board (preview first, write only after the user confirms in the board); keeps the requirement's outline at `doc/requirements/<requirementKey>/需求大纲.md` and one outline per task at `doc/requirements/<requirementKey>/<itemKey>/需求大纲.md` |
+| `delivery-task-planner` | Break a requirement into tasks and write them to the board (preview first, write only after the user confirms in the board); keeps the requirement outline at `doc/requirements/<requirementKey>/需求大纲.md` and can pre-generate each task's sole requirement document at `doc/<moduleKey>/<itemKey>/文档.md` |
 | `delivery-requirement-grooming` | A task's `requirement` phase — produce `doc/<module>/<itemKey>/文档.md` |
 | `delivery-action-execution` | A task's `development` phase — implement against that document; the final reply is stored as the task's action output |
 | `delivery-testing-report` | A task's `testing` phase — verify against the acceptance criteria; the final reply is stored as the task's test report (8MB limit) |
