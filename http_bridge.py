@@ -736,9 +736,12 @@ def build_planning_prompt(
         ]
         if prototype_enabled else []
     )
-    # 每条任务还要留一份自己的需求大纲：任务面板可以直接打开和编辑它，执行阶段也靠它接住拆解时的判断。
+    # 每条任务的需求大纲默认不生成：只有需求上打开了这个开关，才让拆解会话逐条写文件。
+    task_outline_enabled = bool(requirement.get("generateTaskOutline"))
     task_outline_directory = (
-        (requirement_task_outline_path_of(requirement_key, "TASK").parent.parent).as_posix() if requirement_key else ""
+        (requirement_task_outline_path_of(requirement_key, "TASK").parent.parent).as_posix()
+        if requirement_key and task_outline_enabled
+        else ""
     )
     task_outline_lines = (
         [
@@ -781,6 +784,7 @@ def build_planning_prompt(
         f"需求键 requirement_key: {requirement_key or '未指定'}",
         f"任务起始阶段 phase: {requirement.get('startPhase') or 'requirement'}",
         f"拆解成多条任务: {'是' if split_tasks else '否（只建一条任务）'}",
+        f"每个任务生成需求大纲: {'是' if task_outline_enabled else '否（只写需求级大纲）'}",
         f"拆解后生成原型图: {'是' if prototype_enabled else '否'}",
         f"需求名称: {requirement.get('name') or '未命名'}",
         f"主负责人: {requirement.get('owners') or '未指定'}",
@@ -975,6 +979,8 @@ def planning_requirement_of(value: dict[str, Any]) -> dict[str, Any]:
         "startPhase": start_phase,
         # 老客户端不带这个字段时按拆解处理，保持既有行为。
         "splitTasks": bool(value.get("requirementSplitTasks", True)),
+        # 每条任务一份大纲是可选项，老客户端不带这个字段时按不生成处理。
+        "generateTaskOutline": bool(value.get("requirementGenerateTaskOutline")),
         "generatePrototype": bool(value.get("requirementGeneratePrototype")),
     }
 
@@ -4400,6 +4406,25 @@ class ExecutionBridge:
             active = self.active_runs.get(identity)
         return {"programId": program_id, "requirementKey": requirement_key, **document, "active": active is not None}
 
+    def save_requirement_outline(
+        self,
+        program_id: int,
+        requirement_key: str,
+        markdown: str,
+        biz_line: str = DEFAULT_BIZ_LINE,
+        config: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Overwrite one requirement's breakdown outline from the task board editor."""
+        config = request_scoped_config(config, biz_line, program_id)
+        # 与读取同一条校验：需求键必须真的属于当前项目，才允许落盘。
+        self._requirement_for_prototype(config, program_id, requirement_key)
+        text = markdown if markdown.endswith("\n") or not markdown.strip() else markdown + "\n"
+        document = write_outline_document(self.workspace, requirement_outline_path_of(requirement_key), text)
+        identity = self._planning_identity(program_id, requirement_key)
+        with self.lock:
+            active = self.active_runs.get(identity)
+        return {"programId": program_id, "requirementKey": requirement_key, **document, "active": active is not None}
+
     def requirement_prototype(
         self,
         program_id: int,
@@ -5941,6 +5966,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
             "/v1/codex/attachments",
             "/v1/codex/prototype-directory/open",
             "/v1/codex/task-outline",
+            "/v1/codex/requirement-outline",
             "/v1/codex/stop",
         }:
             self.json_response(404, {"error": "not found"})
@@ -5957,7 +5983,11 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 return
             length = int(self.headers.get("Content-Length") or 0)
             # 大纲编辑提交的是整篇 Markdown，比其他控制类请求大一个量级，单独放宽。
-            limit = MAX_EDITABLE_OUTLINE_BYTES + 4 * 1024 if path == "/v1/codex/task-outline" else 64 * 1024
+            limit = (
+                MAX_EDITABLE_OUTLINE_BYTES + 4 * 1024
+                if path in {"/v1/codex/task-outline", "/v1/codex/requirement-outline"}
+                else 64 * 1024
+            )
             if length <= 0 or length > limit:
                 raise BridgeFailure("请求体大小无效")
             payload = json.loads(self.rfile.read(length))
@@ -6002,6 +6032,16 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     raise BridgeFailure("需求大纲正文必须是字符串")
                 self.json_response(200, selected_bridge.save_task_outline(
                     program_id_of(payload.get("programId")), item_key, markdown, config=config,
+                ))
+            elif path == "/v1/codex/requirement-outline":
+                requirement_key = str(payload.get("requirementKey") or "").strip()
+                if not requirement_key:
+                    raise BridgeFailure("缺少需求标识")
+                markdown = payload.get("markdown")
+                if not isinstance(markdown, str):
+                    raise BridgeFailure("需求大纲正文必须是字符串")
+                self.json_response(200, selected_bridge.save_requirement_outline(
+                    program_id_of(payload.get("programId")), requirement_key, markdown, config=config,
                 ))
             elif path == "/v1/codex/prototype-directory/open":
                 item_key = str(payload.get("itemKey") or "").strip()

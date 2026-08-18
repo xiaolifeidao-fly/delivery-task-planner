@@ -146,13 +146,28 @@ class HttpBridgeTest(unittest.TestCase):
         with self.assertRaisesRegex(bridge.BridgeFailure, "任务标识无效"):
             bridge.requirement_task_outline_path_of("req-a", "../../etc")
 
-    def test_planning_prompt_carries_the_per_task_outline_directory_when_writing(self):
+    def test_planning_prompt_carries_the_per_task_outline_directory_only_when_enabled(self):
         prompt = bridge.build_planning_prompt(
+            1, {"program": {"name": "Universe"}}, "确认并写入",
+            requirement={"requirementKey": "req-a", "generateTaskOutline": True}, write_allowed=True,
+        )
+        without = bridge.build_planning_prompt(
             1, {"program": {"name": "Universe"}}, "确认并写入",
             requirement={"requirementKey": "req-a"}, write_allowed=True,
         )
 
         self.assertIn("doc/requirements/req-a/<任务键>/需求大纲.md", prompt)
+        self.assertIn("每个任务生成需求大纲: 是", prompt)
+        self.assertNotIn("doc/requirements/req-a/<任务键>/需求大纲.md", without)
+        self.assertIn("每个任务生成需求大纲: 否（只写需求级大纲）", without)
+
+    def test_planning_payload_defaults_to_no_task_outline_for_older_clients(self):
+        self.assertFalse(bridge.planning_requirement_of({"requirementKey": "req-a"})["generateTaskOutline"])
+        self.assertTrue(
+            bridge.planning_requirement_of(
+                {"requirementKey": "req-a", "requirementGenerateTaskOutline": True},
+            )["generateTaskOutline"]
+        )
 
     def test_planning_prompt_forces_a_single_task_when_splitting_is_off(self):
         preview = bridge.build_planning_prompt(
