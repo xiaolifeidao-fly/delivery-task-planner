@@ -101,6 +101,84 @@ class HttpBridgeTest(unittest.TestCase):
             executor._planning_identity(2, "req-b"),
         )
 
+    def test_requirement_outline_reads_the_one_file_the_planning_session_may_write(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            missing = bridge.requirement_outline_document(workspace, "req-a")
+            directory = workspace / "doc/requirements/req-a"
+            directory.mkdir(parents=True)
+            (directory / "需求大纲.md").write_text("# 需求大纲\n\n背景与目标", encoding="utf-8")
+
+            document = bridge.requirement_outline_document(workspace, "req-a")
+
+        self.assertEqual("doc/requirements/req-a/需求大纲.md", missing["path"])
+        self.assertFalse(missing["exists"])
+        self.assertTrue(document["exists"])
+        self.assertIn("背景与目标", document["markdown"])
+        self.assertTrue(document["updatedAt"])
+
+    def test_requirement_outline_rejects_a_key_that_escapes_the_workspace(self):
+        with self.assertRaisesRegex(bridge.BridgeFailure, "需求标识无效"):
+            bridge.requirement_outline_path_of("../../etc")
+
+    def test_planning_prompt_always_carries_the_requirement_outline_path(self):
+        prompt = bridge.build_planning_prompt(
+            1, {"program": {"name": "Universe"}}, "拆一下", requirement={"requirementKey": "req-a"},
+        )
+
+        self.assertIn("doc/requirements/req-a/需求大纲.md", prompt)
+
+    def test_task_outline_lives_under_its_requirement_and_survives_a_round_trip(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            relative = bridge.requirement_task_outline_path_of("req-a", "billing-7f3c")
+            missing = bridge.outline_document(workspace, relative)
+            written = bridge.write_outline_document(workspace, relative, "# 任务大纲\n\n目标\n")
+
+        self.assertEqual("doc/requirements/req-a/billing-7f3c/需求大纲.md", relative.as_posix())
+        self.assertFalse(missing["exists"])
+        self.assertTrue(written["exists"])
+        self.assertIn("目标", written["markdown"])
+
+    def test_task_outline_rejects_keys_that_escape_the_workspace(self):
+        with self.assertRaisesRegex(bridge.BridgeFailure, "需求标识无效"):
+            bridge.requirement_task_outline_path_of("../../etc", "task-1")
+        with self.assertRaisesRegex(bridge.BridgeFailure, "任务标识无效"):
+            bridge.requirement_task_outline_path_of("req-a", "../../etc")
+
+    def test_planning_prompt_carries_the_per_task_outline_directory_when_writing(self):
+        prompt = bridge.build_planning_prompt(
+            1, {"program": {"name": "Universe"}}, "确认并写入",
+            requirement={"requirementKey": "req-a"}, write_allowed=True,
+        )
+
+        self.assertIn("doc/requirements/req-a/<任务键>/需求大纲.md", prompt)
+
+    def test_planning_prompt_forces_a_single_task_when_splitting_is_off(self):
+        preview = bridge.build_planning_prompt(
+            1, {"program": {"name": "Universe"}}, "拆一下",
+            requirement={"requirementKey": "req-a", "splitTasks": False},
+        )
+        write = bridge.build_planning_prompt(
+            1, {"program": {"name": "Universe"}}, "确认并写入",
+            requirement={"requirementKey": "req-a", "splitTasks": False}, write_allowed=True,
+        )
+        split = bridge.build_planning_prompt(
+            1, {"program": {"name": "Universe"}}, "拆一下", requirement={"requirementKey": "req-a"},
+        )
+
+        self.assertIn("只输出一条覆盖整条需求的任务", preview)
+        self.assertIn("tasks 数组只能包含一条覆盖整条需求的任务", write)
+        self.assertIn("拆解成多条任务: 否（只建一条任务）", write)
+        self.assertNotIn("只输出一条覆盖整条需求的任务", split)
+        self.assertIn("拆解成多条任务: 是", split)
+
+    def test_planning_payload_defaults_to_splitting_for_older_clients(self):
+        self.assertTrue(bridge.planning_requirement_of({"requirementKey": "req-a"})["splitTasks"])
+        self.assertFalse(
+            bridge.planning_requirement_of({"requirementKey": "req-a", "requirementSplitTasks": False})["splitTasks"]
+        )
+
     def test_requirement_prototype_reads_only_bounded_html_files_in_its_fixed_directory(self):
         with tempfile.TemporaryDirectory() as temporary:
             workspace = Path(temporary)
@@ -626,6 +704,15 @@ class HttpBridgeTest(unittest.TestCase):
         self.assertEqual("current-user-token", environment[bridge.planner.RUNTIME_TOKEN_ENV])
         self.assertNotIn("DELIVERY_TASK_BOARD_BIZ_LINE", environment)
         self.assertNotIn("_project_id", environment)
+
+    def test_codex_environment_keeps_claude_in_write_mode_even_in_a_preview_turn(self):
+        config = self.runtime_config()
+
+        preview = bridge.codex_environment(config, 1, write_allowed=False)
+        claude_preview = bridge.codex_environment(config, 1, write_allowed=False, provider="claude")
+
+        self.assertEqual("preview", preview[bridge.planner.RUNTIME_WRITE_MODE_ENV])
+        self.assertEqual("write", claude_preview[bridge.planner.RUNTIME_WRITE_MODE_ENV])
 
     def test_codex_environment_rejects_a_different_project(self):
         with self.assertRaisesRegex(bridge.BridgeFailure, "项目不一致"):

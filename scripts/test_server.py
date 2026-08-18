@@ -472,6 +472,29 @@ class DeliveryTaskPlannerTest(unittest.TestCase):
         self.assertEqual("生成需求原型图", created_bodies[-1]["title"])
         self.assertEqual([created_bodies[1]["itemKey"]], created_bodies[-1]["dependsOnItemKeys"])
 
+    def test_create_tasks_refuses_multiple_tasks_when_the_requirement_disables_splitting(self):
+        context = {"program": {"programId": 1}, "stages": [], "modules": [], "items": []}
+
+        def request(_config, method, path, **kwargs):
+            if method == "GET" and path == "/delivery/requirement":
+                return {"requirementKey": "req-a", "splitTasks": False}
+            self.fail(f"unexpected request: {method} {path}")
+
+        with (
+            patch.object(server, "load_config", return_value={"api_url": "http://example.test/api", "key": "secret"}),
+            patch.object(server, "project_context", return_value=context),
+            patch.object(server, "request_api", side_effect=request),
+        ):
+            with self.assertRaisesRegex(server.ToolFailure, "只能创建一条"):
+                server.create_tasks({
+                    "program_id": 1,
+                    "requirement_key": "req-a",
+                    "tasks": [
+                        {"ref": "a", "title": "A", "benefit_tags": ["收益"], "depends_on": []},
+                        {"ref": "b", "title": "B", "benefit_tags": ["收益"], "depends_on": ["a"]},
+                    ],
+                })
+
     def test_bind_execution_session_uses_generic_fields(self):
         with (
             patch.object(server, "load_config", return_value={"api_url": "http://example.test/api", "key": "secret"}),

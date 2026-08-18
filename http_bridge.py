@@ -53,12 +53,17 @@ CLAUDE_TRANSCRIPTS_DIR = RUNTIME_DIR / "claude-transcripts"
 MAX_CLAUDE_TRANSCRIPT_TURNS = 60
 MAX_CONVERSATIONS_PER_TASK = 12
 MAX_CONVERSATION_ATTACHMENTS = 5
-MAX_CONVERSATION_ATTACHMENT_BYTES = 10 * 1024 * 1024
+MAX_CONVERSATION_ATTACHMENT_BYTES = 20 * 1024 * 1024
 MAX_CONVERSATION_UPLOAD_BYTES = MAX_CONVERSATION_ATTACHMENTS * MAX_CONVERSATION_ATTACHMENT_BYTES + 128 * 1024
 MAX_REQUIREMENT_DOCUMENT_BYTES = 2 * 1024 * 1024
 MAX_REQUIREMENT_PROTOTYPE_FILES = 30
 MAX_REQUIREMENT_PROTOTYPE_FILE_BYTES = 2 * 1024 * 1024
 MAX_REQUIREMENT_PROTOTYPE_TOTAL_BYTES = 8 * 1024 * 1024
+# 需求拆解沉淀下来的需求大纲：每条需求一份，落在该需求的文档目录里。
+REQUIREMENT_OUTLINE_FILE_NAME = "需求大纲.md"
+MAX_REQUIREMENT_OUTLINE_BYTES = 2 * 1024 * 1024
+# 面板直接编辑大纲时走 POST，请求体本身限制在 64KB 级别，这里留出同量级的正文上限。
+MAX_EDITABLE_OUTLINE_BYTES = 512 * 1024
 MAX_WORKSPACE_ARTIFACT_BYTES = 50 * 1024 * 1024
 PLANNING_ITEM_KEY = "__project_planning__"
 REQUIREMENT_TESTING_ITEM_KEY = "__requirement_testing__"
@@ -412,6 +417,26 @@ def document_path_of(task: dict[str, Any]) -> str:
     return f"doc/{task.get('moduleKey') or 'module'}/{task.get('itemKey') or 'item'}/文档.md"
 
 
+def task_outline_path_of(task: dict[str, Any]) -> str:
+    """任务需求大纲在工作区里的相对路径；任务还没挂到需求上时没有大纲。"""
+    requirement_key = str(task.get("requirementKey") or "").strip()
+    item_key = str(task.get("itemKey") or "").strip()
+    if not requirement_key or not item_key:
+        return ""
+    try:
+        return requirement_task_outline_path_of(requirement_key, item_key).as_posix()
+    except BridgeFailure:
+        return ""
+
+
+def outline_prompt_line(task: dict[str, Any]) -> list[str]:
+    """拆解时写下的任务大纲是执行阶段的上游上下文，存在与否都由执行器自己去读一次。"""
+    path = task_outline_path_of(task)
+    if not path:
+        return []
+    return [f"任务需求大纲: `{path}`（拆解这条任务时写下的目标、范围、落点和验收标准；存在就先读，它是需求文档的上游）"]
+
+
 def prototype_directory_of(task: dict[str, Any]) -> str:
     """Return the fixed task-local directory for generated prototype images."""
     document_path = Path(document_path_of(task))
@@ -528,6 +553,7 @@ def build_task_prompt(payload: dict[str, Any], workspace: Path | None = None) ->
         f"标题: {task['title']}",
         f"说明: {task.get('description') or '无'}",
         f"需求文档路径: {document_path}（本任务自己的文档，默认加载：开始前先完整读一遍）",
+        *outline_prompt_line(task),
         phase_instruction,
         *prototype_instruction,
         f"阶段: {task.get('stageKey') or '未指定'}",
@@ -600,6 +626,7 @@ def build_conversation_prompt(
             f"当前执行阶段: {phase}",
             f"当前阶段对应技能: {PHASE_SKILLS.get(phase, '按任务当前阶段处理')}",
             f"需求文档路径: {document_path}（本任务自己的文档，默认加载）。开始前请先读取此文件；梳理需求阶段应更新此文件。",
+            *outline_prompt_line(task),
             f"阶段: {task.get('stageKey') or '未指定'}",
             f"模块: {task.get('moduleKey') or '未指定'}",
             f"前置任务: {', '.join(dependencies) if dependencies else '无'}",
@@ -674,7 +701,7 @@ def build_planning_prompt(
         else [
             f"这是交付任务面板的需求梳理会话，请遵循 {PLANNING_SKILL} 技能。本轮只做梳理和预览，禁止写入任何任务面板数据。",
             "禁止调用 create_task_board_tasks、create_task_board_stage、create_task_board_module，也不要借 shell、HTTP 请求或手工改文件绕过任务面板写入限制；未确认前这些写入调用会被工具直接拒绝。",
-            "本轮的限制只针对写入：不要修改任何文件，也不要写任务面板数据。已授予项目工作目录及需求指定关联目录的只读勘察权限；可使用终端的只读命令和当前会话可用的读取工具列目录、搜索并读取代码、配置、技能和文档。某个可选读取工具不可用时，改用其他可用的只读工具继续勘察，不要因此停止。",
+            "本轮的限制只针对任务面板数据：不要写任务面板数据，除下面给出的需求大纲文件外也不要修改工作区里的其他文件。已授予项目工作目录及需求指定关联目录的只读勘察权限；可使用终端的只读命令和当前会话可用的读取工具列目录、搜索并读取代码、配置、技能和文档。某个可选读取工具不可用时，改用其他可用的只读工具继续勘察，不要因此停止。",
             "拆解前必须先勘察下方给出的项目工作目录：加载该目录下项目自己的开发技能（如 backend-development、web-development），读相关目录和现有实现，据此判断需求真正的落点。get_task_board_context 只给出面板侧上下文，不包含工程现状，不能拿它替代看代码。",
             "任务要落到勘察出的真实模块、目录或接口上，不要只按业务名词泛化出通用分层；工作区里找不到需求所指的模块时，先向用户说明并确认工作目录或范围，不要硬拆。",
             "请与用户对话把需求问清楚，然后输出一份可评审的拆解预览：先用 Markdown 表格列出「序号 / 任务标题 / 收益标签 / 负责人 / 里程碑 / 模块 / 类型 / 前置依赖」，每项给 1-3 个简短收益或作用标签；负责人统一展示为该需求的第一位主负责人（未指定则标为未指派）；再在表格下方逐条补充目标、范围和验收标准。",
@@ -682,6 +709,23 @@ def build_planning_prompt(
             "本需求已有任务列表在下方给出：预览里只列本轮打算新增的任务，不要重复已经存在的任务。",
             "回复结尾提示用户：确认无误后点击输入框旁的「确认并写入」按钮，需要调整就直接回复修改意见，本轮继续讨论不会写入任何数据。",
         ]
+    )
+    # 关掉「拆解成多条任务」时，整条需求只落一条任务：改动本来就不可分的小需求，拆开只会平添依赖和空跑。
+    split_tasks = bool(requirement.get("splitTasks", True))
+    split_lines = (
+        []
+        if split_tasks
+        else (
+            [
+                "本需求已关闭「拆解成多条任务」：调用 create_task_board_tasks 时 tasks 数组只能包含一条覆盖整条需求的任务，"
+                "该任务的 depends_on 传空数组；启用原型图时工具自动追加的原型任务不计入这条限制。",
+            ]
+            if write_allowed
+            else [
+                "本需求已关闭「拆解成多条任务」：预览里只输出一条覆盖整条需求的任务，任务表只有一行，不要拆成多条，也不要用依赖把它串成多步。"
+                "该任务的目标、范围和验收标准要覆盖整条需求。",
+            ]
+        )
     )
     prototype_enabled = bool(requirement.get("generatePrototype"))
     prototype_lines = (
@@ -692,15 +736,51 @@ def build_planning_prompt(
         ]
         if prototype_enabled else []
     )
+    # 每条任务还要留一份自己的需求大纲：任务面板可以直接打开和编辑它，执行阶段也靠它接住拆解时的判断。
+    task_outline_directory = (
+        (requirement_task_outline_path_of(requirement_key, "TASK").parent.parent).as_posix() if requirement_key else ""
+    )
+    task_outline_lines = (
+        [
+            f"任务需求大纲目录: `{task_outline_directory}/<任务键>/{REQUIREMENT_OUTLINE_FILE_NAME}`（相对项目工作目录）。",
+            "create_task_board_tasks 返回每条任务的 itemKey 之后，必须为本轮新建的每条任务覆盖写入这份大纲，一条任务一个文件，不要合并成一份。",
+            "任务大纲用 Markdown 组织，至少包含：任务目标、范围与不做的事、勘察到的落点（真实模块/目录/接口）、实现要点、前置依赖、验收标准。",
+            "写完后在总结里列出实际写入的大纲文件路径。",
+        ]
+        if write_allowed and task_outline_directory
+        else (
+            [
+                f"任务确认写入后，还会为每条任务生成一份任务需求大纲，落在 `{task_outline_directory}/<任务键>/{REQUIREMENT_OUTLINE_FILE_NAME}`；"
+                "本轮只做预览，先不要创建这些文件。",
+            ]
+            if task_outline_directory else []
+        )
+    )
+    # 需求大纲是这条需求跨会话的唯一沉淀：每一轮都带上路径，新开的会话靠读它把上下文接回来。
+    outline_path = requirement_outline_path_of(requirement_key).as_posix() if requirement_key else ""
+    outline_lines = (
+        [
+            f"需求大纲文档: `{outline_path}`（相对项目工作目录）。这是本条需求跨会话的唯一沉淀。",
+            "开工前必须先读这个文件：存在就把它当作本需求已确认的上下文，接着上一轮继续，不要重复问已经写清楚的内容；不存在就按本轮梳理结果新建。",
+            "每一轮梳理给出拆解预览之后，都要把最新的完整需求大纲覆盖写入该文件（只写这一个文件，不要在其他位置另建大纲）。",
+            "大纲用 Markdown 组织，至少包含：需求背景与目标、范围与不做的事、关键约束、勘察到的落点（真实模块/目录/接口）、任务拆解表（与预览一致）、验收标准、待确认问题。",
+            "确认写入任务后，也要把大纲里任务表的最终状态同步成实际落库的那一版。",
+        ]
+        if outline_path else []
+    )
     instruction = [
         *mode_lines,
+        *split_lines,
         *prototype_lines,
+        *outline_lines,
+        *task_outline_lines,
         "",
         f"项目 program_id: {program_id}",
         f"项目名称（仅供理解，不要作为参数）: {context.get('program', {}).get('name') or program_id}",
         workspace_instruction(workspace),
         f"需求键 requirement_key: {requirement_key or '未指定'}",
         f"任务起始阶段 phase: {requirement.get('startPhase') or 'requirement'}",
+        f"拆解成多条任务: {'是' if split_tasks else '否（只建一条任务）'}",
         f"拆解后生成原型图: {'是' if prototype_enabled else '否'}",
         f"需求名称: {requirement.get('name') or '未命名'}",
         f"主负责人: {requirement.get('owners') or '未指定'}",
@@ -893,6 +973,8 @@ def planning_requirement_of(value: dict[str, Any]) -> dict[str, Any]:
         "owners": str(value.get("requirementOwners") or "").strip()[:512],
         "assistants": str(value.get("requirementAssistants") or "").strip()[:512],
         "startPhase": start_phase,
+        # 老客户端不带这个字段时按拆解处理，保持既有行为。
+        "splitTasks": bool(value.get("requirementSplitTasks", True)),
         "generatePrototype": bool(value.get("requirementGeneratePrototype")),
     }
 
@@ -903,6 +985,73 @@ def requirement_prototype_directory_of(requirement_key: str) -> Path:
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value):
         raise BridgeFailure("需求原型标识无效")
     return Path("doc") / "requirements" / value / "prototype"
+
+
+def requirement_outline_path_of(requirement_key: str) -> Path:
+    """Return the one workspace-relative file a requirement breakdown outline may use."""
+    value = str(requirement_key or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value):
+        raise BridgeFailure("需求标识无效")
+    return Path("doc") / "requirements" / value / REQUIREMENT_OUTLINE_FILE_NAME
+
+
+def requirement_task_outline_path_of(requirement_key: str, item_key: str) -> Path:
+    """Return the one workspace-relative file a single task's outline may use.
+
+    任务大纲挂在需求资产目录下：doc/requirements/<需求键>/<任务键>/需求大纲.md，
+    和需求级大纲同根，便于一条需求的所有沉淀留在同一棵目录里。
+    """
+    requirement_value = str(requirement_key or "").strip()
+    item_value = str(item_key or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", requirement_value):
+        raise BridgeFailure("需求标识无效")
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", item_value):
+        raise BridgeFailure("任务标识无效")
+    return Path("doc") / "requirements" / requirement_value / item_value / REQUIREMENT_OUTLINE_FILE_NAME
+
+
+def outline_file_in_workspace(workspace: Path, relative: Path) -> Path:
+    """Resolve an outline path and refuse anything that escapes the project workspace."""
+    path = (workspace / relative).resolve()
+    try:
+        path.relative_to(workspace.resolve())
+    except ValueError as exc:
+        raise BridgeFailure("需求大纲文件超出当前项目") from exc
+    return path
+
+
+def outline_document(workspace: Path, relative: Path) -> dict[str, Any]:
+    """Read one outline markdown file, or report that it has not been written yet."""
+    path = outline_file_in_workspace(workspace, relative)
+    if not path.is_file():
+        return {"path": relative.as_posix(), "exists": False, "markdown": "", "updatedAt": ""}
+    if path.stat().st_size > MAX_REQUIREMENT_OUTLINE_BYTES:
+        raise BridgeFailure("需求大纲超过 2 MB，无法预览")
+    try:
+        markdown = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise BridgeFailure("需求大纲不是 UTF-8 文本") from exc
+    return {
+        "path": relative.as_posix(),
+        "exists": True,
+        "markdown": markdown,
+        "updatedAt": datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+
+
+def write_outline_document(workspace: Path, relative: Path, markdown: str) -> dict[str, Any]:
+    """Overwrite one outline markdown file from the task board."""
+    if len(markdown.encode("utf-8")) > MAX_EDITABLE_OUTLINE_BYTES:
+        raise BridgeFailure("需求大纲不能超过 512 KB")
+    path = outline_file_in_workspace(workspace, relative)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(markdown, encoding="utf-8")
+    return outline_document(workspace, relative)
+
+
+def requirement_outline_document(workspace: Path, requirement_key: str) -> dict[str, Any]:
+    """Read the outline markdown without letting the requirement key escape the workspace."""
+    return outline_document(workspace, requirement_outline_path_of(requirement_key))
 
 
 def requirement_prototype_item_key(requirement_key: str) -> str:
@@ -1282,8 +1431,14 @@ def assert_runtime_project(config: dict[str, Any], program_id: int) -> None:
         raise BridgeFailure("当前请求项目与任务面板入口项目不一致")
 
 
-def codex_environment(config: dict[str, Any], program_id: int, write_allowed: bool = True) -> dict[str, str]:
+def codex_environment(
+    config: dict[str, Any], program_id: int, write_allowed: bool = True, provider: str = "codex",
+) -> dict[str, str]:
     assert_runtime_project(config, program_id)
+    # Claude 一律以 bypass 身份启动：CLI 侧带 --dangerously-skip-permissions，
+    # 插件侧也不再降级成只读，避免预览轮拿不到写文件（需求大纲）所需的权限。
+    if ai_provider_of(provider) == "claude":
+        write_allowed = True
     return {
         # 需求梳理的预览轮次把插件降级成只读：提示词之外再加一道工具级的硬拦截。
         planner.RUNTIME_WRITE_MODE_ENV: "write" if write_allowed else "preview",
@@ -2375,7 +2530,7 @@ class ExecutionBridge:
         client = (
             active["client"]
             if active is not None and active.get("threadId") == thread_id
-            else create_ai_client(provider, self.workspace, environment=codex_environment(config, program_id, write_allowed=False))
+            else create_ai_client(provider, self.workspace, environment=codex_environment(config, program_id, write_allowed=False, provider=provider))
         )
         close_after = active is None or active.get("threadId") != thread_id
         try:
@@ -2472,7 +2627,7 @@ class ExecutionBridge:
                 provider,
                 self.workspace,
                 lambda event: self._publish_app_server_event(identity, event),
-                codex_environment(config, program_id, write_allowed=False),
+                codex_environment(config, program_id, write_allowed=False, provider=provider),
             )
             try:
                 thread_id, turn_id = client.start_task(
@@ -2507,7 +2662,7 @@ class ExecutionBridge:
                 provider,
                 self.workspace,
                 lambda event: self._publish_app_server_event(identity, event),
-                codex_environment(config, program_id, write_allowed=confirm_write),
+                codex_environment(config, program_id, write_allowed=confirm_write, provider=provider),
             )
             try:
                 client.resume_thread(thread_id)
@@ -4184,6 +4339,67 @@ class ExecutionBridge:
             },
         )
 
+    def _task_outline_path(self, config: dict[str, Any], program_id: int, item_key: str) -> tuple[Path, str]:
+        """Resolve one task's outline path from the board, never from caller-supplied paths."""
+        task = self._task_detail(config, program_id, item_key)
+        requirement_key = str(task.get("requirementKey") or "").strip()
+        if not requirement_key:
+            raise BridgeFailure("任务尚未挂到需求上，没有需求大纲")
+        return requirement_task_outline_path_of(requirement_key, str(task.get("itemKey") or "")), requirement_key
+
+    def task_outline(
+        self,
+        program_id: int,
+        item_key: str,
+        biz_line: str = DEFAULT_BIZ_LINE,
+        config: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Read the outline a single task keeps under its requirement's asset directory."""
+        config = request_scoped_config(config, biz_line, program_id)
+        relative, requirement_key = self._task_outline_path(config, program_id, item_key)
+        return {
+            "programId": program_id,
+            "itemKey": item_key,
+            "requirementKey": requirement_key,
+            **outline_document(self.workspace, relative),
+        }
+
+    def save_task_outline(
+        self,
+        program_id: int,
+        item_key: str,
+        markdown: str,
+        biz_line: str = DEFAULT_BIZ_LINE,
+        config: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Overwrite one task's outline from the task board editor."""
+        config = request_scoped_config(config, biz_line, program_id)
+        relative, requirement_key = self._task_outline_path(config, program_id, item_key)
+        text = markdown if markdown.endswith("\n") or not markdown.strip() else markdown + "\n"
+        return {
+            "programId": program_id,
+            "itemKey": item_key,
+            "requirementKey": requirement_key,
+            **write_outline_document(self.workspace, relative, text),
+        }
+
+    def requirement_outline(
+        self,
+        program_id: int,
+        requirement_key: str,
+        biz_line: str = DEFAULT_BIZ_LINE,
+        config: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Read the breakdown outline the planning session keeps for one requirement."""
+        config = request_scoped_config(config, biz_line, program_id)
+        # 走一遍需求校验：面板不能靠猜一个需求键就读到工作区里的任意文档。
+        self._requirement_for_prototype(config, program_id, requirement_key)
+        document = requirement_outline_document(self.workspace, requirement_key)
+        identity = self._planning_identity(program_id, requirement_key)
+        with self.lock:
+            active = self.active_runs.get(identity)
+        return {"programId": program_id, "requirementKey": requirement_key, **document, "active": active is not None}
+
     def requirement_prototype(
         self,
         program_id: int,
@@ -5475,6 +5691,46 @@ class BridgeHandler(BaseHTTPRequestHandler):
             except BridgeFailure as exc:
                 self.json_response(404, {"error": str(exc)})
             return
+        if parsed.path == "/v1/codex/requirement-outline":
+            if not self.allowed_origin():
+                self.json_response(403, {"error": "origin not allowed"})
+                return
+            query = parse_qs(parsed.query)
+            try:
+                program_id = program_id_of((query.get("programId") or [""])[0])
+                requirement_key = str((query.get("requirementKey") or [""])[0]).strip()
+                if not requirement_key:
+                    raise BridgeFailure("缺少需求标识")
+                selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
+                config = self.bridge.request_config(
+                    {"programId": program_id}, self.allowed_origin() or "", self.headers.get("token", "").strip(),
+                )
+                self.json_response(200, selected_bridge.requirement_outline(program_id, requirement_key, config=config))
+            except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
+                self.json_response(400, {"error": str(exc)})
+            except Exception as exc:
+                self.json_response(500, {"error": f"读取需求大纲失败：{exc}"})
+            return
+        if parsed.path == "/v1/codex/task-outline":
+            if not self.allowed_origin():
+                self.json_response(403, {"error": "origin not allowed"})
+                return
+            query = parse_qs(parsed.query)
+            try:
+                program_id = program_id_of((query.get("programId") or [""])[0])
+                item_key = str((query.get("itemKey") or [""])[0]).strip()
+                if not item_key:
+                    raise BridgeFailure("缺少任务标识")
+                selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
+                config = self.bridge.request_config(
+                    {"programId": program_id}, self.allowed_origin() or "", self.headers.get("token", "").strip(),
+                )
+                self.json_response(200, selected_bridge.task_outline(program_id, item_key, config=config))
+            except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
+                self.json_response(400, {"error": str(exc)})
+            except Exception as exc:
+                self.json_response(500, {"error": f"读取任务需求大纲失败：{exc}"})
+            return
         if parsed.path == "/v1/codex/requirement-prototype":
             if not self.allowed_origin():
                 self.json_response(403, {"error": "origin not allowed"})
@@ -5684,6 +5940,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
             "/v1/codex/requirement-testing/stop",
             "/v1/codex/attachments",
             "/v1/codex/prototype-directory/open",
+            "/v1/codex/task-outline",
             "/v1/codex/stop",
         }:
             self.json_response(404, {"error": "not found"})
@@ -5699,7 +5956,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 self.json_response(415, {"error": "application/json required"})
                 return
             length = int(self.headers.get("Content-Length") or 0)
-            if length <= 0 or length > 64 * 1024:
+            # 大纲编辑提交的是整篇 Markdown，比其他控制类请求大一个量级，单独放宽。
+            limit = MAX_EDITABLE_OUTLINE_BYTES + 4 * 1024 if path == "/v1/codex/task-outline" else 64 * 1024
+            if length <= 0 or length > limit:
                 raise BridgeFailure("请求体大小无效")
             payload = json.loads(self.rfile.read(length))
             if not isinstance(payload, dict):
@@ -5734,6 +5993,16 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 self.json_response(202, selected_bridge.send_requirement_testing(payload, config))
             elif path == "/v1/codex/requirement-testing/stop":
                 self.json_response(202, selected_bridge.stop_requirement_testing(payload, config))
+            elif path == "/v1/codex/task-outline":
+                item_key = str(payload.get("itemKey") or "").strip()
+                if not item_key:
+                    raise BridgeFailure("缺少任务标识")
+                markdown = payload.get("markdown")
+                if not isinstance(markdown, str):
+                    raise BridgeFailure("需求大纲正文必须是字符串")
+                self.json_response(200, selected_bridge.save_task_outline(
+                    program_id_of(payload.get("programId")), item_key, markdown, config=config,
+                ))
             elif path == "/v1/codex/prototype-directory/open":
                 item_key = str(payload.get("itemKey") or "").strip()
                 if not item_key:

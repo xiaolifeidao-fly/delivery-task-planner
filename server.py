@@ -241,10 +241,26 @@ def require_option(value: str, options: list[dict[str, Any]], key: str, label: s
         raise ToolFailure(f"{label}“{value}”不属于所选项目。")
 
 
+def requirement_record(config: dict[str, Any], program_id: int, requirement_key: str) -> dict[str, Any]:
+    """Read one requirement from the task board; empty dict when the batch has no requirement."""
+    if not requirement_key:
+        return {}
+    requirement = request_api(
+        config,
+        "GET",
+        "/delivery/requirement",
+        query={"programId": program_id, "requirementKey": requirement_key},
+    )
+    if not isinstance(requirement, dict):
+        raise ToolFailure("需求详情接口返回格式错误。")
+    return requirement
+
+
 def primary_requirement_owner(
     config: dict[str, Any],
     program_id: int,
     requirement_key: str,
+    requirement: dict[str, Any] | None = None,
 ) -> tuple[str, str]:
     """Return the requirement's first primary owner for task-level ownership.
 
@@ -253,14 +269,8 @@ def primary_requirement_owner(
     """
     if not requirement_key:
         return "", ""
-    requirement = request_api(
-        config,
-        "GET",
-        "/delivery/requirement",
-        query={"programId": program_id, "requirementKey": requirement_key},
-    )
-    if not isinstance(requirement, dict):
-        raise ToolFailure("需求详情接口返回格式错误，无法继承任务负责人。")
+    if requirement is None:
+        requirement = requirement_record(config, program_id, requirement_key)
     owners = requirement.get("owners") or []
     if not isinstance(owners, list):
         raise ToolFailure("需求负责人字段格式错误，无法继承任务负责人。")
@@ -716,10 +726,15 @@ def create_tasks(arguments: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(raw_tasks, list):
         raise ToolFailure("tasks 必须是数组。")
     refs, order = validate_tasks(raw_tasks, context, selected_stage, selected_module)
+    requirement = requirement_record(config, context["program"]["programId"], requirement_key)
+    # 需求关掉拆解开关时，一条需求只能落一条任务；原型任务由工具自己追加，不算模型拆出来的。
+    if requirement and not bool(requirement.get("splitTasks", True)) and len(refs) > 1:
+        raise ToolFailure("该需求已关闭「拆解成多条任务」，本次只能创建一条覆盖整条需求的任务。")
     owner_id, owner_name = primary_requirement_owner(
         config,
         context["program"]["programId"],
         requirement_key,
+        requirement,
     )
     if bool(arguments.get("generate_prototype")):
         refs, order = append_prototype_task(config, context, requirement_key, refs, order)
