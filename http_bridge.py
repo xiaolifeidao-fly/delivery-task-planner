@@ -26,7 +26,7 @@ from email.parser import BytesParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 import server as planner
 
@@ -53,6 +53,7 @@ CLAUDE_TRANSCRIPTS_DIR = RUNTIME_DIR / "claude-transcripts"
 MAX_CLAUDE_TRANSCRIPT_TURNS = 60
 MAX_CONVERSATIONS_PER_TASK = 12
 MAX_CONVERSATION_ATTACHMENTS = 5
+MAX_CONVERSATION_REFERENCES = 16
 MAX_CONVERSATION_ATTACHMENT_BYTES = 20 * 1024 * 1024
 MAX_CONVERSATION_UPLOAD_BYTES = MAX_CONVERSATION_ATTACHMENTS * MAX_CONVERSATION_ATTACHMENT_BYTES + 128 * 1024
 MAX_REQUIREMENT_DOCUMENT_BYTES = 2 * 1024 * 1024
@@ -106,6 +107,18 @@ CODEX_GLOBAL_STATE_PATH = Path.home() / ".codex" / ".codex-global-state.json"
 
 class BridgeFailure(Exception):
     pass
+
+
+def content_disposition_of(name: str, inline: bool = False) -> str:
+    """Build a browser-safe Content-Disposition header for arbitrary file names."""
+    cleaned = re.sub(r"[\r\n\"]", "", str(name)).strip() or "attachment"
+    suffix = Path(cleaned).suffix
+    safe_suffix = suffix if re.fullmatch(r"\.[A-Za-z0-9]{1,16}", suffix) else ""
+    ascii_stem = re.sub(r"[^A-Za-z0-9_-]", "_", Path(cleaned).stem.encode("ascii", "ignore").decode("ascii")).strip("_-")
+    fallback = f"{ascii_stem or 'download'}{safe_suffix}"
+    disposition = "inline" if inline else "attachment"
+    encoded = quote(cleaned, safe="!#$&+-.^_`|~")
+    return f"{disposition}; filename=\"{fallback}\"; filename*=UTF-8''{encoded}"
 
 
 def create_https_server(
@@ -394,6 +407,11 @@ def wrap_bridge_context(context_lines: list[str], spoken: str) -> str:
     return "\n".join([f"<{BRIDGE_CONTEXT_TAG}>", *context_lines, f"</{BRIDGE_CONTEXT_TAG}>", "", text])
 
 
+def with_mention_context(message: str, mention_context: list[str]) -> str:
+    """Wrap @-selected entities for an in-flight or follow-up turn only when needed."""
+    return wrap_bridge_context(mention_context, message) if mention_context else message
+
+
 def workspace_instruction(workspace: Path | None) -> str:
     """Point every phase at the project's bound working directory and its own dev skills.
 
@@ -415,6 +433,35 @@ def document_path_of(task: dict[str, Any]) -> str:
     if explicit:
         return explicit
     return f"doc/{task.get('moduleKey') or 'module'}/{task.get('itemKey') or 'item'}/文档.md"
+
+
+def document_revision_rule(document_path: str) -> str:
+    """需求文档是跨回合累积的文档，追加需求时最容易被整段覆盖成只剩本轮内容。"""
+    return (
+        f"`{document_path}` 是跨回合累积的文档，不是本轮回复的存档。要改它就必须："
+        "先把现有内容完整读一遍，再把本轮新增或调整的部分合并进去，最后整篇写回同一路径；"
+        "本轮没有讨论到的章节原样保留，只有用户明确要求删除的内容才能删。"
+        "禁止只把本轮追加的需求写进文件，那会把之前几轮的需求文档整段丢掉。"
+    )
+
+
+def follow_up_context_lines(task: dict[str, Any]) -> list[str]:
+    """续聊回合也要带上任务、阶段和文档纪律：首轮提示词可能已经被会话压缩掉了。"""
+    phase = str(task.get("phase") or "requirement")
+    lines = [
+        "这是同一条任务上的追加回合，任务和当前阶段都没有变化。",
+        f"任务键: {task.get('itemKey') or '未指定'}",
+        f"当前执行阶段: {phase}（对应技能：{PHASE_SKILLS.get(phase, '按任务当前阶段处理')}）",
+    ]
+    # 面板没给出文档路径也没给模块时，document_path_of 只能兜出一个 doc/module/... 的假路径；
+    # 那会把执行器引到错误的文件上，不如不提，让它沿用本会话里已经拿到的路径。
+    if str(task.get("requirementDocumentPath") or "").strip() or str(task.get("moduleKey") or "").strip():
+        document_path = document_path_of(task)
+        lines.extend([
+            f"需求文档路径: {document_path}（本任务唯一的需求文档）",
+            document_revision_rule(document_path),
+        ])
+    return lines
 
 
 def prototype_directory_of(task: dict[str, Any]) -> str:
@@ -533,6 +580,7 @@ def build_task_prompt(payload: dict[str, Any], workspace: Path | None = None) ->
         f"标题: {task['title']}",
         f"说明: {task.get('description') or '无'}",
         f"需求文档路径: {document_path}（本任务唯一的需求文档；默认加载：开始前先完整读一遍）",
+        document_revision_rule(document_path),
         phase_instruction,
         *prototype_instruction,
         f"阶段: {task.get('stageKey') or '未指定'}",
@@ -545,6 +593,9 @@ def build_task_prompt(payload: dict[str, Any], workspace: Path | None = None) ->
     execution_constraints = str(payload.get("executionConstraints") or "").strip()
     if execution_constraints:
         lines.extend(["", "本次队列的前置任务约束条件说明:", execution_constraints])
+    mention_context = payload.get("conversationMentionContext") or []
+    if isinstance(mention_context, list):
+        lines.extend(str(line) for line in mention_context if isinstance(line, str) and line.strip())
     follow_up = str(payload.get("followUp") or "").strip()
     if follow_up:
         lines.append("本上下文标记闭合之后的内容，是用户本轮追加的原话。")
@@ -588,6 +639,7 @@ def build_conversation_prompt(
     message: str,
     workspace: Path | None = None,
     requirement_documents: list[str] | None = None,
+    mention_context: list[str] | None = None,
 ) -> str:
     """Start an independent Codex thread with enough task context to be useful."""
     dependencies = task.get("dependsOnItemKeys") or []
@@ -605,15 +657,33 @@ def build_conversation_prompt(
             f"当前执行阶段: {phase}",
             f"当前阶段对应技能: {PHASE_SKILLS.get(phase, '按任务当前阶段处理')}",
             f"需求文档路径: {document_path}（本任务唯一的需求文档，默认加载）。开始前请先读取此文件；梳理需求阶段应在此基础上更新。",
+            document_revision_rule(document_path),
             f"阶段: {task.get('stageKey') or '未指定'}",
             f"模块: {task.get('moduleKey') or '未指定'}",
             f"前置任务: {', '.join(dependencies) if dependencies else '无'}",
             *sibling_document_lines(requirement_documents),
+            *(mention_context or []),
             "如果生成了用户需要查看或下载的文件、文档或图片，请在最终回复中用 Markdown 链接列出其工作区相对路径。",
             "本上下文标记闭合之后的内容，是用户本轮输入的原文。",
         ],
         message,
     )
+
+
+def requirement_outline_rule_lines(outline_path: str) -> list[str]:
+    """需求大纲的读写纪律。追加需求时最容易被写成只剩本轮那段，所以每一轮都要重申。"""
+    if not outline_path:
+        return []
+    return [
+        f"需求大纲文档: `{outline_path}`（相对项目工作目录）。这是本条需求跨会话的唯一沉淀。",
+        "开工前必须先读这个文件：存在就把它当作本需求已确认的上下文，接着上一轮继续，不要重复问已经写清楚的内容；不存在就按本轮梳理结果新建。",
+        "每一轮梳理给出拆解预览之后，都要把最新的完整需求大纲写回该文件（只写这一个文件，不要在其他位置另建大纲）。",
+        "写回是「读全文 → 合并本轮增量 → 整篇覆盖」：先完整读一遍现有大纲（用户可能在面板上直接编辑过），"
+        "把本轮追加或调整的需求并进对应章节，本轮没聊到的章节原样保留，只有用户明确要求删除的内容才能删。"
+        "禁止只把本轮追加的那段需求写进文件，那等于把之前几轮的需求大纲整段丢掉。",
+        "大纲用 Markdown 组织，至少包含：需求背景与目标、范围与不做的事、关键约束、勘察到的落点（真实模块/目录/接口）、任务拆解表（与预览一致）、验收标准、待确认问题。",
+        "确认写入任务后，也要把大纲里任务表的最终状态同步成实际落库的那一版。",
+    ]
 
 
 def build_planning_prompt(
@@ -626,6 +696,7 @@ def build_planning_prompt(
     requirement: dict[str, Any] | None = None,
     write_allowed: bool = False,
     workspace: Path | None = None,
+    mention_context: list[str] | None = None,
 ) -> str:
     """Give a project-level Codex turn the precise planner-tool contract and scope.
 
@@ -755,21 +826,56 @@ def build_planning_prompt(
     )
     # 需求大纲是这条需求跨会话的唯一沉淀：每一轮都带上路径，新开的会话靠读它把上下文接回来。
     outline_path = requirement_outline_path_of(requirement_key).as_posix() if requirement_key else ""
-    outline_lines = (
+    outline_lines = requirement_outline_rule_lines(outline_path)
+    # 被 @ 的历史需求：只给大纲产物地址，读不读、读哪一段由执行器按需决定。
+    references = requirement.get("references") or []
+    reference_lines = (
         [
-            f"需求大纲文档: `{outline_path}`（相对项目工作目录）。这是本条需求跨会话的唯一沉淀。",
-            "开工前必须先读这个文件：存在就把它当作本需求已确认的上下文，接着上一轮继续，不要重复问已经写清楚的内容；不存在就按本轮梳理结果新建。",
-            "每一轮梳理给出拆解预览之后，都要把最新的完整需求大纲覆盖写入该文件（只写这一个文件，不要在其他位置另建大纲）。",
-            "大纲用 Markdown 组织，至少包含：需求背景与目标、范围与不做的事、关键约束、勘察到的落点（真实模块/目录/接口）、任务拆解表（与预览一致）、验收标准、待确认问题。",
-            "确认写入任务后，也要把大纲里任务表的最终状态同步成实际落库的那一版。",
+            "本需求在详情里 @ 引用了下面这些历史需求。它们各自的需求大纲产物地址已列出（相对项目工作目录）：",
+            *(
+                f"- {item.get('name') or item.get('requirementKey')}"
+                f"（requirement_key: {item.get('requirementKey')}）: "
+                f"`{requirement_outline_path_of(str(item.get('requirementKey'))).as_posix()}`"
+                for item in references
+            ),
+            "这些文件不会随提示词发给你：需要参考时按上面的路径自行读取，并且只读与本需求真正相关的章节，不要为了凑上下文把它们整段搬进回复。",
+            "文件不存在说明那条需求还没沉淀大纲：如实说明，不要臆造它的内容。",
+            "引用只作为背景和既有约定的来源，本轮拆解的范围仍然只限当前这条需求。",
         ]
-        if outline_path else []
+        if references else []
     )
+    # 被 @ 的既有任务从当前项目目录重新解析，不能采信浏览器提交的任务标题或文档路径。
+    item_references = requirement.get("itemReferences") or []
+    items_by_key = {
+        str(item.get("itemKey") or ""): item
+        for item in context.get("items") or []
+        if isinstance(item, dict) and str(item.get("itemKey") or "")
+    }
+    item_reference_lines: list[str] = []
+    if item_references:
+        item_reference_lines.append("本需求在详情里 @ 引用了下面这些既有任务。需要参考时先读取对应任务需求文档：")
+        for reference in item_references:
+            item_key = str(reference.get("itemKey") or "")
+            item = items_by_key.get(item_key)
+            if item is None:
+                item_reference_lines.append(f"- {item_key}：当前项目中已找不到该任务，不能据此推断实现细节。")
+                continue
+            item_reference_lines.append(
+                f"- {item.get('title') or item_key}（item_key: {item_key}）: "
+                f"`{document_path_of(item)}`"
+            )
+        item_reference_lines.extend([
+            "这些任务仅作为已有实现和约定的参考，不能改变本轮拆解范围或重复创建同一项工作。",
+            "任务文档不存在时如实说明，不要臆造其中的实现细节。",
+        ])
     instruction = [
         *mode_lines,
         *split_lines,
         *prototype_lines,
         *outline_lines,
+        *reference_lines,
+        *item_reference_lines,
+        *(mention_context or []),
         *task_document_lines,
         "",
         f"项目 program_id: {program_id}",
@@ -783,6 +889,7 @@ def build_planning_prompt(
         f"需求名称: {requirement.get('name') or '未命名'}",
         f"主负责人: {requirement.get('owners') or '未指定'}",
         f"辅助人: {requirement.get('assistants') or '未指定'}",
+        f"@ 引用的历史需求: {'、'.join(str(item.get('name') or item.get('requirementKey')) for item in references) or '无'}",
         "需求详细信息:",
         str(requirement.get("detail") or "（未填写）"),
         "",
@@ -856,7 +963,7 @@ def build_requirement_testing_prompt(
     )
 
 
-def validate_planning_payload(value: Any) -> tuple[int, str, str, bool, str, str, str, str, str, bool, dict[str, Any], list[str], bool]:
+def validate_planning_payload(value: Any) -> tuple[int, str, str, bool, str, str, str, str, str, bool, dict[str, Any], list[str], list[dict[str, str]], bool]:
     if not isinstance(value, dict):
         raise BridgeFailure("请求体必须是 JSON 对象")
     program_id = program_id_of(value.get("programId"))
@@ -874,6 +981,7 @@ def validate_planning_payload(value: Any) -> tuple[int, str, str, bool, str, str
     if not isinstance(attachment_ids, list) or len(attachment_ids) > MAX_CONVERSATION_ATTACHMENTS:
         raise BridgeFailure("附件数量无效")
     attachment_ids = [str(attachment_id).strip() for attachment_id in attachment_ids if str(attachment_id).strip()]
+    chat_references = conversation_references_of(value.get("chatReferences"))
     # 只带附件不写字也是一次有效的追问，图片本身就是需求说明。
     if not message and not attachment_ids:
         raise BridgeFailure("请输入要拆解的需求")
@@ -896,6 +1004,7 @@ def validate_planning_payload(value: Any) -> tuple[int, str, str, bool, str, str
         fast_mode,
         requirement,
         attachment_ids,
+        chat_references,
         # 只有面板上的「确认并写入」会带上这个标记，其余轮次一律是只读的预览。
         bool(value.get("confirmWrite")),
     )
@@ -978,7 +1087,77 @@ def planning_requirement_of(value: dict[str, Any]) -> dict[str, Any]:
             value.get("requirementPreGenerateTaskDocuments", value.get("requirementGenerateTaskOutline", False))
         ),
         "generatePrototype": bool(value.get("requirementGeneratePrototype")),
+        "references": planning_requirement_references_of(value.get("requirementReferences")),
+        "itemReferences": planning_requirement_item_references_of(value.get("requirementItemReferences")),
     }
+
+
+def planning_requirement_references_of(value: Any) -> list[dict[str, str]]:
+    """Normalize the earlier requirements a new requirement @-mentions.
+
+    面板只传被 @ 的需求键和名字：正文按需从各自的大纲产物地址读取，
+    不把历史大纲整段塞进提示词。
+    """
+    if not isinstance(value, list):
+        return []
+    references: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for entry in value[:20]:
+        if not isinstance(entry, dict):
+            continue
+        requirement_key = str(entry.get("requirementKey") or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", requirement_key) or requirement_key in seen:
+            continue
+        seen.add(requirement_key)
+        references.append({
+            "requirementKey": requirement_key,
+            "name": str(entry.get("name") or "").strip()[:255] or requirement_key,
+        })
+    return references
+
+
+def planning_requirement_item_references_of(value: Any) -> list[dict[str, str]]:
+    """Normalize the existing tasks a requirement detail @-mentions.
+
+    Titles are deliberately not accepted from the browser. The planning prompt resolves
+    each task key against the current project catalog before exposing its document path.
+    """
+    if not isinstance(value, list):
+        return []
+    references: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for entry in value[:20]:
+        if not isinstance(entry, dict):
+            continue
+        item_key = str(entry.get("itemKey") or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", item_key) or item_key in seen:
+            continue
+        seen.add(item_key)
+        references.append({"itemKey": item_key})
+    return references
+
+
+def conversation_references_of(value: Any) -> list[dict[str, str]]:
+    """Normalize objects selected from a task or requirement chat @ menu.
+
+    The browser can only nominate keys. The bridge later fetches every record again,
+    so labels or arbitrary text supplied by a browser never become task context.
+    """
+    if not isinstance(value, list):
+        return []
+    references: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for entry in value[:MAX_CONVERSATION_REFERENCES]:
+        if not isinstance(entry, dict):
+            continue
+        kind = str(entry.get("kind") or "").strip()
+        key = str(entry.get("key") or "").strip()
+        pattern = r"[A-Za-z0-9_-]{1,64}" if kind == "requirement" else r"[A-Za-z0-9._-]{1,64}"
+        if kind not in {"requirement", "task"} or not re.fullmatch(pattern, key) or (kind, key) in seen:
+            continue
+        seen.add((kind, key))
+        references.append({"kind": kind, "key": key})
+    return references
 
 
 def requirement_prototype_directory_of(requirement_key: str) -> Path:
@@ -1212,6 +1391,7 @@ def validate_execute_payload(value: Any) -> dict[str, Any]:
     if len(follow_up) > 32 * 1024:
         raise BridgeFailure("追加要求不能超过 32KB")
     normalized["followUp"] = follow_up
+    normalized["conversationReferences"] = conversation_references_of(value.get("conversationReferences"))
     execution_constraints = str(value.get("executionConstraints") or "").strip()
     if len(execution_constraints) > 32 * 1024:
         raise BridgeFailure("任务约束条件说明不能超过 32KB")
@@ -1223,7 +1403,7 @@ def validate_execute_payload(value: Any) -> dict[str, Any]:
     return normalized
 
 
-def validate_conversation_payload(value: Any) -> tuple[int, str, str, str, bool, list[str], str, str, bool]:
+def validate_conversation_payload(value: Any) -> tuple[int, str, str, str, bool, list[str], str, str, bool, list[dict[str, str]]]:
     if not isinstance(value, dict):
         raise BridgeFailure("请求体必须是 JSON 对象")
     program_id = program_id_of(value.get("programId"))
@@ -1252,6 +1432,7 @@ def validate_conversation_payload(value: Any) -> tuple[int, str, str, str, bool,
     provider = ai_provider_of(value)
     reasoning_effort = reasoning_effort_of(value, provider)
     fast_mode = fast_mode_of(value, provider)
+    references = conversation_references_of(value.get("references"))
     return (
         program_id,
         item_key,
@@ -1262,6 +1443,7 @@ def validate_conversation_payload(value: Any) -> tuple[int, str, str, str, bool,
         model,
         reasoning_effort,
         fast_mode,
+        references,
     )
 
 
@@ -2220,6 +2402,7 @@ class ConversationAttachmentStore:
             "contentType": str(manifest.get("contentType") or "application/octet-stream"),
             "size": int(manifest.get("size") or 0),
             "isImage": bool(manifest.get("isImage")),
+            "relativePath": str(manifest.get("relativePath") or ""),
             "url": f"/v1/codex/attachments/{attachment_id}",
         }
 
@@ -2308,6 +2491,7 @@ class WorkspaceArtifactStore:
             "contentType": str(manifest.get("contentType") or "application/octet-stream"),
             "size": int(manifest.get("size") or 0),
             "isImage": bool(manifest.get("isImage")),
+            "relativePath": str(manifest.get("relativePath") or ""),
             "url": f"/v1/codex/artifacts/{artifact_id}",
         }
 
@@ -2580,11 +2764,13 @@ class ExecutionBridge:
             fast_mode,
             requirement,
             attachment_ids,
+            chat_references,
             confirm_write,
         ) = validate_planning_payload(raw)
         assert_runtime_project(config, program_id)
         biz_line = config_biz_line(config)
         context = planner.project_context(config, program_id)
+        mention_context = self._conversation_mention_context(config, program_id, chat_references, context)
         planner.require_option(selected_stage, context.get("stages") or [], "stageKey", "里程碑")
         planner.require_option(selected_module, context.get("modules") or [], "moduleKey", "模块")
         requirement_key = str(requirement.get("requirementKey") or "")
@@ -2602,7 +2788,18 @@ class ExecutionBridge:
             active["client"].steer_turn(
                 str(active["threadId"]),
                 str(active["turnId"]),
-                message_with_attachments(message, attachments),
+                message_with_attachments(
+                    with_mention_context(
+                        message,
+                        [
+                            *requirement_outline_rule_lines(
+                                requirement_outline_path_of(requirement_key).as_posix() if requirement_key else ""
+                            ),
+                            *mention_context,
+                        ],
+                    ),
+                    attachments,
+                ),
                 attachments,
                 request_id=active["client"].next_request_id(),
             )
@@ -2631,7 +2828,7 @@ class ExecutionBridge:
                 thread_id, turn_id = client.start_task(
                     title,
                     message_with_attachments(
-                        build_planning_prompt(program_id, context, message, selected_stage, selected_module, selected_kind, requirement, False, self.workspace),
+                        build_planning_prompt(program_id, context, message, selected_stage, selected_module, selected_kind, requirement, False, self.workspace, mention_context),
                         attachments,
                     ),
                     attachments,
@@ -2669,7 +2866,7 @@ class ExecutionBridge:
                 turn_id = client.start_turn(
                     thread_id,
                     message_with_attachments(
-                        build_planning_prompt(program_id, context, message, selected_stage, selected_module, selected_kind, requirement, confirm_write, self.workspace),
+                        build_planning_prompt(program_id, context, message, selected_stage, selected_module, selected_kind, requirement, confirm_write, self.workspace, mention_context),
                         attachments,
                     ),
                     attachments,
@@ -3655,6 +3852,12 @@ class ExecutionBridge:
         config = request_scoped_config(config, biz_line, program_id)
         biz_line = config_biz_line(config)
         context = planner.project_context(config, program_id)
+        payload["conversationMentionContext"] = self._conversation_mention_context(
+            config,
+            program_id,
+            payload.get("conversationReferences") or [],
+            context,
+        )
         task = next((item for item in context["items"] if item.get("itemKey") == requested_task["itemKey"]), None)
         if task is None:
             raise BridgeFailure("任务不存在")
@@ -4712,11 +4915,12 @@ class ExecutionBridge:
     def send_conversation(self, raw: Any, config: dict[str, Any] | None = None) -> dict[str, Any]:
         provider = ai_provider_of(raw)
         biz_line = biz_line_of(raw)
-        program_id, item_key, text, requested_thread_id, new_conversation, attachment_ids, model, reasoning_effort, fast_mode = validate_conversation_payload(raw)
+        program_id, item_key, text, requested_thread_id, new_conversation, attachment_ids, model, reasoning_effort, fast_mode, references = validate_conversation_payload(raw)
         config = request_scoped_config(config, biz_line, program_id)
         biz_line = config_biz_line(config)
         attachments = self.attachments.resolve(program_id, item_key, attachment_ids)
         message = message_with_attachments(text, attachments)
+        mention_context = self._conversation_mention_context(config, program_id, references)
         identity = task_identity(biz_line, program_id, item_key)
         with self.lock:
             active = self.active_runs.get(identity)
@@ -4725,7 +4929,13 @@ class ExecutionBridge:
                 raise BridgeFailure("该任务已有正在运行的 Codex 会话，请先停止或等待当前回合结束")
             client = active["client"]
             client.steer_turn(
-                active["threadId"], active["turnId"], message, attachments, request_id=client.next_request_id()
+                active["threadId"],
+                active["turnId"],
+                with_mention_context(
+                    message, [*follow_up_context_lines(active.get("task") or {"itemKey": item_key}), *mention_context]
+                ),
+                attachments,
+                request_id=client.next_request_id(),
             )
             self.progress.publish(identity, "message", "已追加要求", text or "已添加附件", "running")
             return {
@@ -4739,6 +4949,7 @@ class ExecutionBridge:
             }
 
         task = self._task_detail(config, program_id, item_key)
+        mentioned_message = with_mention_context(message, [*follow_up_context_lines(task), *mention_context])
         binding = self._session_binding(config, program_id, item_key, str(task.get("phase") or "requirement"), provider)
         current_thread_id = str((binding or {}).get("externalSessionId") or "")
         catalog = conversation_catalog(binding)
@@ -4749,7 +4960,7 @@ class ExecutionBridge:
             if binding and binding.get("status") == "running":
                 raise BridgeFailure("该任务已有正在运行的 Codex 会话，请先停止或等待当前回合结束")
             return self._start_new_conversation(
-                config, program_id, item_key, task, binding, message, attachments, model, provider, reasoning_effort, fast_mode
+                config, program_id, item_key, task, binding, message, attachments, model, provider, reasoning_effort, fast_mode, mention_context
             )
         thread_id = requested_thread_id or current_thread_id
         metadata = (binding or {}).get("metadata") or {}
@@ -4757,7 +4968,7 @@ class ExecutionBridge:
         if binding and binding.get("status") == "running" and thread_id == current_thread_id and running_turn_id:
             active = self._resume_active_turn(config, identity, task, binding, thread_id, running_turn_id, provider)
             client = active["client"]
-            client.steer_turn(thread_id, running_turn_id, message, attachments, request_id=client.next_request_id())
+            client.steer_turn(thread_id, running_turn_id, mentioned_message, attachments, request_id=client.next_request_id())
             self.progress.publish(identity, "message", "已追加要求", text or "已添加附件", "running")
             return {
                 "accepted": True,
@@ -4775,6 +4986,7 @@ class ExecutionBridge:
                     "programId": program_id,
                     "task": task,
                     "followUp": message,
+                    "conversationReferences": references,
                     "followUpAttachments": attachments,
                     "model": model,
                     "provider": provider,
@@ -4784,7 +4996,7 @@ class ExecutionBridge:
                 config=config,
             )
         return self._start_follow_up_turn(
-            config, program_id, item_key, task, binding, thread_id, message, attachments, model, provider, reasoning_effort, fast_mode
+            config, program_id, item_key, task, binding, thread_id, mentioned_message, attachments, model, provider, reasoning_effort, fast_mode
         )
 
     def stop_conversation(self, raw: Any, config: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -4828,6 +5040,75 @@ class ExecutionBridge:
         if not isinstance(task, dict) or not task.get("itemKey"):
             raise BridgeFailure("任务不存在")
         return task
+
+    def _conversation_mention_context(
+        self,
+        config: dict[str, Any],
+        program_id: int,
+        references: list[dict[str, str]],
+        project_context: dict[str, Any] | None = None,
+    ) -> list[str]:
+        """Load authoritative @ references and the requirement/task that connects them."""
+        if not references:
+            return []
+        context = project_context or planner.project_context(config, program_id)
+        items = [item for item in context.get("items") or [] if isinstance(item, dict)]
+        items_by_key = {str(item.get("itemKey") or ""): item for item in items}
+        requirement_cache: dict[str, dict[str, Any]] = {}
+        task_cache: dict[str, dict[str, Any]] = {}
+
+        def requirement_of(key: str) -> dict[str, Any]:
+            if key not in requirement_cache:
+                requirement_cache[key] = planner.requirement_record(config, program_id, key)
+            return requirement_cache[key]
+
+        def task_of(key: str) -> dict[str, Any]:
+            if key not in task_cache:
+                task_cache[key] = self._task_detail(config, program_id, key)
+            return task_cache[key]
+
+        def readable_detail(value: Any, limit: int = 6000) -> str:
+            text = str(value or "").strip()
+            return text if len(text) <= limit else f"{text[:limit]}…（已截断）"
+
+        lines = ["用户在本轮消息中 @ 了以下关联对象。它们是本轮的补充上下文，按需参考，不能改写当前任务或需求的边界："]
+        for reference in references:
+            kind = reference["kind"]
+            key = reference["key"]
+            if kind == "requirement":
+                requirement = requirement_of(key)
+                related_items = [item for item in items if str(item.get("requirementKey") or "") == key]
+                related_lines = [
+                    f"- {item.get('itemKey')}: {item.get('title') or item.get('itemKey')}"
+                    f"（{item.get('phase') or '-'}/{item.get('status') or '-'}；需求文档：{document_path_of(item)}）"
+                    for item in related_items[:30]
+                ]
+                lines.extend([
+                    f"@需求 {key}: {requirement.get('name') or key}",
+                    "需求详情:",
+                    readable_detail(requirement.get("detail")) or "（未填写）",
+                    "该需求关联的任务:",
+                    *(related_lines or ["- 暂无任务"]),
+                ])
+                continue
+            task = task_of(key)
+            requirement_key = str(task.get("requirementKey") or "").strip()
+            lines.extend([
+                f"@任务 {key}: {task.get('title') or key}",
+                f"任务说明: {readable_detail(task.get('description'), 4000) or '（未填写）'}",
+                f"当前阶段: {task.get('phase') or 'requirement'}/{task.get('status') or 'todo'}",
+                f"需求文档: {document_path_of(task)}",
+            ])
+            if requirement_key:
+                requirement = requirement_of(requirement_key)
+                lines.extend([
+                    f"所属需求 {requirement_key}: {requirement.get('name') or requirement_key}",
+                    "所属需求详情:",
+                    readable_detail(requirement.get("detail")) or "（未填写）",
+                ])
+            elif key in items_by_key:
+                lines.append("所属需求: 未关联")
+        return lines
 
     def _session_binding(
         self,
@@ -4892,6 +5173,7 @@ class ExecutionBridge:
         provider: str = "codex",
         reasoning_effort: str = "",
         fast_mode: bool = False,
+        mention_context: list[str] | None = None,
     ) -> dict[str, Any]:
         identity = task_identity(config_biz_line(config), program_id, item_key)
         with self.lock:
@@ -4922,7 +5204,7 @@ class ExecutionBridge:
             )
             thread_id, turn_id = client.start_task(
                 title,
-                build_conversation_prompt(program_id, updated_task, text, self.workspace, catalog),
+                build_conversation_prompt(program_id, updated_task, text, self.workspace, catalog, mention_context),
                 attachments,
                 model,
                 reasoning_effort=reasoning_effort,
@@ -5247,7 +5529,10 @@ class ExecutionBridge:
                 "actorName": f"{provider}-http-bridge",
             }
             if output_field:
-                patch_body[output_field] = execution_output_text
+                # 追加回合只产出增量：覆盖会把同一阶段前几轮的产物文档整段丢掉。
+                patch_body[output_field] = merged_execution_output(
+                    str(current_task.get(output_field) or ""), execution_output_text
+                )
             if phase == "requirement" and turn_status == "completed":
                 requirement_text = final_agent_text_from_output(execution_output_text)
                 self._persist_requirement_document(current_task, requirement_text)
@@ -5352,6 +5637,9 @@ class ExecutionBridge:
         raise last_error
 
 
+EXECUTION_OUTPUT_LIMIT = 8 * 1024 * 1024
+
+
 def execution_output(turn_status: str, turn: dict[str, Any]) -> str:
     """Persist a readable Markdown summary instead of exposing protocol JSON."""
     lines = ["# Codex 执行结果", "", f"- 状态：{turn_status}", f"- 完成时间：{datetime.now(timezone.utc).isoformat()}", ""]
@@ -5367,12 +5655,34 @@ def execution_output(turn_status: str, turn: dict[str, Any]) -> str:
                 command = "\n".join(str(part) for part in command)
             lines.extend(["## 执行命令", "", "```sh", str(command), "```", ""])
     raw = "\n".join(lines).strip() + "\n"
-    limit = 8 * 1024 * 1024
     encoded = raw.encode("utf-8")
-    if len(encoded) <= limit:
+    if len(encoded) <= EXECUTION_OUTPUT_LIMIT:
         return raw
-    truncated = encoded[: limit - 128].decode("utf-8", errors="ignore")
+    truncated = encoded[: EXECUTION_OUTPUT_LIMIT - 128].decode("utf-8", errors="ignore")
     return truncated + "\n\n[执行记录过长，已在 8MB 处截断]"
+
+
+def merged_execution_output(previous: str, incoming: str) -> str:
+    """把本轮产物接在任务已有产物后面，而不是整段覆盖掉。
+
+    面板的「设计文档」和「成品测试报告」页签读的就是 actionOutput / testingReport。
+    一次追加对话只会产出增量，直接覆盖等于把前几轮的产物删掉，用户看到的文档
+    就只剩最后一次追加的内容。
+    """
+    previous_text = (previous or "").strip()
+    incoming_text = (incoming or "").strip()
+    if not previous_text:
+        return f"{incoming_text}\n" if incoming_text else ""
+    if not incoming_text or incoming_text in previous_text:
+        return f"{previous_text}\n"
+    merged = f"{previous_text}\n\n---\n\n{incoming_text}\n"
+    encoded = merged.encode("utf-8")
+    if len(encoded) <= EXECUTION_OUTPUT_LIMIT:
+        return merged
+    # 超限时丢最早的回合：最近的产物才是用户正在看的那一份。
+    note = "[更早的执行记录已按 8MB 上限截断]\n\n"
+    kept = encoded[-(EXECUTION_OUTPUT_LIMIT - len(note.encode("utf-8")) - 128):].decode("utf-8", errors="ignore")
+    return note + kept
 
 
 def final_agent_text_from_output(output: str) -> str:
@@ -5606,13 +5916,14 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
     def attachment_response(self, manifest: dict[str, Any], path: Path) -> None:
         content_type = str(manifest.get("contentType") or "application/octet-stream")
-        name = str(manifest.get("name") or "attachment").replace('"', "")
         self.send_response(200)
         self.cors()
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(path.stat().st_size))
-        disposition = "inline" if manifest.get("isImage") else "attachment"
-        self.send_header("Content-Disposition", f'{disposition}; filename="{name}"')
+        self.send_header(
+            "Content-Disposition",
+            content_disposition_of(str(manifest.get("name") or "attachment"), bool(manifest.get("isImage"))),
+        )
         self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         with path.open("rb") as source:

@@ -46,6 +46,21 @@ class HttpBridgeTest(unittest.TestCase):
         self.assertIn(("Access-Control-Allow-Origin", "*"), headers)
         self.assertNotIn(("Vary", "Origin"), headers)
 
+    def test_content_disposition_encodes_non_latin_file_names(self):
+        header = bridge.content_disposition_of("需求大纲.md")
+
+        self.assertEqual(
+            "attachment; filename=\"download.md\"; filename*=UTF-8''%E9%9C%80%E6%B1%82%E5%A4%A7%E7%BA%B2.md",
+            header,
+        )
+        self.assertTrue(header.encode("latin-1"))
+
+    def test_content_disposition_preserves_ascii_image_file_name(self):
+        self.assertEqual(
+            "inline; filename=\"result.png\"; filename*=UTF-8''result.png",
+            bridge.content_disposition_of("result.png", inline=True),
+        )
+
     def test_https_server_requires_tls_1_2_and_loads_the_bridge_certificate(self):
         server = unittest.mock.MagicMock()
         plaintext_socket = object()
@@ -127,6 +142,74 @@ class HttpBridgeTest(unittest.TestCase):
         )
 
         self.assertIn("doc/requirements/req-a/需求大纲.md", prompt)
+
+    def test_planning_prompt_lists_mentioned_requirement_outline_paths_without_their_content(self):
+        prompt = bridge.build_planning_prompt(
+            1, {"program": {"name": "Universe"}}, "拆一下",
+            requirement={
+                "requirementKey": "req-b",
+                "references": [{"requirementKey": "req-a", "name": "任务面板"}],
+            },
+        )
+
+        self.assertIn("doc/requirements/req-a/需求大纲.md", prompt)
+        self.assertIn("@ 引用的历史需求: 任务面板", prompt)
+        self.assertIn("需要参考时按上面的路径自行读取", prompt)
+
+    def test_planning_prompt_lists_mentioned_task_document_paths(self):
+        prompt = bridge.build_planning_prompt(
+            1,
+            {
+                "program": {"name": "Universe"},
+                "items": [{"itemKey": "task-a", "title": "存量任务", "moduleKey": "web"}],
+            },
+            "拆一下",
+            requirement={
+                "requirementKey": "req-b",
+                "itemReferences": [{"itemKey": "task-a"}],
+            },
+        )
+
+        self.assertIn("item_key: task-a", prompt)
+        self.assertIn("doc/web/task-a/文档.md", prompt)
+        self.assertIn("已有实现和约定的参考", prompt)
+
+    def test_planning_payload_keeps_only_valid_and_unique_requirement_references(self):
+        references = bridge.planning_requirement_of({
+            "requirementKey": "req-b",
+            "requirementReferences": [
+                {"requirementKey": "req-a", "name": "任务面板"},
+                {"requirementKey": "req-a", "name": "重复"},
+                {"requirementKey": "../../etc", "name": "越界"},
+                {"requirementKey": "req-c"},
+                "不是对象",
+            ],
+        })["references"]
+
+        self.assertEqual(
+            [
+                {"requirementKey": "req-a", "name": "任务面板"},
+                {"requirementKey": "req-c", "name": "req-c"},
+            ],
+            references,
+        )
+
+    def test_planning_payload_keeps_only_valid_and_unique_task_references(self):
+        references = bridge.planning_requirement_of({
+            "requirementKey": "req-b",
+            "requirementItemReferences": [
+                {"itemKey": "task-a", "title": "不信任的标题"},
+                {"itemKey": "task-a"},
+                {"itemKey": "task.v1"},
+                {"itemKey": "../../etc"},
+                "不是对象",
+            ],
+        })["itemReferences"]
+
+        self.assertEqual(
+            [{"itemKey": "task-a"}, {"itemKey": "task.v1"}],
+            references,
+        )
 
     def test_planning_prompt_pre_generates_task_documents_only_when_enabled(self):
         prompt = bridge.build_planning_prompt(
@@ -863,7 +946,9 @@ class HttpBridgeTest(unittest.TestCase):
             artifact_resolver=lambda paths: store.register("whatsapp", 1, "a", paths),
             )
 
-            self.assertEqual("report.pdf", turns[0]["items"][0]["attachments"][0]["name"])
+            attachment = turns[0]["items"][0]["attachments"][0]
+            self.assertEqual("report.pdf", attachment["name"])
+            self.assertEqual("output/report.pdf", attachment["relativePath"])
 
     def test_workspace_artifacts_hide_sensitive_and_outside_files(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -988,7 +1073,7 @@ class HttpBridgeTest(unittest.TestCase):
             {"bizLine": "whatsapp", "programId": 1, "itemKey": "a", "message": "Start fresh", "threadId": "thr_old", "newConversation": True}
         )
 
-        self.assertEqual((1, "a", "Start fresh", "thr_old", True, [], "", "", False), result)
+        self.assertEqual((1, "a", "Start fresh", "thr_old", True, [], "", "", False, []), result)
 
     def test_validate_conversation_payload_accepts_attachment_only_message(self):
         attachment_id = "abcdefghijklmnop"
@@ -996,7 +1081,51 @@ class HttpBridgeTest(unittest.TestCase):
             {"bizLine": "whatsapp", "programId": 1, "itemKey": "a", "message": "", "attachmentIds": [attachment_id]}
         )
 
-        self.assertEqual((1, "a", "", "", False, [attachment_id], "", "", False), result)
+        self.assertEqual((1, "a", "", "", False, [attachment_id], "", "", False, []), result)
+
+    def test_conversation_references_only_accept_known_entity_kinds_and_keys(self):
+        references = bridge.conversation_references_of([
+            {"kind": "requirement", "key": "req-a"},
+            {"kind": "task", "key": "task.v1"},
+            {"kind": "requirement", "key": "req-a"},
+            {"kind": "unknown", "key": "ignored"},
+            {"kind": "requirement", "key": "bad key"},
+        ])
+
+        self.assertEqual(
+            [{"kind": "requirement", "key": "req-a"}, {"kind": "task", "key": "task.v1"}],
+            references,
+        )
+
+    def test_conversation_mention_context_loads_the_selected_requirement_and_task(self):
+        executor = bridge.ExecutionBridge(Path.cwd())
+        context = {
+            "items": [
+                {"itemKey": "task-a", "title": "关联任务", "requirementKey": "req-a", "phase": "development", "status": "doing"},
+            ]
+        }
+        requirement = {"requirementKey": "req-a", "name": "关联需求", "detail": "需求详情"}
+        task = {
+            "itemKey": "task-a", "title": "关联任务", "description": "任务说明",
+            "requirementKey": "req-a", "phase": "development", "status": "doing",
+            "moduleKey": "web",
+        }
+        with (
+            patch.object(bridge.planner, "requirement_record", return_value=requirement),
+            patch.object(executor, "_task_detail", return_value=task),
+        ):
+            lines = executor._conversation_mention_context(
+                {"api_url": "http://test/api", "key": "k"},
+                1,
+                [{"kind": "requirement", "key": "req-a"}, {"kind": "task", "key": "task-a"}],
+                context,
+            )
+
+        rendered = "\n".join(lines)
+        self.assertIn("@需求 req-a: 关联需求", rendered)
+        self.assertIn("关联任务", rendered)
+        self.assertIn("@任务 task-a: 关联任务", rendered)
+        self.assertIn("所属需求 req-a: 关联需求", rendered)
 
     def test_conversation_marks_the_running_thread_even_when_reading_history(self):
         executor = bridge.ExecutionBridge(Path.cwd())
@@ -1376,6 +1505,42 @@ class HttpBridgeTest(unittest.TestCase):
         )
         self.assertIn("doc/module/a/文档.md", prompt)
         self.assertNotIn("## 验收", prompt)
+
+    def test_task_prompt_forbids_writing_only_the_appended_requirement(self):
+        prompt = bridge.build_task_prompt(
+            {"programId": 1, "task": {"itemKey": "a", "title": "Build API", "moduleKey": "svc"}}
+        )
+
+        self.assertIn("doc/svc/a/文档.md` 是跨回合累积的文档", prompt)
+        self.assertIn("整篇写回同一路径", prompt)
+
+    def test_conversation_prompt_carries_the_document_revision_rule(self):
+        prompt = bridge.build_conversation_prompt(1, {"itemKey": "a", "moduleKey": "svc", "title": "Build API"}, "再加一条需求")
+
+        self.assertIn("跨回合累积的文档", prompt)
+        self.assertIn("禁止只把本轮追加的需求写进文件", prompt)
+
+    def test_follow_up_context_repeats_the_phase_document_and_merge_rule(self):
+        lines = bridge.follow_up_context_lines({"itemKey": "a", "moduleKey": "svc", "phase": "development"})
+        context = "\n".join(lines)
+
+        self.assertIn("doc/svc/a/文档.md", context)
+        self.assertIn(bridge.PHASE_SKILLS["development"], context)
+        self.assertIn("整篇写回同一路径", context)
+
+    def test_follow_up_context_omits_the_document_path_when_the_board_did_not_give_one(self):
+        context = "\n".join(bridge.follow_up_context_lines({"itemKey": "a"}))
+
+        self.assertIn("追加回合", context)
+        self.assertNotIn("doc/module/a/文档.md", context)
+
+    def test_planning_prompt_requires_merging_the_existing_outline_before_writing_it_back(self):
+        prompt = bridge.build_planning_prompt(
+            1, {"program": {"name": "Universe"}}, "再追加一条需求", requirement={"requirementKey": "req-a"},
+        )
+
+        self.assertIn("读全文 → 合并本轮增量 → 整篇覆盖", prompt)
+        self.assertIn("禁止只把本轮追加的那段需求写进文件", prompt)
 
     def test_testing_prompt_uses_task_scoped_test_artifact_directory(self):
         prompt = bridge.build_task_prompt(
@@ -1805,7 +1970,42 @@ class HttpBridgeTest(unittest.TestCase):
                 {"api_url": "http://test/api", "key": "x"}, 1, "a",
                 {"version": 3, "phase": "development", "progress": 25, "status": "doing"}, {"version": 2}, "turn-1", "completed", "full output",
         )
-        self.assertEqual("full output", requests[0][2]["actionOutput"])
+        self.assertEqual("full output\n", requests[0][2]["actionOutput"])
+
+    def test_result_sync_appends_a_follow_up_round_to_the_existing_action_output(self):
+        requests = []
+        executor = bridge.ExecutionBridge(Path.cwd())
+        executor.pending_session_syncs = unittest.mock.MagicMock()
+        with (
+            patch.object(
+                executor,
+                "_task_detail",
+                return_value={"version": 4, "phase": "development", "status": "doing", "actionOutput": "第一轮产物"},
+            ),
+            patch.object(bridge.planner, "request_api", side_effect=lambda _config, method, path, **kwargs: requests.append((method, path, kwargs["body"]))),
+        ):
+            executor._sync_result(
+                {"api_url": "http://test/api", "key": "x"}, 1, "a",
+                {"version": 3, "phase": "development", "progress": 25, "status": "doing"}, {"version": 2}, "turn-1", "completed", "追加轮产物",
+            )
+
+        action_output = requests[0][2]["actionOutput"]
+        self.assertIn("第一轮产物", action_output)
+        self.assertIn("追加轮产物", action_output)
+
+    def test_merged_execution_output_keeps_earlier_rounds_and_skips_repeats(self):
+        self.assertEqual("只有本轮\n", bridge.merged_execution_output("", "只有本轮"))
+        self.assertEqual("已有产物\n", bridge.merged_execution_output("已有产物", ""))
+        self.assertEqual("已有产物\n", bridge.merged_execution_output("已有产物", "已有产物"))
+        merged = bridge.merged_execution_output("第一轮", "第二轮")
+        self.assertEqual("第一轮\n\n---\n\n第二轮\n", merged)
+
+    def test_merged_execution_output_drops_the_oldest_rounds_at_the_size_limit(self):
+        merged = bridge.merged_execution_output("旧" * bridge.EXECUTION_OUTPUT_LIMIT, "最新一轮产物")
+
+        self.assertLessEqual(len(merged.encode("utf-8")), bridge.EXECUTION_OUTPUT_LIMIT)
+        self.assertTrue(merged.startswith("[更早的执行记录已按 8MB 上限截断]"))
+        self.assertIn("最新一轮产物", merged)
 
     def test_completed_testing_turn_requires_explicit_passing_verdict(self):
         requests = []
