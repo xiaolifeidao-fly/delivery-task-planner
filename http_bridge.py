@@ -10,9 +10,11 @@ import hashlib
 import json
 import mimetypes
 import os
+import platform
 import queue
 import re
 import secrets
+import shlex
 import shutil
 import ssl
 import subprocess
@@ -67,6 +69,49 @@ MAX_REQUIREMENT_OUTLINE_BYTES = 2 * 1024 * 1024
 MAX_EDITABLE_OUTLINE_BYTES = 512 * 1024
 MAX_WORKSPACE_ARTIFACT_BYTES = 50 * 1024 * 1024
 PLANNING_ITEM_KEY = "__project_planning__"
+GIT_ENVIRONMENT_SESSIONS_PATH = RUNTIME_DIR / "git-environment-sessions.json"
+MAX_GIT_ENVIRONMENT_CONVERSATIONS = 12
+# 项目偏好设置「高级设置 → 预设环境」的聊天：装的是本机全局环境，不挂在任何业务仓库上。
+ENVIRONMENT_SETUP_ITEM_KEY = "__environment_setup__"
+ENVIRONMENT_SETUP_SESSIONS_PATH = RUNTIME_DIR / "environment-setup-sessions.json"
+MAX_ENVIRONMENT_SETUP_CONVERSATIONS = 12
+MAX_ENVIRONMENT_SETUP_ITEMS = 12
+# 预设环境属于当前电脑，不属于任务面板中的任一项目。
+GLOBAL_ENVIRONMENT_SETUP_PROGRAM_ID = 0
+# 预设环境的版本下限、探测命令和安装命令：前端只传标识，这份是唯一事实来源。
+# 检测和安装命令按 macOS / Windows 分开写死 —— 两个系统的命令名和包管理器都不一样，
+# 交给执行器现猜会猜出 Windows 上根本不存在的 `python3`。
+ENVIRONMENT_PRESETS: dict[str, dict[str, Any]] = {
+    "python": {
+        "label": "Python",
+        "requirement": "3.11 及以上",
+        "minimumVersion": "3.11",
+        "probe": {"macos": "python3 --version", "windows": "py -3 --version"},
+        "install": {"macos": "brew install python@3.12", "windows": "winget install --id Python.Python.3.12 -e"},
+    },
+    "node": {
+        "label": "Node.js",
+        "requirement": "22.0 及以上",
+        "minimumVersion": "22.0",
+        "probe": {"macos": "node --version", "windows": "node --version"},
+        "install": {"macos": "brew install node@22", "windows": "winget install --id OpenJS.NodeJS.LTS -e"},
+    },
+    "go": {
+        "label": "Go",
+        "requirement": "1.21 及以上",
+        "minimumVersion": "1.21",
+        "probe": {"macos": "go version", "windows": "go version"},
+        "install": {"macos": "brew install go", "windows": "winget install --id GoLang.Go -e"},
+    },
+}
+GIT_PRESET: dict[str, Any] = {
+    "label": "Git",
+    "probe": {"macos": "git --version", "windows": "git --version"},
+    "install": {
+        "macos": "brew install git；没有 Homebrew 就用 xcode-select --install",
+        "windows": "winget install --id Git.Git -e",
+    },
+}
 REQUIREMENT_TESTING_ITEM_KEY = "__requirement_testing__"
 # 任务生命周期的四个技能都在本插件 skills/ 下；执行时按阶段点名，别让执行器自己猜。
 PLANNING_SKILL = "delivery-task-planner"
@@ -188,6 +233,35 @@ def placeholder_workspace() -> Path:
     请求带了 workspace 就按项目路由，没带就在 workspace_path_of 里直接报错，不会误伤到任何真实仓库。
     """
     root = RUNTIME_DIR / "no-workspace"
+    root.mkdir(parents=True, exist_ok=True)
+    return root.resolve()
+
+
+def host_platform() -> str:
+    """桥接自己跑在哪个系统上。
+
+    执行器和桥接在同一台机器上，系统由这里说了算，不让提示词去猜——猜出来的
+    `python3` 在 Windows 上根本不存在，`winget` 在 macOS 上同理。
+    """
+    system = platform.system().strip().lower()
+    if system == "darwin":
+        return "macos"
+    if system == "windows":
+        return "windows"
+    return "linux"
+
+
+def host_platform_label(value: str = "") -> str:
+    return {"macos": "macOS", "windows": "Windows"}.get(value or host_platform(), "Linux")
+
+
+def environment_setup_workspace() -> Path:
+    """「预设环境」的专用工作目录。
+
+    装 Python / Node / Go 走的是本机全局包管理器，和项目代码没有关系，
+    所以和初始化 Git 环境一样给一个运行时目录下的空目录当 cwd，别把安装痕迹落进业务仓库。
+    """
+    root = RUNTIME_DIR / "environment-setup"
     root.mkdir(parents=True, exist_ok=True)
     return root.resolve()
 
@@ -360,6 +434,66 @@ class PendingSessionSyncStore:
     def snapshot(self) -> list[dict[str, Any]]:
         with self.lock:
             return list(self._read().values())
+
+
+class GitEnvironmentSessionStore:
+    """不挂服务端会话表的本机聊天，其会话目录的落盘实现。
+
+    这类聊天不属于任何项目，服务端没有对应的会话表可绑，所以目录直接落在运行时目录里，
+    一个执行器（codex / claude）一份，刷新页面后还能把之前聊过的会话找回来。
+    """
+
+    def __init__(self, path: Path = GIT_ENVIRONMENT_SESSIONS_PATH) -> None:
+        self.path = path
+        self.lock = threading.Lock()
+
+    def _read(self) -> dict[str, Any]:
+        if not self.path.exists():
+            return {}
+        try:
+            value = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    def _write(self, value: dict[str, Any]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = self.path.with_suffix(".tmp")
+        temp_path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.chmod(temp_path, 0o600)
+        os.replace(temp_path, self.path)
+
+    def catalog(self, provider: str) -> list[dict[str, Any]]:
+        with self.lock:
+            entries = self._read().get(provider) or []
+        return [entry for entry in entries if isinstance(entry, dict) and str(entry.get("threadId") or "")]
+
+    def load(self, provider: str, thread_id: str = "") -> dict[str, Any] | None:
+        catalog = self.catalog(provider)
+        if not catalog:
+            return None
+        current = next((entry for entry in catalog if entry.get("threadId") == thread_id), catalog[-1])
+        return {
+            "threadId": str(current.get("threadId") or ""),
+            "turnId": str(current.get("turnId") or ""),
+            "catalog": catalog,
+        }
+
+    def save(self, provider: str, session: dict[str, Any]) -> None:
+        thread_id = str(session.get("threadId") or "")
+        if not thread_id:
+            return
+        catalog = [entry for entry in session.get("catalog") or [] if isinstance(entry, dict) and entry.get("threadId")]
+        for entry in catalog:
+            if entry.get("threadId") == thread_id:
+                entry["turnId"] = str(session.get("turnId") or "")
+        with self.lock:
+            value = self._read()
+            value[provider] = catalog[-MAX_GIT_ENVIRONMENT_CONVERSATIONS:]
+            self._write(value)
+
+
+ENVIRONMENT_SETUP_SESSIONS = GitEnvironmentSessionStore(ENVIRONMENT_SETUP_SESSIONS_PATH)
 
 
 def progress_event_of(message: dict[str, Any]) -> tuple[str, str, str, str] | None:
@@ -962,6 +1096,217 @@ def build_requirement_testing_prompt(
         message,
     )
 
+
+def environment_selection_of(value: Any) -> list[dict[str, Any]]:
+    """把前端偏好里选中的环境标识翻成「名称 + 版本要求 + 分系统的检测/安装命令」。
+
+    预设项的版本要求由桥接决定，自定义项照抄用户填的原文——用户自己写的东西
+    没有可校验的版本下限，也没法预判它在 macOS 和 Windows 上各叫什么，交给执行器按字面理解。
+    """
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise BridgeFailure("预设环境必须是数组")
+    if len(value) > MAX_ENVIRONMENT_SETUP_ITEMS:
+        raise BridgeFailure(f"预设环境最多 {MAX_ENVIRONMENT_SETUP_ITEMS} 项")
+    selected: list[dict[str, Any]] = []
+    for raw in value:
+        name = str(raw or "").strip()
+        if not name:
+            continue
+        if len(name) > 64:
+            raise BridgeFailure("单个预设环境不能超过 64 个字符")
+        preset = ENVIRONMENT_PRESETS.get(name.lower())
+        entry = (
+            {
+                "id": name.lower(),
+                "label": preset["label"],
+                "requirement": preset["requirement"],
+                "minimumVersion": preset["minimumVersion"],
+                "probe": dict(preset["probe"]),
+                "install": dict(preset["install"]),
+            }
+            if preset
+            else {"id": name, "label": name, "requirement": "", "probe": {}, "install": {}}
+        )
+        if entry not in selected:
+            selected.append(entry)
+    return selected
+
+def validate_environment_setup_payload(value: Any) -> tuple[int, str, str, bool, bool, list[dict[str, Any]], str, str, bool]:
+    if not isinstance(value, dict):
+        raise BridgeFailure("请求体必须是 JSON 对象")
+    message = str(value.get("message") or "").strip()
+    if len(message) > 32 * 1024:
+        raise BridgeFailure("消息不能超过 32KB")
+    thread_id = str(value.get("threadId") or "").strip()
+    if len(thread_id) > 255:
+        raise BridgeFailure("会话标识无效")
+    use_git = value.get("useGit", False)
+    if not isinstance(use_git, bool):
+        raise BridgeFailure("是否使用 Git 必须是布尔值")
+    environments = environment_selection_of(value.get("environments"))
+    if not use_git and not environments and not message:
+        raise BridgeFailure("请先在高级设置里选择要预设的环境")
+    model = str(value.get("model") or "").strip()
+    if len(model) > 128:
+        raise BridgeFailure("模型标识不能超过 128 个字符")
+    provider = ai_provider_of(value)
+    return (
+        GLOBAL_ENVIRONMENT_SETUP_PROGRAM_ID,
+        message,
+        thread_id,
+        bool(value.get("newConversation")),
+        use_git,
+        environments,
+        model,
+        reasoning_effort_of(value, provider),
+        fast_mode_of(value, provider),
+    )
+
+
+def environment_command_for(entry: dict[str, Any], field: str, host: str) -> str:
+    """取某项环境在本机系统上的检测 / 安装命令，自定义项没写就返回空串。"""
+    value = entry.get(field)
+    if not isinstance(value, dict):
+        return ""
+    # Linux 没有逐项写死命令，回落到 macOS 那条，让执行器自己换成 apt / yum。
+    return str(value.get(host) or value.get("macos") or "").strip()
+
+
+VERSION_RE = re.compile(r"(?<!\d)(\d+(?:\.\d+)+)")
+
+
+def version_at_least(version: str, minimum: str) -> bool:
+    """比较由固定探测命令返回的数字版本，不接受任意命令或版本表达式。"""
+    actual = tuple(int(part) for part in version.split("."))
+    expected = tuple(int(part) for part in minimum.split("."))
+    length = max(len(actual), len(expected))
+    return actual + (0,) * (length - len(actual)) >= expected + (0,) * (length - len(expected))
+
+
+def environment_probe_status(entry: dict[str, Any], host: str = "") -> dict[str, Any]:
+    """执行预设的只读版本命令；绿色状态只给已安装且版本达标的项。"""
+    host = host or host_platform()
+    probe = environment_command_for(entry, "probe", host)
+    result = {
+        "id": str(entry.get("id") or ""),
+        "installed": False,
+        "version": "",
+    }
+    if not probe:
+        return result
+    try:
+        completed = subprocess.run(
+            shlex.split(probe, posix=host != "windows"),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=3,
+        )
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return result
+    if completed.returncode != 0:
+        return result
+    version_match = VERSION_RE.search(completed.stdout or "")
+    version = version_match.group(1) if version_match else ""
+    minimum = str(entry.get("minimumVersion") or "")
+    result["version"] = version
+    result["installed"] = not minimum or bool(version and version_at_least(version, minimum))
+    return result
+
+
+def environment_probe_statuses(use_git: bool, environments: list[dict[str, Any]], host: str = "") -> list[dict[str, Any]]:
+    """只检查前端当前列出的预设项；自定义项没有固定命令，不进行臆测。"""
+    entries = list(environments)
+    if use_git:
+        entries.insert(0, {"id": "__git__", **GIT_PRESET})
+    return [environment_probe_status(entry, host) for entry in entries]
+
+
+def build_environment_setup_prompt(
+    use_git: bool, environments: list[dict[str, Any]], message: str, first_turn: bool, host: str = "",
+) -> str:
+    """项目偏好「预设环境」的提示词：先检测，只补装缺的，装完把版本核一遍。
+
+    macOS 和 Windows 的命令名、包管理器、权限模型都不一样，所以清单按本机系统生成，
+    只把该系统那一套命令写进去，不给执行器留自由发挥的余地。
+    """
+    host = host or host_platform()
+    label = host_platform_label(host)
+    privilege = "管理员" if host == "windows" else "sudo"
+    if not first_turn:
+        return wrap_bridge_context(
+            [
+                f"这是「预设环境」会话的续聊，本机是 {label}，继续按既定顺序把本机全局环境补齐。",
+                "已经装好并且版本达标的环境不要重装、不要升级、不要改用户已有的版本管理器配置。",
+                f"需要 {privilege} 权限的命令，如果当前拿不到权限，就把命令原样交给用户执行，然后等用户回话。",
+                "本上下文标记闭合之后的内容，是用户本轮说的话。",
+            ],
+            message,
+        )
+    checklist = []
+    if use_git:
+        checklist.append(
+            f"- Git：先执行 `{environment_command_for(GIT_PRESET, 'probe', host)}` 检测；未安装才装"
+            f"（{environment_command_for(GIT_PRESET, 'install', host)}）。"
+            "装好后顺带确认 `git config --global user.name` 与 `git config --global user.email` 是否已配置，"
+            "缺了就问用户要，不要自己编。"
+        )
+    for entry in environments:
+        probe = environment_command_for(entry, "probe", host)
+        install = environment_command_for(entry, "install", host)
+        probe_text = f"`{probe}`" if probe else f"该环境在 {label} 上对应的版本命令"
+        requirement = f"版本要求 {entry['requirement']}" if entry.get("requirement") else "版本由用户在偏好设置里自定义，按字面理解"
+        install_text = f"（{label} 上装：{install}）" if install else f"（自定义项，按 {label} 的常规装法安装）"
+        checklist.append(
+            f"- {entry['label']}：先执行 {probe_text} 检测，{requirement}。"
+            f"低于要求或没装才安装/升级到满足要求的版本{install_text}。"
+        )
+    if host == "windows":
+        platform_rules = [
+            "6. 命令用 PowerShell 执行；包管理器优先 winget，没有 winget 再退到 scoop / choco 或官网安装包，并把选择理由说清楚。",
+            "7. 装完要开新的 PowerShell 会话或先刷新 PATH（`$env:Path = [System.Environment]::GetEnvironmentVariable('Path','Machine') "
+            "+ ';' + [System.Environment]::GetEnvironmentVariable('Path','User')`）再复检，"
+            "否则复检读到的是旧 PATH，会把装好的环境误判成没装上。",
+            "8. Windows 上 Python 的命令是 `py -3` 或 `python`，没有 `python3`；winget 触发 UAC 弹窗时当前会话无法确认，"
+            "直接把命令交给用户以管理员身份运行。",
+        ]
+    elif host == "macos":
+        platform_rules = [
+            "6. 包管理器用 Homebrew；没有 brew 就先把官方安装命令交给用户，或退到官网安装包，并把选择理由说清楚。",
+            "7. Apple Silicon 的 brew 前缀是 /opt/homebrew、Intel 是 /usr/local；装完 `which` 找不到命令时，"
+            "先确认对应的 bin 目录在 PATH 里再判定失败。",
+            "8. 不要用 sudo 跑 brew。",
+        ]
+    else:
+        platform_rules = [
+            "6. 按发行版选包管理器（Debian/Ubuntu 用 apt，RHEL/CentOS 用 yum/dnf）；"
+            "官方源版本低于要求时改用官网安装包或版本管理器，并把选择理由说清楚。",
+        ]
+    return wrap_bridge_context(
+        [
+            "这是交付任务面板「项目管理 → 偏好设置 → 高级设置 → 预设环境」发起的一次本机环境预设。",
+            "它装的是本机全局环境，不属于任何项目：不要读取、修改或提交任何业务仓库的代码，"
+            "也不要调用任务面板的任务拆解、执行或测试工具。",
+            f"本机系统是 {label}，下面的命令已经按 {label} 给好了，照着执行，不要换成别的系统那一套。",
+            f"本轮 cwd 是一个专用空目录：{environment_setup_workspace()}；只在需要落临时文件时用它。",
+            "只做下面这份清单，逐项先检测再动手，并把执行过的命令和真实输出讲清楚：",
+            *checklist,
+            "硬约束：",
+            "1. 只装缺的。检测到已安装且版本满足要求的，直接跳过并说明当前版本，"
+            "绝不重装、降级或顶掉用户已有的版本管理器（nvm / nvm-windows / pyenv / asdf / conda 等）配置。",
+            "2. 全局安装，不要建项目级虚拟环境。",
+            f"3. 需要 {privilege} 权限而当前拿不到时不要硬闯，把命令原样交给用户执行，然后等用户回话。",
+            "4. 装完再跑一次检测命令核对版本，用一个表格列出每项环境的「安装前状态 / 处理动作 / 安装后版本」。",
+            "5. 清单以外的环境一律不装。",
+            *platform_rules,
+            "最终回复末尾单独给出「下一步」，写清还需要用户自己动手的事项；全部就绪就明说无需额外操作。",
+            "本上下文标记闭合之后的内容，是用户本轮补充的说明。",
+        ],
+        message,
+    )
 
 def validate_planning_payload(value: Any) -> tuple[int, str, str, bool, str, str, str, str, str, bool, dict[str, Any], list[str], list[dict[str, str]], bool]:
     if not isinstance(value, dict):
@@ -1607,7 +1952,7 @@ def runtime_config_from_payload(value: Any) -> dict[str, Any]:
 def assert_runtime_project(config: dict[str, Any], program_id: int) -> None:
     runtime_value = config.get("_project_id")
     runtime_program_id = program_id_of(runtime_value) if runtime_value not in (None, "") else 0
-    if runtime_program_id and runtime_program_id != program_id:
+    if program_id and runtime_program_id and runtime_program_id != program_id:
         raise BridgeFailure("当前请求项目与任务面板入口项目不一致")
 
 
@@ -2197,6 +2542,22 @@ def create_ai_client(provider: str, workspace: Path, event_callback: Any = None,
     return AppServerClient(workspace, event_callback, environment)
 
 
+def read_thread_or_empty(client: Any, thread_id: str) -> dict[str, Any]:
+    """读不到会话正文时按空会话返回，不把错误抛给需求编辑和任务详情。
+
+    会话正文只落在发起这条聊天的那台机器上（Codex 的 rollout、Claude 的
+    transcript）。别人在自己电脑上聊出来的会话，本机自然读不到，这属于常态而不是
+    故障，所以只保留目录里的会话条目、正文留空即可。
+    """
+    if not thread_id:
+        return {}
+    try:
+        return client.read_thread(thread_id, request_id=client.next_request_id())
+    except (BridgeFailure, planner.ToolFailure, OSError, ValueError) as exc:
+        print(f"本机读取会话正文失败，按空会话处理：{thread_id}: {exc}", file=sys.stderr, flush=True)
+        return {}
+
+
 class ConversationAttachmentStore:
     """Keeps browser uploads inside the workspace so the Codex sandbox can read them."""
 
@@ -2716,7 +3077,7 @@ class ExecutionBridge:
         )
         close_after = active is None or active.get("threadId") != thread_id
         try:
-            thread = client.read_thread(thread_id, request_id=client.next_request_id())
+            thread = read_thread_or_empty(client, thread_id)
             planning_item_key = self._planning_item_key(requirement_key)
             for entry in catalog:
                 entry["active"] = bool(active is not None and entry.get("threadId") == active.get("threadId"))
@@ -2966,6 +3327,248 @@ class ExecutionBridge:
                     self.active.discard(identity)
                     self.active_runs.pop(identity, None)
 
+    # ---------- 预设环境会话 ----------
+
+    @staticmethod
+    def _environment_setup_identity(program_id: int = GLOBAL_ENVIRONMENT_SETUP_PROGRAM_ID) -> tuple[str, int, str]:
+        """预设环境只有一条本机全局会话，不随项目切换。"""
+        return task_identity("", program_id, ENVIRONMENT_SETUP_ITEM_KEY)
+
+    @staticmethod
+    def _environment_setup_store_key(provider: str, program_id: int = GLOBAL_ENVIRONMENT_SETUP_PROGRAM_ID) -> str:
+        return f"{provider}:{program_id}"
+
+    def environment_setup(
+        self,
+        program_id: int,
+        selected_thread_id: str = "",
+        config: dict[str, Any] | None = None,
+        provider: str = "codex",
+        use_git: bool = False,
+        environments: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        provider = ai_provider_of(provider)
+        config = request_scoped_config(config, "", program_id)
+        store_key = self._environment_setup_store_key(provider, program_id)
+        session = ENVIRONMENT_SETUP_SESSIONS.load(store_key, selected_thread_id)
+        identity = self._environment_setup_identity(program_id)
+        with self.lock:
+            active = self.active_runs.get(identity)
+        environment_statuses = environment_probe_statuses(use_git, environments or [])
+        catalog = [dict(entry) for entry in (session or {}).get("catalog") or []]
+        known_thread_ids = {str(entry.get("threadId") or "") for entry in catalog}
+        if selected_thread_id and selected_thread_id not in known_thread_ids:
+            raise BridgeFailure("所选预设环境会话不存在")
+        thread_id = selected_thread_id or str((session or {}).get("threadId") or "")
+        if not thread_id:
+            return {
+                "programId": program_id,
+                "threadId": "",
+                "turns": [],
+                "conversations": [],
+                "active": False,
+                "activeTurnId": "",
+                "environmentStatuses": environment_statuses,
+            }
+        client = (
+            active["client"]
+            if active is not None and active.get("environmentSetup") and active.get("threadId") == thread_id
+            else create_ai_client(
+                provider,
+                environment_setup_workspace(),
+                environment=codex_environment(config, program_id, write_allowed=False, provider=provider),
+            )
+        )
+        close_after = active is None or active.get("threadId") != thread_id
+        try:
+            thread = read_thread_or_empty(client, thread_id)
+            for entry in catalog:
+                entry["active"] = bool(active is not None and entry.get("threadId") == active.get("threadId"))
+                # 目录里留着 running 但本进程没有对应回合：多半是上一次桥接跑一半被重启了。
+                if not entry["active"] and entry.get("status") == "running":
+                    entry["status"] = "interrupted"
+            return {
+                "programId": program_id,
+                "threadId": thread_id,
+                "turns": serialize_turns(thread.get("turns") or []),
+                "conversations": catalog,
+                "active": bool(active is not None and active.get("threadId") == thread_id),
+                "activeTurnId": str((active or {}).get("turnId") or ""),
+                "environmentStatuses": environment_statuses,
+            }
+        finally:
+            if close_after:
+                client.close()
+
+    def send_environment_setup(self, raw: Any, config: dict[str, Any]) -> dict[str, Any]:
+        provider = ai_provider_of(raw)
+        (
+            program_id,
+            message,
+            requested_thread_id,
+            new_conversation,
+            use_git,
+            environments,
+            model,
+            reasoning_effort,
+            fast_mode,
+        ) = validate_environment_setup_payload(raw)
+        assert_runtime_project(config, program_id)
+        identity = self._environment_setup_identity(program_id)
+        store_key = self._environment_setup_store_key(provider, program_id)
+        session = ENVIRONMENT_SETUP_SESSIONS.load(store_key, requested_thread_id)
+        with self.lock:
+            active = self.active_runs.get(identity)
+        if active is not None:
+            if new_conversation or (requested_thread_id and requested_thread_id != active.get("threadId")):
+                raise BridgeFailure("本机已有正在运行的预设环境会话，请先停止或等待完成")
+            active["client"].steer_turn(
+                str(active["threadId"]),
+                str(active["turnId"]),
+                build_environment_setup_prompt(use_git, environments, message, False),
+                [],
+                request_id=active["client"].next_request_id(),
+            )
+            self.progress.publish(identity, "message", "已追加预设要求", message, "running")
+            return {"accepted": True, "programId": program_id, "threadId": active["threadId"], "turnId": active["turnId"], "active": True}
+        catalog = [dict(entry) for entry in (session or {}).get("catalog") or []]
+        known_thread_ids = {str(entry.get("threadId") or "") for entry in catalog}
+        if requested_thread_id and requested_thread_id not in known_thread_ids:
+            raise BridgeFailure("所选预设环境会话不存在")
+        workspace = environment_setup_workspace()
+        if not session or new_conversation or not session.get("threadId"):
+            if len(catalog) >= MAX_ENVIRONMENT_SETUP_CONVERSATIONS:
+                raise BridgeFailure("本机保留的预设环境会话已达上限")
+            title = "预设环境"
+            if catalog:
+                title = f"{title} V0.0.{len(catalog)}"
+            client = create_ai_client(
+                provider,
+                workspace,
+                lambda event: self._publish_app_server_event(identity, event),
+                codex_environment(config, program_id, write_allowed=False, provider=provider),
+            )
+            try:
+                thread_id, turn_id = client.start_task(
+                    title,
+                    build_environment_setup_prompt(use_git, environments, message, True),
+                    [],
+                    model=model,
+                    reasoning_effort=reasoning_effort,
+                    fast_mode=fast_mode,
+                )
+            except Exception:
+                client.close()
+                raise
+            session = {
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "catalog": [*catalog, {"threadId": thread_id, "title": title, "createdAt": utc_now(), "updatedAt": utc_now(), "status": "running", "active": True}],
+            }
+        else:
+            thread_id = requested_thread_id or str(session.get("threadId") or "")
+            client = create_ai_client(
+                provider,
+                workspace,
+                lambda event: self._publish_app_server_event(identity, event),
+                codex_environment(config, program_id, write_allowed=False, provider=provider),
+            )
+            try:
+                client.resume_thread(thread_id)
+                turn_id = client.start_turn(
+                    thread_id,
+                    build_environment_setup_prompt(use_git, environments, message, False),
+                    [],
+                    request_id=client.next_request_id(),
+                    model=model,
+                    reasoning_effort=reasoning_effort,
+                    fast_mode=fast_mode,
+                )
+            except Exception:
+                client.close()
+                raise
+            session.update({"threadId": thread_id, "turnId": turn_id})
+            for entry in session.get("catalog") or []:
+                if entry.get("threadId") == thread_id:
+                    entry["status"] = "running"
+                    entry["active"] = True
+                    entry["updatedAt"] = utc_now()
+        with self.lock:
+            self.active.add(identity)
+            self.active_runs[identity] = {
+                "client": client, "threadId": thread_id, "turnId": turn_id,
+                "environmentSetup": True, "provider": provider, "config": config, "programId": program_id,
+            }
+        # 目录当场落盘：这一轮还没跑完桥接就重启，会话列表里也得留着这条聊天。
+        ENVIRONMENT_SETUP_SESSIONS.save(store_key, session)
+        self.progress.publish(
+            identity,
+            "status",
+            "正在预设环境",
+            f"{provider_label(provider)} 正在检测本机环境，只补装缺少的部分。",
+            "running",
+        )
+        threading.Thread(
+            target=self._follow_environment_setup,
+            args=(identity, client, store_key, session, thread_id, turn_id),
+            daemon=True,
+        ).start()
+        return {"accepted": True, "programId": program_id, "threadId": thread_id, "turnId": turn_id, "active": True}
+
+    def stop_environment_setup(self, raw: Any, config: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(raw, dict):
+            raise BridgeFailure("请求体必须是 JSON 对象")
+        program_id = GLOBAL_ENVIRONMENT_SETUP_PROGRAM_ID
+        assert_runtime_project(config, program_id)
+        identity = self._environment_setup_identity(program_id)
+        with self.lock:
+            active = self.active_runs.get(identity)
+        if active is None or not active.get("environmentSetup"):
+            raise BridgeFailure("本机当前没有正在运行的预设环境会话")
+        requested_thread_id = str(raw.get("threadId") or "").strip()
+        if requested_thread_id and requested_thread_id != active.get("threadId"):
+            raise BridgeFailure("所选预设环境会话当前没有正在运行的回合")
+        active["client"].interrupt_turn(str(active["threadId"]), str(active["turnId"]), request_id=active["client"].next_request_id())
+        self.progress.publish(identity, "status", "已请求停止预设", "正在等待执行器中断当前回合。", "running")
+        return {"accepted": True, "programId": program_id, "threadId": active["threadId"], "turnId": active["turnId"], "active": True}
+
+    def _follow_environment_setup(
+        self,
+        identity: tuple[str, int, str],
+        client: AppServerClient,
+        store_key: str,
+        session: dict[str, Any],
+        thread_id: str,
+        turn_id: str,
+    ) -> None:
+        status = "failed"
+        try:
+            status = client.wait_turn(turn_id)
+            session["turnId"] = turn_id
+            for entry in session.get("catalog") or []:
+                if entry.get("threadId") == thread_id:
+                    entry["status"] = status
+                    entry["active"] = False
+                    entry["updatedAt"] = utc_now()
+            ENVIRONMENT_SETUP_SESSIONS.save(store_key, session)
+            self.progress.publish(
+                identity,
+                "status",
+                "预设环境已完成" if status == "completed" else "预设环境未完成",
+                "请查看会话里的环境检测与安装结果。",
+                status,
+            )
+        except Exception as exc:
+            self.progress.publish(identity, "error", "预设环境失败", str(exc), "failed")
+            print(f"预设环境失败：{identity[1]}: {exc}", file=sys.stderr, flush=True)
+        finally:
+            client.close()
+            with self.lock:
+                current = self.active_runs.get(identity)
+                if current is not None and current.get("client") is client:
+                    self.active.discard(identity)
+                    self.active_runs.pop(identity, None)
+
     # ---------- 需求总体测试会话 ----------
 
     @staticmethod
@@ -3097,7 +3700,7 @@ class ExecutionBridge:
         )
         close_after = active is None or active.get("threadId") != selected_thread_id
         try:
-            thread = client.read_thread(selected_thread_id, request_id=client.next_request_id())
+            thread = read_thread_or_empty(client, selected_thread_id)
             item_key = self._requirement_testing_item_key(requirement_key)
             for entry in catalog:
                 entry["active"] = bool(active is not None and entry.get("threadId") == active.get("threadId"))
@@ -3344,6 +3947,19 @@ class ExecutionBridge:
         if program_id_of(program.get("programId")) != program_id:
             raise BridgeFailure("任务面板项目上下文校验失败")
         return config
+
+    @staticmethod
+    def global_environment_config(raw: Any, token: str) -> dict[str, Any]:
+        """环境检测只需当前用户凭证，不读取或校验任何任务面板项目。"""
+        if not isinstance(raw, dict):
+            raise BridgeFailure("请求体必须是 JSON 对象")
+        if not token:
+            raise BridgeFailure("当前用户凭证为空")
+        return {
+            "key": token,
+            "key_header": "token",
+            "user_id": str(raw.get("userId") or "task-executor").strip() or "task-executor",
+        }
 
     @staticmethod
     def _resolve_task_board_api(explicit_url: str, origin: str, token: str, program_id: int) -> str:
@@ -3598,7 +4214,7 @@ class ExecutionBridge:
             )
             close_after = True
         try:
-            thread = client.read_thread(thread_id, request_id=client.next_request_id())
+            thread = read_thread_or_empty(client, thread_id)
             for entry in catalog:
                 entry["active"] = bool(active_for_thread is not None and entry.get("threadId") == thread_id)
                 if not entry["active"] and entry.get("status") == "running":
@@ -4386,7 +5002,7 @@ class ExecutionBridge:
             client = create_ai_client(provider, self.workspace, environment=codex_environment(config, program_id))
             close_after = True
         try:
-            thread = client.read_thread(thread_id, request_id=client.next_request_id())
+            thread = read_thread_or_empty(client, thread_id)
             self.attachments.recover_generated_images(config_biz_line(config), program_id, item_key, thread_id)
             turns = ensure_terminal_result(
                 serialize_turns(
@@ -4767,7 +5383,7 @@ class ExecutionBridge:
         )
         close_after = active is None or active.get("threadId") != selected_thread_id
         try:
-            thread = client.read_thread(selected_thread_id, request_id=client.next_request_id())
+            thread = read_thread_or_empty(client, selected_thread_id)
             item_key = requirement_prototype_item_key(requirement_key)
             return {
                 "programId": program_id,
@@ -6229,6 +6845,34 @@ class BridgeHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self.json_response(500, {"error": f"读取 Codex 会话失败：{exc}"})
             return
+        if parsed.path == "/v1/codex/environment-setup":
+            if not self.allowed_origin():
+                self.json_response(403, {"error": "origin not allowed"})
+                return
+            query = parse_qs(parsed.query)
+            try:
+                thread_id = str((query.get("threadId") or [""])[0]).strip()
+                provider = ai_provider_of((query.get("provider") or ["codex"])[0])
+                use_git = str((query.get("useGit") or [""])[0]).strip().lower() == "true"
+                environments_raw = str((query.get("environments") or ["[]"])[0])
+                try:
+                    environments = environment_selection_of(json.loads(environments_raw))
+                except (json.JSONDecodeError, TypeError):
+                    raise BridgeFailure("预设环境参数无效")
+                config = self.bridge.global_environment_config({}, self.headers.get("token", "").strip())
+                self.json_response(200, self.bridge.environment_setup(
+                    GLOBAL_ENVIRONMENT_SETUP_PROGRAM_ID,
+                    thread_id,
+                    config=config,
+                    provider=provider,
+                    use_git=use_git,
+                    environments=environments,
+                ))
+            except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
+                self.json_response(400, {"error": str(exc)})
+            except Exception as exc:
+                self.json_response(500, {"error": f"读取预设环境会话失败：{exc}"})
+            return
         if parsed.path == "/v1/codex/planning":
             if not self.allowed_origin():
                 self.json_response(403, {"error": "origin not allowed"})
@@ -6269,6 +6913,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
             "/v1/codex/conversation",
             "/v1/codex/planning",
             "/v1/codex/planning/stop",
+            "/v1/codex/environment-setup",
+            "/v1/codex/environment-setup/stop",
             "/v1/codex/requirement-prototype/generate",
             "/v1/codex/requirement-prototype/conversation",
             "/v1/codex/requirement-testing",
@@ -6305,12 +6951,16 @@ class BridgeHandler(BaseHTTPRequestHandler):
             payload = json.loads(self.rfile.read(length))
             if not isinstance(payload, dict):
                 raise BridgeFailure("请求体必须是 JSON 对象")
-            config = self.bridge.request_config(
-                payload,
-                self.allowed_origin() or "",
-                self.headers.get("token", "").strip(),
-            )
-            selected_bridge = self.bridge.for_workspace(payload.get("workspace"))
+            if path in {"/v1/codex/environment-setup", "/v1/codex/environment-setup/stop"}:
+                config = self.bridge.global_environment_config(payload, self.headers.get("token", "").strip())
+                selected_bridge = self.bridge
+            else:
+                config = self.bridge.request_config(
+                    payload,
+                    self.allowed_origin() or "",
+                    self.headers.get("token", "").strip(),
+                )
+                selected_bridge = self.bridge.for_workspace(payload.get("workspace"))
             if path == "/v1/codex/execute":
                 self.json_response(202, selected_bridge.execute(payload, config=config))
             elif path == "/v1/codex/task-testing-cases":
@@ -6327,6 +6977,10 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 self.json_response(202, selected_bridge.send_planning(payload, config))
             elif path == "/v1/codex/planning/stop":
                 self.json_response(202, selected_bridge.stop_planning(payload, config))
+            elif path == "/v1/codex/environment-setup":
+                self.json_response(202, self.bridge.send_environment_setup(payload, config))
+            elif path == "/v1/codex/environment-setup/stop":
+                self.json_response(202, self.bridge.stop_environment_setup(payload, config))
             elif path == "/v1/codex/requirement-prototype/generate":
                 self.json_response(202, selected_bridge.generate_requirement_prototype(payload, config))
             elif path == "/v1/codex/requirement-prototype/conversation":

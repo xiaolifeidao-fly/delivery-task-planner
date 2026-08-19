@@ -3,6 +3,7 @@
 import importlib.util
 import base64
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -373,6 +374,144 @@ class HttpBridgeTest(unittest.TestCase):
         self.assertEqual("thread-1", continued["threadId"])
         client.steer_turn.assert_called_once()
         thread.return_value.start.assert_called_once()
+
+    def test_planning_keeps_the_conversation_list_when_the_transcript_is_not_on_this_machine(self):
+        # 别人在自己电脑上聊出来的会话，本机读不到正文，需求编辑不该整页报错。
+        executor = bridge.ExecutionBridge(Path.cwd())
+        client = unittest.mock.MagicMock()
+        client.read_thread.side_effect = bridge.BridgeFailure("thread not found")
+        rows = [{"threadId": "thread-remote", "title": "别人的拆解", "status": "completed"}]
+
+        with (
+            patch.object(bridge.planner, "request_api", return_value=rows),
+            patch.object(bridge, "create_ai_client", return_value=client),
+        ):
+            conversation = executor.planning(2, "thread-remote", config=self.runtime_config() | {"_project_id": 2}, requirement_key="req-a")
+
+        self.assertEqual("thread-remote", conversation["threadId"])
+        self.assertEqual([], conversation["turns"])
+        self.assertEqual(["thread-remote"], [entry["threadId"] for entry in conversation["conversations"]])
+        client.close.assert_called_once()
+
+    def test_read_thread_or_empty_swallows_only_the_missing_transcript(self):
+        client = unittest.mock.MagicMock()
+        client.read_thread.return_value = {"turns": [{"id": "turn-1"}]}
+        self.assertEqual({"turns": [{"id": "turn-1"}]}, bridge.read_thread_or_empty(client, "thread-1"))
+        self.assertEqual({}, bridge.read_thread_or_empty(client, ""))
+        client.read_thread.side_effect = bridge.BridgeFailure("thread not found")
+        self.assertEqual({}, bridge.read_thread_or_empty(client, "thread-1"))
+
+    def test_environment_selection_resolves_presets_and_keeps_custom_entries(self):
+        selected = bridge.environment_selection_of(["python", "Node", "rust 1.79"])
+
+        self.assertEqual(
+            [("python", "3.11 及以上"), ("node", "22.0 及以上"), ("rust 1.79", "")],
+            [(entry["id"], entry["requirement"]) for entry in selected],
+        )
+
+    def test_environment_selection_rejects_an_oversized_list(self):
+        with self.assertRaises(bridge.BridgeFailure):
+            bridge.environment_selection_of([f"custom-{index}" for index in range(bridge.MAX_ENVIRONMENT_SETUP_ITEMS + 1)])
+
+    def test_environment_setup_payload_requires_something_to_install(self):
+        with self.assertRaises(bridge.BridgeFailure):
+            bridge.validate_environment_setup_payload({"programId": 1, "useGit": False, "environments": []})
+
+    def test_environment_setup_prompt_only_lists_the_selected_environments(self):
+        prompt = bridge.build_environment_setup_prompt(True, bridge.environment_selection_of(["go"]), "", True, host="macos")
+
+        self.assertIn("git --version", prompt)
+        self.assertIn("go version", prompt)
+        self.assertNotIn("python3 --version", prompt)
+        self.assertIn("只装缺的", prompt)
+
+    def test_environment_setup_prompt_gives_macos_commands_on_a_mac(self):
+        prompt = bridge.build_environment_setup_prompt(True, bridge.environment_selection_of(["python"]), "", True, host="macos")
+
+        self.assertIn("本机系统是 macOS", prompt)
+        self.assertIn("python3 --version", prompt)
+        self.assertIn("brew install python@3.12", prompt)
+        self.assertIn("不要用 sudo 跑 brew", prompt)
+        self.assertNotIn("winget", prompt)
+        self.assertNotIn("PowerShell", prompt)
+
+    def test_environment_setup_prompt_gives_windows_commands_on_windows(self):
+        prompt = bridge.build_environment_setup_prompt(True, bridge.environment_selection_of(["python"]), "", True, host="windows")
+
+        self.assertIn("本机系统是 Windows", prompt)
+        # Windows 上没有 python3 这个命令，检测命令必须换成 py -3。
+        self.assertIn("py -3 --version", prompt)
+        self.assertNotIn("python3 --version", prompt)
+        self.assertIn("winget install --id Python.Python.3.12 -e", prompt)
+        self.assertIn("winget install --id Git.Git -e", prompt)
+        self.assertIn("PowerShell", prompt)
+        self.assertIn("管理员 权限", prompt)
+        self.assertNotIn("brew", prompt)
+
+    def test_environment_setup_follow_up_prompt_names_the_host_privilege(self):
+        self.assertIn("管理员 权限", bridge.build_environment_setup_prompt(True, [], "继续", False, host="windows"))
+        self.assertIn("sudo 权限", bridge.build_environment_setup_prompt(True, [], "继续", False, host="macos"))
+
+    def test_host_platform_maps_python_platform_names(self):
+        for system, expected in [("Darwin", "macos"), ("Windows", "windows"), ("Linux", "linux")]:
+            with patch.object(bridge.platform, "system", return_value=system):
+                self.assertEqual(expected, bridge.host_platform())
+
+    def test_environment_setup_runs_outside_any_project_workspace(self):
+        executor = bridge.ExecutionBridge(Path.cwd())
+        client = unittest.mock.MagicMock()
+        client.start_task.return_value = ("thread-env", "turn-env")
+
+        with (
+            patch.object(bridge, "create_ai_client", return_value=client) as create_client,
+            patch.object(bridge.ENVIRONMENT_SETUP_SESSIONS, "load", return_value=None),
+            patch.object(bridge.ENVIRONMENT_SETUP_SESSIONS, "save") as save,
+            patch.object(bridge.threading, "Thread") as thread,
+        ):
+            result = executor.send_environment_setup(
+                {"useGit": True, "environments": ["python"], "provider": "codex"},
+                {"key": "current-user-token"},
+            )
+
+        self.assertEqual("thread-env", result["threadId"])
+        self.assertEqual(bridge.GLOBAL_ENVIRONMENT_SETUP_PROGRAM_ID, result["programId"])
+        self.assertEqual(bridge.environment_setup_workspace(), create_client.call_args.args[1])
+        self.assertEqual("codex:0", save.call_args.args[0])
+        self.assertEqual("0", create_client.call_args.args[3][bridge.planner.RUNTIME_PROJECT_ID_ENV])
+        thread.return_value.start.assert_called_once()
+
+    def test_environment_setup_conversation_is_empty_before_the_first_run(self):
+        executor = bridge.ExecutionBridge(Path.cwd())
+
+        with patch.object(bridge.ENVIRONMENT_SETUP_SESSIONS, "load", return_value=None):
+            conversation = executor.environment_setup(bridge.GLOBAL_ENVIRONMENT_SETUP_PROGRAM_ID, config={"key": "current-user-token"})
+
+        self.assertEqual(
+            {
+                "programId": bridge.GLOBAL_ENVIRONMENT_SETUP_PROGRAM_ID,
+                "threadId": "",
+                "turns": [],
+                "conversations": [],
+                "active": False,
+                "activeTurnId": "",
+                "environmentStatuses": [],
+            },
+            conversation,
+        )
+
+    def test_environment_probe_status_marks_only_supported_versions_as_installed(self):
+        completed = subprocess.CompletedProcess(["python3", "--version"], 0, "Python 3.12.1\n")
+        with patch.object(bridge.subprocess, "run", return_value=completed):
+            status = bridge.environment_probe_status(bridge.environment_selection_of(["python"])[0], "macos")
+
+        self.assertEqual({"id": "python", "installed": True, "version": "3.12.1"}, status)
+
+    def test_environment_probe_status_does_not_mark_outdated_version_as_installed(self):
+        completed = subprocess.CompletedProcess(["node", "--version"], 0, "v20.19.0\n")
+        with patch.object(bridge.subprocess, "run", return_value=completed):
+            status = bridge.environment_probe_status(bridge.environment_selection_of(["node"])[0], "macos")
+
+        self.assertEqual({"id": "node", "installed": False, "version": "20.19.0"}, status)
 
     def test_planning_previews_before_confirmation_and_writes_after(self):
         executor = bridge.ExecutionBridge(Path.cwd())
@@ -2315,6 +2454,26 @@ class HttpBridgeTest(unittest.TestCase):
 
         self.assertEqual(2, executor.reconcile.call_count)
         sleep.assert_called_once_with(7)
+
+
+    def test_local_session_catalog_store_round_trip(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = bridge.GitEnvironmentSessionStore(Path(directory) / "sessions.json")
+            store.save("codex", {
+                "threadId": "thread-1", "turnId": "turn-1",
+                "catalog": [{"threadId": "thread-1", "title": "会话一", "status": "running"}],
+            })
+            store.save("claude", {
+                "threadId": "thread-2", "turnId": "turn-2",
+                "catalog": [{"threadId": "thread-2", "title": "会话二", "status": "running"}],
+            })
+
+            # 两个执行器各自一份目录，不互相串会话。
+            self.assertEqual("thread-1", store.load("codex")["threadId"])
+            self.assertEqual("turn-1", store.load("codex")["turnId"])
+            self.assertEqual("thread-2", store.load("claude")["threadId"])
+            # 指定的会话不在目录里时回落到最近一条，不至于把聊天面板打空。
+            self.assertEqual("thread-1", store.load("codex", "missing")["threadId"])
 
 
 if __name__ == "__main__":
