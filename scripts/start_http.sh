@@ -18,12 +18,6 @@ if [[ -n "${workspace}" ]]; then
   printf '%s\n' "${workspace}" >"${workspace_file}"
 fi
 
-certificate_args=()
-if [[ "$(uname -s)" == "Darwin" ]]; then
-  certificate_args+=(--install-trust)
-fi
-python3 "${script_dir}/ensure_https_cert.py" "${certificate_args[@]}"
-
 if [[ "$(uname -s)" == "Darwin" ]]; then
   python3 "${script_dir}/install_http_service.py" \
     --plugin-root "${plugin_root}" \
@@ -42,12 +36,12 @@ else
 fi
 
 for _ in {1..30}; do
-  if curl --silent --fail --cacert "${runtime_dir}/tls/ca.pem" https://127.0.0.1:8765/healthz >/dev/null; then
-    echo "Codex HTTPS bridge is running at https://127.0.0.1:8765"
+  if curl --silent --fail http://127.0.0.1:8765/healthz >/dev/null; then
+    echo "Codex HTTP bridge is running at http://127.0.0.1:8765"
     exit 0
   fi
   sleep 0.2
 done
 
-echo "Codex HTTPS bridge failed to start. See ${log_file}" >&2
+echo "Codex HTTP bridge failed to start. See ${log_file}" >&2
 exit 1

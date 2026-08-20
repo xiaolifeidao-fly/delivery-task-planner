@@ -62,31 +62,55 @@ class HttpBridgeTest(unittest.TestCase):
             bridge.content_disposition_of("result.png", inline=True),
         )
 
-    def test_https_server_requires_tls_1_2_and_loads_the_bridge_certificate(self):
+    def test_http_server_uses_the_loopback_listener_without_tls(self):
         server = unittest.mock.MagicMock()
-        plaintext_socket = object()
-        server.socket = plaintext_socket
-        context = unittest.mock.MagicMock()
-        context.wrap_socket.return_value = "tls-socket"
         workspace = Path("/workspace")
-        certificate = Path("/cert.pem")
-        private_key = Path("/key.pem")
 
-        with (
-            patch.object(bridge, "ThreadingHTTPServer", return_value=server) as http_server,
-            patch.object(bridge.ssl, "SSLContext", return_value=context) as ssl_context,
-        ):
-            result = bridge.create_https_server("127.0.0.1", 8765, workspace, {"*"}, certificate, private_key)
+        with patch.object(bridge, "ThreadingHTTPServer", return_value=server) as http_server:
+            result = bridge.create_http_server("127.0.0.1", 8765, workspace, {"*"})
 
         self.assertIs(server, result)
         http_server.assert_called_once_with(("127.0.0.1", 8765), bridge.BridgeHandler)
-        ssl_context.assert_called_once_with(bridge.ssl.PROTOCOL_TLS_SERVER)
-        self.assertEqual(bridge.ssl.TLSVersion.TLSv1_2, context.minimum_version)
-        context.load_cert_chain.assert_called_once_with(certfile="/cert.pem", keyfile="/key.pem")
-        context.wrap_socket.assert_called_once_with(plaintext_socket, server_side=True)
-        self.assertEqual("tls-socket", server.socket)
         self.assertEqual(workspace, server.bridge.workspace)
         self.assertEqual({"*"}, server.allowed_origins)
+
+    def test_plugin_version_comparison_ignores_cachebuster_and_uses_semver_order(self):
+        self.assertEqual(0, bridge.compare_plugin_versions("0.2.0+codex.1", "0.2.0+codex.2"))
+        self.assertGreater(bridge.compare_plugin_versions("1.0.0", "0.9.9"), 0)
+        self.assertLess(bridge.compare_plugin_versions("1.0.0-beta.2", "1.0.0-beta.11"), 0)
+        self.assertGreater(bridge.compare_plugin_versions("1.0.0", "1.0.0-rc.1"), 0)
+
+    def test_plugin_update_status_only_reports_a_newer_remote_release(self):
+        with (
+            patch.object(bridge, "installed_plugin_version", return_value="0.2.0+codex.local"),
+            patch.object(bridge, "cached_remote_plugin_version", return_value="0.3.0+codex.remote"),
+        ):
+            status = bridge.plugin_update_status()
+
+        self.assertTrue(status["updateAvailable"])
+        self.assertEqual("0.2.0+codex.local", status["localVersion"])
+        self.assertEqual("0.3.0+codex.remote", status["remoteVersion"])
+
+    def test_plugin_update_status_does_not_report_a_newer_local_release(self):
+        with (
+            patch.object(bridge, "installed_plugin_version", return_value="0.3.0+codex.local"),
+            patch.object(bridge, "cached_remote_plugin_version", return_value="0.2.0+codex.remote"),
+        ):
+            status = bridge.plugin_update_status()
+
+        self.assertFalse(status["updateAvailable"])
+        self.assertEqual("", status["message"])
+
+    def test_plugin_update_status_treats_remote_lookup_failures_as_non_updates(self):
+        with (
+            patch.object(bridge, "installed_plugin_version", return_value="0.2.0+codex.local"),
+            patch.object(bridge, "cached_remote_plugin_version", side_effect=bridge.BridgeFailure("network unavailable")),
+        ):
+            status = bridge.plugin_update_status()
+
+        self.assertFalse(status["updateAvailable"])
+        self.assertEqual("0.2.0+codex.local", status["localVersion"])
+        self.assertIn("network unavailable", status["message"])
 
     def test_planning_result_only_contains_records_created_after_the_session_started(self):
         executor = bridge.ExecutionBridge(Path.cwd())
@@ -421,9 +445,85 @@ class HttpBridgeTest(unittest.TestCase):
         prompt = bridge.build_environment_setup_prompt(True, bridge.environment_selection_of(["go"]), "", True, host="macos")
 
         self.assertIn("git --version", prompt)
+        self.assertIn("Host github.com", prompt)
+        self.assertIn("id_ed25519_github_delivery_task_planner", prompt)
         self.assertIn("go version", prompt)
         self.assertNotIn("python3 --version", prompt)
         self.assertIn("只装缺的", prompt)
+
+    def test_github_ssh_status_accepts_a_configured_public_key(self):
+        public_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDeliveryTaskPlanner github@example.test"
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            ssh_directory = home / ".ssh"
+            ssh_directory.mkdir()
+            (ssh_directory / "config").write_text("Host github.com\n  IdentityFile ~/.ssh/id_github\n", encoding="utf-8")
+            (ssh_directory / "id_github.pub").write_text(f"{public_key}\n", encoding="utf-8")
+
+            status = bridge.github_ssh_key_status(home)
+
+        self.assertTrue(status["githubSshConfigured"])
+        self.assertEqual(public_key, status["githubSshPublicKey"])
+        self.assertFalse(status["githubSshError"])
+
+    def test_github_ssh_status_rejects_missing_or_invalid_public_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            ssh_directory = home / ".ssh"
+            ssh_directory.mkdir()
+            (ssh_directory / "config").write_text("Host github.com\n  IdentityFile ~/.ssh/id_github\n", encoding="utf-8")
+            (ssh_directory / "id_github.pub").write_text("not an ssh public key\n", encoding="utf-8")
+
+            status = bridge.github_ssh_key_status(home)
+
+        self.assertFalse(status["githubSshConfigured"])
+        self.assertFalse(status["githubSshPublicKey"])
+
+    def test_ensure_github_ssh_key_generates_a_managed_key_only_when_missing(self):
+        public_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDeliveryTaskPlanner generated"
+
+        def generate_key(command, **_kwargs):
+            private_key = Path(command[5])
+            private_key.write_text("private key", encoding="utf-8")
+            private_key.with_name(f"{private_key.name}.pub").write_text(f"{public_key}\n", encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, "")
+
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            with (
+                patch.object(bridge.shutil, "which", return_value="/usr/bin/ssh-keygen"),
+                patch.object(bridge.subprocess, "run", side_effect=generate_key) as run,
+            ):
+                status = bridge.ensure_github_ssh_key(home)
+
+            config = (home / ".ssh" / "config").read_text(encoding="utf-8")
+            private_key = home / ".ssh" / bridge.GITHUB_SSH_KEY_NAME
+            private_key_exists = private_key.exists()
+
+        self.assertTrue(status["githubSshConfigured"])
+        self.assertEqual(public_key, status["githubSshPublicKey"])
+        self.assertIn(bridge.GITHUB_SSH_CONFIG_START, config)
+        self.assertIn("Host github.com", config)
+        self.assertTrue(private_key_exists)
+        self.assertEqual(1, run.call_count)
+
+    def test_ensure_github_ssh_key_reuses_an_existing_valid_configuration(self):
+        public_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDeliveryTaskPlanner existing"
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            ssh_directory = home / ".ssh"
+            ssh_directory.mkdir()
+            config = ssh_directory / "config"
+            original = "Host github.com\n  IdentityFile ~/.ssh/id_existing\n"
+            config.write_text(original, encoding="utf-8")
+            (ssh_directory / "id_existing.pub").write_text(f"{public_key}\n", encoding="utf-8")
+            with patch.object(bridge.shutil, "which") as which:
+                status = bridge.ensure_github_ssh_key(home)
+
+            self.assertEqual(original, config.read_text(encoding="utf-8"))
+
+        self.assertTrue(status["githubSshConfigured"])
+        which.assert_not_called()
 
     def test_environment_setup_prompt_gives_macos_commands_on_a_mac(self):
         prompt = bridge.build_environment_setup_prompt(True, bridge.environment_selection_of(["python"]), "", True, host="macos")
@@ -464,6 +564,7 @@ class HttpBridgeTest(unittest.TestCase):
 
         with (
             patch.object(bridge, "create_ai_client", return_value=client) as create_client,
+            patch.object(bridge, "ensure_github_ssh_key", return_value={"githubSshConfigured": True, "githubSshPublicKey": "public", "githubSshError": ""}),
             patch.object(bridge.ENVIRONMENT_SETUP_SESSIONS, "load", return_value=None),
             patch.object(bridge.ENVIRONMENT_SETUP_SESSIONS, "save") as save,
             patch.object(bridge.threading, "Thread") as thread,
@@ -2474,6 +2575,141 @@ class HttpBridgeTest(unittest.TestCase):
             self.assertEqual("thread-2", store.load("claude")["threadId"])
             # 指定的会话不在目录里时回落到最近一条，不至于把聊天面板打空。
             self.assertEqual("thread-1", store.load("codex", "missing")["threadId"])
+
+
+class GitBranchTest(unittest.TestCase):
+    """需求分支相关的命令全部落在真实仓库上，用临时仓库跑，不 mock 掉 Git 本身。"""
+
+    def setUp(self):
+        if not subprocess.run(["git", "--version"], capture_output=True).returncode == 0:
+            self.skipTest("本机没有 Git")
+        self.directory = tempfile.TemporaryDirectory()
+        self.workspace = Path(self.directory.name)
+        self.addCleanup(self.directory.cleanup)
+        for args in (
+            ["init", "--initial-branch=main"],
+            ["config", "user.email", "bridge@test"],
+            ["config", "user.name", "bridge"],
+        ):
+            subprocess.run(["git", "-C", str(self.workspace), *args], check=True, capture_output=True)
+        (self.workspace / "README.md").write_text("bridge", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.workspace), "add", "."], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(self.workspace), "commit", "-m", "init"], check=True, capture_output=True)
+
+    def test_branch_names_reject_shell_and_git_unsafe_values(self):
+        self.assertTrue(bridge.valid_git_branch_name("feature/issue_req-1787112353409"))
+        self.assertTrue(bridge.valid_git_branch_name("feature/req-1"))
+        for value in ("", "-branch", "feature..1", "feature//1", "feature/", "branch;rm -rf /", "branch name", "a" * 256):
+            self.assertFalse(bridge.valid_git_branch_name(value), value)
+
+    def test_branch_catalog_lists_local_branches_and_defaults_to_current(self):
+        subprocess.run(["git", "-C", str(self.workspace), "branch", "feature/a"], check=True, capture_output=True)
+        catalog = bridge.git_branch_catalog(self.workspace)
+        self.assertEqual(["feature/a", "main"], catalog["branches"])
+        self.assertEqual("main", catalog["defaultBranch"])
+
+    def test_branch_catalog_rejects_a_directory_without_a_repository(self):
+        with tempfile.TemporaryDirectory() as plain:
+            with self.assertRaises(bridge.BridgeFailure):
+                bridge.git_branch_catalog(Path(plain))
+
+    def test_create_branch_switches_to_the_new_requirement_branch(self):
+        result = bridge.git_create_branch(self.workspace, "main", "feature/issue_req-1787112353409")
+        self.assertTrue(result["created"])
+        self.assertEqual("feature/issue_req-1787112353409", bridge.git_current_branch(self.workspace))
+
+    def test_create_branch_reuses_an_existing_branch_instead_of_overwriting_it(self):
+        bridge.git_create_branch(self.workspace, "main", "feature/issue_req-1787112353409")
+        bridge.git_checkout_branch(self.workspace, "main")
+        result = bridge.git_create_branch(self.workspace, "main", "feature/issue_req-1787112353409")
+        self.assertFalse(result["created"])
+        self.assertEqual("feature/issue_req-1787112353409", bridge.git_current_branch(self.workspace))
+
+    def test_create_branch_rejects_an_unknown_base_branch(self):
+        with self.assertRaises(bridge.BridgeFailure):
+            bridge.git_create_branch(self.workspace, "release/none", "feature/issue_req-1787112353409")
+
+    def test_create_branch_refuses_to_move_a_dirty_worktree(self):
+        (self.workspace / "README.md").write_text("dirty", encoding="utf-8")
+        with self.assertRaises(bridge.BridgeFailure):
+            bridge.git_create_branch(self.workspace, "main", "feature/issue_req-1787112353410")
+
+    def add_origin(self) -> Path:
+        remote = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(remote, ignore_errors=True))
+        subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(self.workspace), "remote", "add", "origin", str(remote)], check=True, capture_output=True)
+        return remote
+
+    def test_push_commits_the_worktree_before_pushing(self):
+        self.add_origin()
+        bridge.git_create_branch(self.workspace, "main", "feature/issue_req-1")
+        (self.workspace / "README.md").write_text("changed", encoding="utf-8")
+        result = bridge.git_push_branch(self.workspace, "feature/issue_req-1", "feat: 需求改动")
+        self.assertTrue(result["committed"])
+        self.assertEqual("feat: 需求改动", result["commitMessage"])
+        self.assertEqual("origin", result["remote"])
+        self.assertFalse(bridge.git_worktree_dirty(self.workspace))
+        log = subprocess.run(
+            ["git", "-C", str(self.workspace), "log", "-1", "--format=%s", "origin/feature/issue_req-1"],
+            check=True, capture_output=True, text=True,
+        )
+        self.assertEqual("feat: 需求改动", log.stdout.strip())
+
+    def test_push_without_local_changes_only_pushes(self):
+        self.add_origin()
+        bridge.git_create_branch(self.workspace, "main", "feature/issue_req-1")
+        result = bridge.git_push_branch(self.workspace, "feature/issue_req-1", "feat: 需求改动")
+        self.assertFalse(result["committed"])
+        self.assertTrue(result["pushed"])
+
+    def test_branch_sync_check_reflects_the_remote_state(self):
+        self.add_origin()
+        bridge.git_create_branch(self.workspace, "main", "feature/issue_req-1")
+        (self.workspace / "README.md").write_text("changed", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.workspace), "commit", "-am", "wip"], check=True, capture_output=True)
+        self.assertFalse(bridge.git_branch_synced(self.workspace, "feature/issue_req-1"))
+        bridge.git_push_branch(self.workspace, "feature/issue_req-1", "feat: 推送")
+        self.assertTrue(bridge.git_branch_synced(self.workspace, "feature/issue_req-1"))
+
+    def test_push_repair_prompt_carries_the_failure_and_its_limits(self):
+        prompt = bridge.build_git_push_repair_prompt(
+            self.workspace, "feature/issue_req-1", "origin", "! [rejected] non-fast-forward", "feat: 需求改动",
+        )
+        self.assertIn("! [rejected] non-fast-forward", prompt)
+        self.assertIn("feature/issue_req-1", prompt)
+        self.assertIn("force push", prompt)
+        self.assertIn("最后必须实际执行一次 push", prompt)
+
+    def test_push_refuses_dirty_changes_made_on_another_branch(self):
+        self.add_origin()
+        bridge.git_create_branch(self.workspace, "main", "feature/issue_req-1")
+        bridge.git_checkout_branch(self.workspace, "main")
+        (self.workspace / "README.md").write_text("changed", encoding="utf-8")
+        with self.assertRaises(bridge.BridgeFailure):
+            bridge.git_push_branch(self.workspace, "feature/issue_req-1", "feat: 需求改动")
+
+    def test_push_requires_an_origin_remote(self):
+        bridge.git_create_branch(self.workspace, "main", "feature/issue_req-1")
+        with self.assertRaises(bridge.BridgeFailure):
+            bridge.git_push_branch(self.workspace, "feature/issue_req-1", "")
+
+    def test_push_rejects_an_unknown_branch(self):
+        self.add_origin()
+        with self.assertRaises(bridge.BridgeFailure):
+            bridge.git_push_branch(self.workspace, "feature/issue_missing", "")
+
+    def test_task_prompt_pins_changes_to_the_requirement_branch(self):
+        prompt = bridge.build_task_prompt({
+            "programId": 1,
+            "gitBranch": "feature/issue_req-1787112353409",
+            "task": {"itemKey": "T-1", "title": "任务", "phase": "development"},
+        })
+        self.assertIn("feature/issue_req-1787112353409", prompt)
+        self.assertNotIn("Git 需求分支", bridge.build_task_prompt({
+            "programId": 1,
+            "task": {"itemKey": "T-1", "title": "任务", "phase": "development"},
+        }))
 
 
 if __name__ == "__main__":

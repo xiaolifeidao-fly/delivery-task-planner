@@ -28,20 +28,15 @@ if (-not $pythonCommand) {
   $pythonArguments = @("-3")
 }
 if (-not $pythonCommand) {
-  throw "Python 3 is required to run the delivery HTTPS bridge."
-}
-
-& $pythonCommand.Source @pythonArguments (Join-Path $scriptDirectory "ensure_https_cert.py") --install-trust
-if ($LASTEXITCODE -ne 0) {
-  throw "Could not initialize the local HTTPS certificate."
+  throw "Python 3 is required to run the delivery HTTP bridge."
 }
 
 & (Join-Path $scriptDirectory "install_http_service.ps1") -PluginRoot $pluginRoot -Workspace $Workspace -AllowOrigin "*"
 for ($attempt = 0; $attempt -lt 30; $attempt += 1) {
   try {
-    $response = Invoke-WebRequest -UseBasicParsing -Uri "https://127.0.0.1:8765/healthz" -TimeoutSec 2
+    $response = Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:8765/healthz" -TimeoutSec 2
     if ($response.StatusCode -eq 200) {
-      Write-Output "Codex HTTPS bridge is running at https://127.0.0.1:8765"
+      Write-Output "Codex HTTP bridge is running at http://127.0.0.1:8765"
       exit 0
     }
   } catch {
@@ -49,4 +44,4 @@ for ($attempt = 0; $attempt -lt 30; $attempt += 1) {
   }
 }
 
-throw "Codex HTTPS bridge failed to start. Check the scheduled task '$taskName'."
+throw "Codex HTTP bridge failed to start. Check the scheduled task '$taskName'."

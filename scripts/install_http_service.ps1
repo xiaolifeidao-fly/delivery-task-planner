@@ -19,7 +19,7 @@ if (-not $pythonCommand) {
   $pythonArguments = @("-3")
 }
 if (-not $pythonCommand) {
-  throw "Python 3 is required to run the delivery HTTPS bridge."
+  throw "Python 3 is required to run the delivery HTTP bridge."
 }
 
 $arguments = @()
@@ -38,5 +38,5 @@ $action = New-ScheduledTaskAction -Execute $pythonCommand.Source -Argument ($arg
 $trigger = New-ScheduledTaskTrigger -AtLogOn
 $settings = New-ScheduledTaskSettingsSet -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
 Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description "Local HTTPS bridge for the Universe delivery task board." -Force | Out-Null
+Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description "Local HTTP bridge for the Universe delivery task board." -Force | Out-Null
 Start-ScheduledTask -TaskName $taskName

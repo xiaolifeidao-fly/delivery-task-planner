@@ -371,7 +371,7 @@ def initialize(arguments: dict[str, Any]) -> dict[str, Any]:
 
 
 def update_api_url(arguments: dict[str, Any]) -> dict[str, Any]:
-    """Update the normal MCP and HTTPS bridge panel targets together."""
+    """Update the normal MCP and HTTP bridge panel targets together."""
     if os.environ.get(RUNTIME_TOKEN_ENV, "").strip() and os.environ.get(RUNTIME_API_URL_ENV, "").strip():
         raise ToolFailure("任务面板桥接运行态不能修改共享接口地址，请在普通 @delivery-task-planner 会话中执行此操作。")
     config = load_config()

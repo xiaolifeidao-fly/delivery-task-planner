@@ -16,7 +16,6 @@ import re
 import secrets
 import shlex
 import shutil
-import ssl
 import subprocess
 import sys
 import threading
@@ -29,14 +28,25 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, urlparse
+from urllib.request import Request, urlopen
 
 import server as planner
 
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
+PLUGIN_MANIFEST_PATH = Path(__file__).resolve().parent / ".codex-plugin" / "plugin.json"
+PLUGIN_GITHUB_REPOSITORY = "https://github.com/xiaolifeidao-fly/delivery-task-planner.git"
+PLUGIN_GITHUB_RAW_BASE_URL = "https://raw.githubusercontent.com/xiaolifeidao-fly/delivery-task-planner"
+PLUGIN_VERSION_CHECK_CACHE_SECONDS = 60
 SESSION_STATUS = {"completed": "completed", "failed": "blocked", "interrupted": "blocked"}
 TERMINAL_TURN_STATUSES = set(SESSION_STATUS)
+
+_PLUGIN_VERSION_RE = re.compile(
+    r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$"
+)
+_remote_plugin_version_cache: tuple[float, str] | None = None
+_remote_plugin_version_cache_lock = threading.Lock()
 
 
 def default_runtime_dir() -> Path:
@@ -45,10 +55,136 @@ def default_runtime_dir() -> Path:
     return Path.home() / ".local" / "state" / "delivery-task-planner"
 
 
+def plugin_version_from_manifest(path: Path) -> str:
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise BridgeFailure(f"无法读取插件版本信息：{exc}") from exc
+    version = str(manifest.get("version") or "").strip() if isinstance(manifest, dict) else ""
+    if not version:
+        raise BridgeFailure("插件版本信息为空")
+    return version
+
+
+def installed_plugin_version() -> str:
+    return plugin_version_from_manifest(PLUGIN_MANIFEST_PATH)
+
+
+def semver_parts(value: str) -> tuple[tuple[int, int, int], tuple[str, ...] | None]:
+    """Parse a SemVer release, deliberately ignoring its build metadata."""
+    normalized = str(value or "").strip().lstrip("v").split("+", 1)[0]
+    match = _PLUGIN_VERSION_RE.fullmatch(normalized)
+    if not match:
+        raise ValueError(f"无效的插件版本号：{value}")
+    release = tuple(int(match.group(index)) for index in range(1, 4))
+    pre_release = tuple(match.group(4).split(".")) if match.group(4) else None
+    return release, pre_release
+
+
+def compare_plugin_versions(left: str, right: str) -> int:
+    """Compare SemVer values. A positive result means left is newer than right."""
+    left_release, left_pre_release = semver_parts(left)
+    right_release, right_pre_release = semver_parts(right)
+    if left_release != right_release:
+        return 1 if left_release > right_release else -1
+    if left_pre_release is None and right_pre_release is None:
+        return 0
+    if left_pre_release is None:
+        return 1
+    if right_pre_release is None:
+        return -1
+    for left_identifier, right_identifier in zip(left_pre_release, right_pre_release):
+        if left_identifier == right_identifier:
+            continue
+        left_numeric = left_identifier.isdigit()
+        right_numeric = right_identifier.isdigit()
+        if left_numeric and right_numeric:
+            return 1 if int(left_identifier) > int(right_identifier) else -1
+        if left_numeric != right_numeric:
+            return -1 if left_numeric else 1
+        return 1 if left_identifier > right_identifier else -1
+    if len(left_pre_release) == len(right_pre_release):
+        return 0
+    return 1 if len(left_pre_release) > len(right_pre_release) else -1
+
+
+def remote_plugin_default_branch() -> str:
+    """Ask Git for the default branch, then retain main as an offline-safe fallback."""
+    try:
+        result = subprocess.run(
+            ["git", "ls-remote", "--symref", PLUGIN_GITHUB_REPOSITORY, "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "main"
+    match = re.search(r"^ref:\s+refs/heads/(.+?)\s+HEAD$", result.stdout, re.MULTILINE)
+    return match.group(1) if match else "main"
+
+
+def fetch_remote_plugin_version() -> str:
+    branch = remote_plugin_default_branch()
+    manifest_url = f"{PLUGIN_GITHUB_RAW_BASE_URL}/{quote(branch, safe='/')}/.codex-plugin/plugin.json"
+    request = Request(manifest_url, headers={"User-Agent": "delivery-task-planner-version-check"})
+    try:
+        with urlopen(request, timeout=5) as response:
+            manifest = json.loads(response.read().decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise BridgeFailure(f"无法读取 Git 仓库中的插件版本：{exc}") from exc
+    version = str(manifest.get("version") or "").strip() if isinstance(manifest, dict) else ""
+    if not version:
+        raise BridgeFailure("Git 仓库中的插件版本信息为空")
+    return version
+
+
+def cached_remote_plugin_version() -> str:
+    global _remote_plugin_version_cache
+    now = time.monotonic()
+    with _remote_plugin_version_cache_lock:
+        cached = _remote_plugin_version_cache
+        if cached is not None and now - cached[0] < PLUGIN_VERSION_CHECK_CACHE_SECONDS:
+            return cached[1]
+    version = fetch_remote_plugin_version()
+    with _remote_plugin_version_cache_lock:
+        _remote_plugin_version_cache = (now, version)
+    return version
+
+
+def plugin_update_status() -> dict[str, Any]:
+    checked_at = int(time.time())
+    try:
+        local_version = installed_plugin_version()
+    except BridgeFailure as exc:
+        return {
+            "localVersion": "",
+            "remoteVersion": "",
+            "updateAvailable": False,
+            "checkedAt": checked_at,
+            "message": str(exc),
+        }
+    try:
+        remote_version = cached_remote_plugin_version()
+        update_available = compare_plugin_versions(remote_version, local_version) > 0
+    except (BridgeFailure, ValueError) as exc:
+        return {
+            "localVersion": local_version,
+            "remoteVersion": "",
+            "updateAvailable": False,
+            "checkedAt": checked_at,
+            "message": str(exc),
+        }
+    return {
+        "localVersion": local_version,
+        "remoteVersion": remote_version,
+        "updateAvailable": update_available,
+        "checkedAt": checked_at,
+        "message": "",
+    }
+
+
 RUNTIME_DIR = default_runtime_dir()
-TLS_DIRECTORY = RUNTIME_DIR / "tls"
-DEFAULT_TLS_CERTIFICATE = TLS_DIRECTORY / "bridge-cert.pem"
-DEFAULT_TLS_KEY = TLS_DIRECTORY / "bridge-key.pem"
 PENDING_SESSION_SYNCS_PATH = RUNTIME_DIR / "pending-session-syncs.json"
 # Claude 是 print 模式的一次性子进程，没有常驻线程服务可读；会话记录只能自己落盘。
 CLAUDE_TRANSCRIPTS_DIR = RUNTIME_DIR / "claude-transcripts"
@@ -112,6 +248,16 @@ GIT_PRESET: dict[str, Any] = {
         "windows": "winget install --id Git.Git -e",
     },
 }
+GITHUB_SSH_HOST = "github.com"
+GITHUB_SSH_KEY_NAME = "id_ed25519_github_delivery_task_planner"
+GITHUB_SSH_CONFIG_START = "# >>> delivery-task-planner GitHub SSH key >>>"
+GITHUB_SSH_CONFIG_END = "# <<< delivery-task-planner GitHub SSH key <<<"
+GITHUB_SSH_CONFIG_BLOCK_RE = re.compile(
+    rf"(?ms)^{re.escape(GITHUB_SSH_CONFIG_START)}\n.*?^{re.escape(GITHUB_SSH_CONFIG_END)}\n?",
+)
+SSH_PUBLIC_KEY_RE = re.compile(
+    r"^(?:ssh-(?:ed25519|rsa|dss)|ecdsa-sha2-nistp(?:256|384|521)|sk-(?:ssh-ed25519|ecdsa-sha2-nistp256)@openssh\\.com)\s+[A-Za-z0-9+/=]+(?:\s+.*)?$",
+)
 REQUIREMENT_TESTING_ITEM_KEY = "__requirement_testing__"
 # 任务生命周期的四个技能都在本插件 skills/ 下；执行时按阶段点名，别让执行器自己猜。
 PLANNING_SKILL = "delivery-task-planner"
@@ -166,22 +312,16 @@ def content_disposition_of(name: str, inline: bool = False) -> str:
     return f"{disposition}; filename=\"{fallback}\"; filename*=UTF-8''{encoded}"
 
 
-def create_https_server(
+def create_http_server(
     host: str,
     port: int,
     workspace: Path,
     allowed_origins: set[str],
-    certificate: Path,
-    private_key: Path,
 ) -> ThreadingHTTPServer:
-    """Create the loopback bridge listener with TLS required for browser calls."""
+    """Create the loopback bridge listener for browser calls over local HTTP."""
     httpd = ThreadingHTTPServer((host, port), BridgeHandler)
     httpd.bridge = ExecutionBridge(workspace)  # type: ignore[attr-defined]
     httpd.allowed_origins = allowed_origins  # type: ignore[attr-defined]
-    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    context.minimum_version = ssl.TLSVersion.TLSv1_2
-    context.load_cert_chain(certfile=str(certificate), keyfile=str(private_key))
-    httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
     return httpd
 
 
@@ -669,6 +809,16 @@ def sibling_document_lines(catalog: Any) -> list[str]:
     ]
 
 
+def git_branch_lines(branch: str) -> list[str]:
+    """需求启用了 Git 分支时，明确告诉执行器改动应留在这条分支上。"""
+    if not branch:
+        return []
+    return [
+        f"Git 需求分支: {branch}（工作目录已切到该分支）。本任务的所有改动都留在这条分支上，"
+        "不要切换分支、不要合并回主干，也不要执行 push。",
+    ]
+
+
 def build_task_prompt(payload: dict[str, Any], workspace: Path | None = None) -> str:
     """`workspace` 是项目管理里绑定的工作目录，也是本轮 cwd；四个阶段都要靠它去读代码和项目技能。"""
     task = payload["task"]
@@ -720,6 +870,7 @@ def build_task_prompt(payload: dict[str, Any], workspace: Path | None = None) ->
         f"阶段: {task.get('stageKey') or '未指定'}",
         f"模块: {task.get('moduleKey') or '未指定'}",
         f"前置任务: {', '.join(dependencies) if dependencies else '无'}",
+        *git_branch_lines(str(payload.get("gitBranch") or "")),
         "完成后说明修改内容和验证结果；无法完成时明确说明阻塞原因。",
         "如果生成了用户需要查看或下载的文件、文档或图片，请在最终回复中用 Markdown 链接列出其工作区相对路径。",
     ]
@@ -1174,6 +1325,406 @@ def environment_command_for(entry: dict[str, Any], field: str, host: str) -> str
     return str(value.get(host) or value.get("macos") or "").strip()
 
 
+def github_ssh_paths(home: Path | None = None) -> tuple[Path, Path]:
+    root = (home or Path.home()).expanduser()
+    ssh_directory = root / ".ssh"
+    return ssh_directory, ssh_directory / "config"
+
+
+def github_identity_files(config_path: Path, home: Path) -> list[Path]:
+    """Read only `Host github.com` identity entries from the user's SSH config.
+
+    The UI only claims that a GitHub key is ready when its corresponding public
+    key is present. We intentionally do not inspect private-key contents.
+    """
+    try:
+        lines = config_path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return []
+    identities: list[Path] = []
+    host_matches = False
+    for line in lines:
+        try:
+            parts = shlex.split(line, comments=True, posix=True)
+        except ValueError:
+            continue
+        if len(parts) < 2:
+            continue
+        option = parts[0].lower()
+        if option == "host":
+            host_matches = any(item.casefold() == GITHUB_SSH_HOST for item in parts[1:])
+            continue
+        if option != "identityfile" or not host_matches:
+            continue
+        raw_path = parts[1].replace("%d", str(home)).replace("%h", GITHUB_SSH_HOST)
+        if raw_path == "~":
+            candidate = home
+        elif raw_path.startswith("~/"):
+            candidate = home / raw_path[2:]
+        else:
+            candidate = Path(raw_path).expanduser()
+        if not candidate.is_absolute():
+            candidate = home / ".ssh" / candidate
+        resolved = candidate.resolve(strict=False)
+        if resolved not in identities:
+            identities.append(resolved)
+    return identities
+
+
+def public_key_from_file(path: Path) -> str:
+    try:
+        if path.stat().st_size > 16 * 1024:
+            return ""
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return ""
+    for line in lines:
+        candidate = line.strip()
+        if candidate and not candidate.startswith("#"):
+            return candidate if SSH_PUBLIC_KEY_RE.fullmatch(candidate) else ""
+    return ""
+
+
+def github_ssh_key_status(home: Path | None = None) -> dict[str, Any]:
+    """Return only public, display-safe GitHub SSH state for the environment UI."""
+    root = (home or Path.home()).expanduser()
+    _, config_path = github_ssh_paths(root)
+    result = {
+        "githubSshConfigured": False,
+        "githubSshPublicKey": "",
+        "githubSshError": "",
+    }
+    for identity_path in github_identity_files(config_path, root):
+        public_key = public_key_from_file(identity_path.with_name(f"{identity_path.name}.pub"))
+        if public_key:
+            result.update({"githubSshConfigured": True, "githubSshPublicKey": public_key})
+            return result
+    return result
+
+
+def write_github_ssh_config(config_path: Path, home: Path, identity_path: Path) -> None:
+    if config_path.exists() and config_path.is_symlink():
+        raise BridgeFailure("SSH 配置文件是符号链接，未自动修改；请先手动配置 GitHub 密钥")
+    try:
+        existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+    except (OSError, UnicodeDecodeError) as exc:
+        raise BridgeFailure(f"无法读取 SSH 配置文件：{exc}") from exc
+    relative_identity = identity_path.relative_to(home)
+    managed_block = "\n".join((
+        GITHUB_SSH_CONFIG_START,
+        f"Host {GITHUB_SSH_HOST}",
+        f"  HostName {GITHUB_SSH_HOST}",
+        "  User git",
+        f"  IdentityFile ~/{relative_identity}",
+        "  IdentitiesOnly yes",
+        GITHUB_SSH_CONFIG_END,
+        "",
+    ))
+    content = GITHUB_SSH_CONFIG_BLOCK_RE.sub("", existing).lstrip()
+    temporary = config_path.with_name(f".{config_path.name}.delivery-task-planner.tmp")
+    try:
+        temporary.write_text(managed_block + content, encoding="utf-8")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, config_path)
+    except OSError as exc:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise BridgeFailure(f"无法写入 SSH 配置文件：{exc}") from exc
+
+
+def ensure_github_ssh_key(home: Path | None = None) -> dict[str, Any]:
+    """Create a managed GitHub key only when no configured public key is usable."""
+    root = (home or Path.home()).expanduser()
+    current = github_ssh_key_status(root)
+    if current["githubSshConfigured"]:
+        return current
+    ssh_directory, config_path = github_ssh_paths(root)
+    try:
+        ssh_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(ssh_directory, 0o700)
+    except OSError as exc:
+        current["githubSshError"] = f"无法创建 SSH 目录：{exc}"
+        return current
+    private_key = ssh_directory / GITHUB_SSH_KEY_NAME
+    public_key = private_key.with_name(f"{private_key.name}.pub")
+    ssh_keygen = shutil.which("ssh-keygen")
+    if not ssh_keygen:
+        current["githubSshError"] = "未找到 ssh-keygen；请先完成 Git 安装后重新预设"
+        return current
+    try:
+        if not private_key.exists():
+            generated = subprocess.run(
+                [ssh_keygen, "-q", "-t", "ed25519", "-f", str(private_key), "-N", "", "-C", "delivery-task-planner-github"],
+                check=False,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=10,
+            )
+            if generated.returncode != 0:
+                current["githubSshError"] = f"GitHub SSH 密钥生成失败：{(generated.stdout or '').strip() or 'ssh-keygen 退出异常'}"
+                return current
+        elif not public_key_from_file(public_key):
+            recovered = subprocess.run(
+                [ssh_keygen, "-y", "-f", str(private_key)],
+                check=False,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=10,
+            )
+            recovered_key = (recovered.stdout or "").strip()
+            if recovered.returncode != 0 or not SSH_PUBLIC_KEY_RE.fullmatch(recovered_key):
+                current["githubSshError"] = "已有 GitHub 密钥无法恢复公钥，未覆盖原有文件"
+                return current
+            public_key.write_text(f"{recovered_key}\n", encoding="utf-8")
+        os.chmod(private_key, 0o600)
+        os.chmod(public_key, 0o644)
+        write_github_ssh_config(config_path, root, private_key)
+    except (BridgeFailure, OSError, subprocess.SubprocessError) as exc:
+        current["githubSshError"] = str(exc)
+        return current
+    configured = github_ssh_key_status(root)
+    if not configured["githubSshConfigured"]:
+        configured["githubSshError"] = "GitHub SSH 密钥已生成，但未能完成配置校验"
+    return configured
+
+
+# ---------------------------------------------------------------------------
+# 需求分支：面板只记录关联结果，真正的 Git 命令全部在本机工作目录里执行。
+# 命令参数一律固定，不拼接用户输入到 shell；分支名先做白名单校验再交给 Git。
+# ---------------------------------------------------------------------------
+
+GIT_BRANCH_NAME_RE = re.compile(r"[A-Za-z0-9._/-]{1,255}")
+GIT_REMOTE_PREFIX = "remotes/"
+
+
+def valid_git_branch_name(value: str) -> bool:
+    """挡掉明显非法的分支名。最终仍由 git check-ref-format 判定，这里只做前置过滤。"""
+    name = str(value or "").strip()
+    if not name or not GIT_BRANCH_NAME_RE.fullmatch(name):
+        return False
+    if name.startswith(("-", "/", ".")) or name.endswith(("/", ".", ".lock")):
+        return False
+    return ".." not in name and "//" not in name and "@{" not in name
+
+
+def run_git(workspace: Path, args: list[str], timeout: int = 20) -> subprocess.CompletedProcess:
+    """在项目工作目录里执行一条只带固定参数的 Git 命令。"""
+    try:
+        return subprocess.run(
+            ["git", "-C", str(workspace), *args],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=timeout,
+        )
+    except FileNotFoundError as exc:
+        raise BridgeFailure("本机未安装 Git，请先在环境预设中完成安装") from exc
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise BridgeFailure(f"执行 Git 命令失败：{exc}") from exc
+
+
+def git_output(workspace: Path, args: list[str], failure: str) -> str:
+    completed = run_git(workspace, args)
+    if completed.returncode != 0:
+        raise BridgeFailure(f"{failure}：{(completed.stdout or '').strip() or 'git 退出异常'}")
+    return (completed.stdout or "").strip()
+
+
+def require_git_workspace(workspace: Path) -> None:
+    completed = run_git(workspace, ["rev-parse", "--is-inside-work-tree"])
+    if completed.returncode != 0 or (completed.stdout or "").strip() != "true":
+        raise BridgeFailure(f"项目工作目录不是 Git 仓库：{workspace}")
+
+
+def git_current_branch(workspace: Path) -> str:
+    """游离 HEAD 时返回空串，调用方据此提示用户先切回分支。"""
+    completed = run_git(workspace, ["symbolic-ref", "--quiet", "--short", "HEAD"])
+    return (completed.stdout or "").strip() if completed.returncode == 0 else ""
+
+
+def git_default_branch(workspace: Path, branches: list[str]) -> str:
+    """基准分支的默认值：优先当前分支，其次远端 HEAD，最后常见主干名。"""
+    current = git_current_branch(workspace)
+    if current:
+        return current
+    head = run_git(workspace, ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"])
+    if head.returncode == 0:
+        candidate = (head.stdout or "").strip()
+        if candidate in branches:
+            return candidate
+    for candidate in ("main", "master", "develop"):
+        if candidate in branches:
+            return candidate
+    return branches[0] if branches else ""
+
+
+def git_branch_catalog(workspace: Path) -> dict[str, Any]:
+    """本地分支加远端分支，去重后按名称排序；origin/HEAD 这类符号引用不列出。"""
+    require_git_workspace(workspace)
+    listed = git_output(
+        workspace,
+        ["for-each-ref", "--format=%(refname:short)", "refs/heads", "refs/remotes"],
+        "读取 Git 分支失败",
+    )
+    branches: list[str] = []
+    for line in listed.splitlines():
+        name = line.strip()
+        if not name or name.endswith("/HEAD"):
+            continue
+        if name not in branches:
+            branches.append(name)
+    branches.sort()
+    return {"branches": branches, "defaultBranch": git_default_branch(workspace, branches)}
+
+
+def git_branch_exists(workspace: Path, branch: str) -> bool:
+    return run_git(workspace, ["rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"]).returncode == 0
+
+
+def git_worktree_dirty(workspace: Path) -> bool:
+    return bool(git_output(workspace, ["status", "--porcelain"], "读取 Git 工作区状态失败"))
+
+
+def git_checkout_branch(workspace: Path, branch: str) -> None:
+    """切换到已存在的本地分支；工作区有未提交改动时不强行切，交回给用户处理。"""
+    if git_current_branch(workspace) == branch:
+        return
+    if git_worktree_dirty(workspace):
+        raise BridgeFailure(f"工作目录有未提交改动，无法切换到分支 {branch}，请先提交或暂存")
+    completed = run_git(workspace, ["checkout", branch])
+    if completed.returncode != 0:
+        raise BridgeFailure(f"切换分支 {branch} 失败：{(completed.stdout or '').strip() or 'git 退出异常'}")
+
+
+def git_default_remote(workspace: Path) -> str:
+    """只认 origin：需求分支是给评审用的，推到哪个远端不该由面板猜。"""
+    remotes = git_output(workspace, ["remote"], "读取 Git 远端失败").split()
+    if "origin" in remotes:
+        return "origin"
+    raise BridgeFailure("当前仓库没有配置 origin 远端，无法推送")
+
+
+GIT_PUSH_REPAIR_TIMEOUT_SECONDS = 15 * 60
+
+
+def git_branch_synced(workspace: Path, branch: str, remote: str = "origin") -> bool:
+    """本地分支是否已经全部推到远端。AI 兜底之后用它判定，而不是信 AI 的自述。"""
+    run_git(workspace, ["fetch", remote, branch], timeout=180)
+    ahead = run_git(workspace, ["rev-list", "--count", f"{remote}/{branch}..{branch}"])
+    return ahead.returncode == 0 and (ahead.stdout or "").strip() == "0"
+
+
+def build_git_push_repair_prompt(workspace: Path, branch: str, remote: str, failure: str, commit_message: str) -> str:
+    """推送失败时交给 AI 的修复提示词。只授权它解决推送本身，不允许改业务实现。"""
+    return wrap_bridge_context(
+        [
+            "这是交付任务面板的「推送需求分支」回合：面板已经尝试提交并推送，但失败了，请你在本机把它修好并真正推送成功。",
+            workspace_instruction(workspace),
+            f"需求分支: {branch}",
+            f"远端: {remote}",
+            f"面板使用的提交说明: {commit_message}",
+            "",
+            "面板执行失败的原始输出:",
+            failure,
+            "",
+            "处理要求:",
+            "- 只解决提交与推送本身：拉取远端、rebase 或 merge、解决冲突、补提交、重新 push。",
+            "- 解决冲突时保留双方的真实意图，不要为了让命令通过而删掉别人的改动。",
+            "- 不要修改与本次冲突无关的业务实现，不要改动其他分支。",
+            f"- 禁止 force push、禁止 push 到 {branch} 以外的分支、禁止改写已经推到远端的历史。",
+            "- 处理不了（例如需要凭据、需要人工决策的冲突）就停下来说明原因，不要绕开。",
+            "- 最后必须实际执行一次 push，并在回复里贴出 push 命令的真实输出。",
+        ],
+        f"推送需求分支 {branch} 失败，请解决后重新推送。",
+    )
+
+
+MAX_GIT_COMMIT_MESSAGE_BYTES = 4 * 1024
+
+
+def git_commit_message_of(value: str, branch: str) -> str:
+    """提交说明来自用户输入，只做长度和控制字符限制；命令参数是数组，不存在注入。"""
+    message = str(value or "").strip() or f"chore: {branch}"
+    if len(message.encode("utf-8")) > MAX_GIT_COMMIT_MESSAGE_BYTES:
+        raise BridgeFailure("提交说明过长")
+    if "\x00" in message:
+        raise BridgeFailure("提交说明不能包含控制字符")
+    return message
+
+
+def git_push_branch(workspace: Path, branch: str, message: str = "") -> dict[str, Any]:
+    """先把工作区改动提交到需求分支，再推到 origin。
+
+    只做普通推送，不带 --force：远端已经跑在前面时报错给用户，不在这里替他决定怎么合。
+    """
+    if not valid_git_branch_name(branch):
+        raise BridgeFailure("需求分支名不合法")
+    require_git_workspace(workspace)
+    if not git_branch_exists(workspace, branch):
+        raise BridgeFailure(f"本机不存在需求分支 {branch}，请先创建分支")
+    remote = git_default_remote(workspace)
+    commit_message = git_commit_message_of(message, branch)
+    current = git_current_branch(workspace)
+    dirty = git_worktree_dirty(workspace)
+    if current != branch:
+        # 改动是在别的分支上做的，提交到需求分支多半是误操作，让用户自己先归位。
+        if dirty:
+            raise BridgeFailure(
+                f"工作目录当前在分支 {current or 'HEAD'} 上且有未提交改动，请先处理后再推送需求分支 {branch}"
+            )
+        git_checkout_branch(workspace, branch)
+    committed = False
+    if dirty:
+        add = run_git(workspace, ["add", "--all"])
+        if add.returncode != 0:
+            raise BridgeFailure(f"暂存改动失败：{(add.stdout or '').strip() or 'git 退出异常'}")
+        commit = run_git(workspace, ["commit", "-m", commit_message], timeout=120)
+        if commit.returncode != 0:
+            raise BridgeFailure(f"提交改动失败：{(commit.stdout or '').strip() or 'git 退出异常'}")
+        committed = True
+    completed = run_git(workspace, ["push", "--set-upstream", remote, f"{branch}:{branch}"], timeout=180)
+    output = (completed.stdout or "").strip()
+    if completed.returncode != 0:
+        raise BridgeFailure(f"推送分支 {branch} 失败：{output or 'git 退出异常'}")
+    return {
+        "pushed": True,
+        "branch": branch,
+        "remote": remote,
+        "committed": committed,
+        "commitMessage": commit_message if committed else "",
+        "upToDate": "Everything up-to-date" in output,
+        "output": output[-2000:],
+    }
+
+
+def git_create_branch(workspace: Path, base_branch: str, branch: str) -> dict[str, Any]:
+    """从基准分支创建并切换到需求分支；分支已存在时只切换，不覆盖已有提交。"""
+    if not valid_git_branch_name(base_branch):
+        raise BridgeFailure("基准分支名不合法")
+    if not valid_git_branch_name(branch):
+        raise BridgeFailure("需求分支名不合法")
+    require_git_workspace(workspace)
+    if run_git(workspace, ["check-ref-format", "--branch", branch]).returncode != 0:
+        raise BridgeFailure(f"需求分支名不符合 Git 规范：{branch}")
+    if run_git(workspace, ["rev-parse", "--verify", "--quiet", f"{base_branch}^{{commit}}"]).returncode != 0:
+        raise BridgeFailure(f"基准分支不存在：{base_branch}")
+    if git_branch_exists(workspace, branch):
+        git_checkout_branch(workspace, branch)
+        return {"created": False, "baseBranch": base_branch, "branch": branch}
+    if git_worktree_dirty(workspace):
+        raise BridgeFailure("工作目录有未提交改动，无法创建需求分支，请先提交或暂存")
+    completed = run_git(workspace, ["checkout", "-b", branch, base_branch])
+    if completed.returncode != 0:
+        raise BridgeFailure(f"创建需求分支失败：{(completed.stdout or '').strip() or 'git 退出异常'}")
+    return {"created": True, "baseBranch": base_branch, "branch": branch}
+
 VERSION_RE = re.compile(r"(?<!\d)(\d+(?:\.\d+)+)")
 
 
@@ -1194,6 +1745,8 @@ def environment_probe_status(entry: dict[str, Any], host: str = "") -> dict[str,
         "installed": False,
         "version": "",
     }
+    if result["id"] == "__git__":
+        result.update(github_ssh_key_status())
     if not probe:
         return result
     try:
@@ -1253,6 +1806,11 @@ def build_environment_setup_prompt(
             f"（{environment_command_for(GIT_PRESET, 'install', host)}）。"
             "装好后顺带确认 `git config --global user.name` 与 `git config --global user.email` 是否已配置，"
             "缺了就问用户要，不要自己编。"
+            "随后检查 `~/.ssh/config` 中 `Host github.com` 的 `IdentityFile`，且对应 `.pub` 文件必须是有效 SSH 公钥。"
+            "已有有效 GitHub 密钥时不要重建、不要覆盖；没有有效配置时，生成新的 ed25519 密钥对"
+            " `~/.ssh/id_ed25519_github_delivery_task_planner`，并在配置文件最前面写入带"
+            " `delivery-task-planner GitHub SSH key` 标记的 `Host github.com` 配置块。"
+            "绝不读取、展示或输出私钥；最后只输出公钥，并明确提示用户将它添加到 GitHub 账户的 SSH keys。"
         )
     for entry in environments:
         probe = environment_command_for(entry, "probe", host)
@@ -3414,6 +3972,7 @@ class ExecutionBridge:
             fast_mode,
         ) = validate_environment_setup_payload(raw)
         assert_runtime_project(config, program_id)
+        github_ssh_status = ensure_github_ssh_key() if use_git else {}
         identity = self._environment_setup_identity(program_id)
         store_key = self._environment_setup_store_key(provider, program_id)
         session = ENVIRONMENT_SETUP_SESSIONS.load(store_key, requested_thread_id)
@@ -3430,7 +3989,14 @@ class ExecutionBridge:
                 request_id=active["client"].next_request_id(),
             )
             self.progress.publish(identity, "message", "已追加预设要求", message, "running")
-            return {"accepted": True, "programId": program_id, "threadId": active["threadId"], "turnId": active["turnId"], "active": True}
+            return {
+                "accepted": True,
+                "programId": program_id,
+                "threadId": active["threadId"],
+                "turnId": active["turnId"],
+                "active": True,
+                **github_ssh_status,
+            }
         catalog = [dict(entry) for entry in (session or {}).get("catalog") or []]
         known_thread_ids = {str(entry.get("threadId") or "") for entry in catalog}
         if requested_thread_id and requested_thread_id not in known_thread_ids:
@@ -3497,7 +4063,7 @@ class ExecutionBridge:
             self.active.add(identity)
             self.active_runs[identity] = {
                 "client": client, "threadId": thread_id, "turnId": turn_id,
-                "environmentSetup": True, "provider": provider, "config": config, "programId": program_id,
+                "environmentSetup": True, "provider": provider, "config": config, "programId": program_id, "useGit": use_git,
             }
         # 目录当场落盘：这一轮还没跑完桥接就重启，会话列表里也得留着这条聊天。
         ENVIRONMENT_SETUP_SESSIONS.save(store_key, session)
@@ -3510,10 +4076,17 @@ class ExecutionBridge:
         )
         threading.Thread(
             target=self._follow_environment_setup,
-            args=(identity, client, store_key, session, thread_id, turn_id),
+            args=(identity, client, store_key, session, thread_id, turn_id, use_git),
             daemon=True,
         ).start()
-        return {"accepted": True, "programId": program_id, "threadId": thread_id, "turnId": turn_id, "active": True}
+        return {
+            "accepted": True,
+            "programId": program_id,
+            "threadId": thread_id,
+            "turnId": turn_id,
+            "active": True,
+            **github_ssh_status,
+        }
 
     def stop_environment_setup(self, raw: Any, config: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(raw, dict):
@@ -3540,10 +4113,14 @@ class ExecutionBridge:
         session: dict[str, Any],
         thread_id: str,
         turn_id: str,
+        use_git: bool,
     ) -> None:
         status = "failed"
         try:
             status = client.wait_turn(turn_id)
+            if use_git:
+                # Git may only have become available during the preset run.
+                ensure_github_ssh_key()
             session["turnId"] = turn_id
             for entry in session.get("catalog") or []:
                 if entry.get("threadId") == thread_id:
@@ -4458,6 +5035,132 @@ class ExecutionBridge:
                     self.active.discard(identity)
                     self.active_runs.pop(identity, None)
 
+    def _ensure_requirement_git_branch(self, config: dict[str, Any], program_id: int, task: dict[str, Any]) -> str:
+        """任务所属需求关联了 Git 分支时，执行前把工作目录切到该分支。
+
+        分支本身由需求窗口创建，这里只负责切换：本机没有这个分支说明需求分支还没建，
+        直接拦下来，比让执行器把改动提交到主干安全。
+        """
+        requirement_key = str(task.get("requirementKey") or "").strip()
+        if not requirement_key:
+            return ""
+        try:
+            requirement = planner.request_api(
+                config,
+                "GET",
+                "/delivery/requirement",
+                query={"programId": program_id, "requirementKey": requirement_key},
+            )
+        except planner.ToolFailure as exc:
+            raise BridgeFailure(f"读取需求 Git 设置失败：{exc}") from exc
+        if not isinstance(requirement, dict) or not requirement.get("gitEnabled"):
+            return ""
+        branch = str(requirement.get("gitBranch") or "").strip()
+        if not branch:
+            return ""
+        if not valid_git_branch_name(branch):
+            raise BridgeFailure(f"需求关联的分支名不合法：{branch}")
+        require_git_workspace(self.workspace)
+        if not git_branch_exists(self.workspace, branch):
+            raise BridgeFailure(f"本机不存在需求分支 {branch}，请先在需求窗口创建分支")
+        current = git_current_branch(self.workspace)
+        if current == branch:
+            return branch
+        # 同一个工作目录同时只能停在一个分支上；已有任务在跑时切分支会影响它们。
+        with self.lock:
+            busy = sorted(key for _, _, key in self.active)
+        if busy:
+            raise BridgeFailure(
+                f"本机仍有任务在分支 {current or 'HEAD'} 上执行（{', '.join(busy)}），无法切换到需求分支 {branch}"
+            )
+        git_checkout_branch(self.workspace, branch)
+        return branch
+
+    def push_requirement_branch(self, raw: Any, config: dict[str, Any] | None = None) -> dict[str, Any]:
+        """需求窗口的「推送到 Git」：先在本机提交并推送，失败或冲突再交给 AI 处理一轮。"""
+        if not isinstance(raw, dict):
+            raise BridgeFailure("请求体必须是 JSON 对象")
+        program_id = program_id_of(raw.get("programId"))
+        if not program_id:
+            raise BridgeFailure("缺少项目标识")
+        branch = str(raw.get("branch") or "").strip()
+        message = str(raw.get("message") or "")
+        provider = ai_provider_of(raw)
+        try:
+            result = git_push_branch(self.workspace, branch, message)
+            result["repaired"] = False
+            return result
+        except BridgeFailure as exc:
+            failure = str(exc)
+        config = request_scoped_config(config, "", program_id)
+        summary, status = self._repair_git_push(
+            config,
+            program_id,
+            branch,
+            git_commit_message_of(message, branch),
+            failure,
+            provider,
+            str(raw.get("model") or "").strip(),
+            reasoning_effort_of(raw, provider),
+            fast_mode_of(raw, provider),
+        )
+        remote = git_default_remote(self.workspace)
+        # 以仓库的真实状态判定成功与否，不采信 AI 的结论。
+        if not git_branch_synced(self.workspace, branch, remote):
+            raise BridgeFailure(f"推送失败，{provider_label(provider)} 也没能解决：{failure}\n\n处理说明：{summary or '无'}")
+        return {
+            "pushed": True,
+            "branch": branch,
+            "remote": remote,
+            "committed": True,
+            "commitMessage": "",
+            "upToDate": False,
+            "repaired": True,
+            "repairStatus": status,
+            "repairSummary": summary,
+            "output": failure,
+        }
+
+    def _repair_git_push(
+        self,
+        config: dict[str, Any],
+        program_id: int,
+        branch: str,
+        commit_message: str,
+        failure: str,
+        provider: str,
+        model: str,
+        reasoning_effort: str,
+        fast_mode: bool,
+    ) -> tuple[str, str]:
+        """起一轮 AI 会话专门修推送。超时就掐掉进程，不让 HTTP 请求无限期挂着。"""
+        remote = git_default_remote(self.workspace)
+        client = create_ai_client(provider, self.workspace, None, codex_environment(config, program_id))
+        try:
+            thread_id, turn_id = client.start_task(
+                f"推送需求分支 {branch}",
+                build_git_push_repair_prompt(self.workspace, branch, remote, failure, commit_message),
+                None,
+                model,
+                reasoning_effort=reasoning_effort,
+                fast_mode=fast_mode,
+            )
+            outcome: dict[str, str] = {}
+
+            def wait() -> None:
+                outcome["status"] = client.wait_turn(turn_id)
+
+            waiter = threading.Thread(target=wait, daemon=True)
+            waiter.start()
+            waiter.join(GIT_PUSH_REPAIR_TIMEOUT_SECONDS)
+            if waiter.is_alive():
+                return "", "timeout"
+            status = outcome.get("status") or "failed"
+            turn = client.read_turn(thread_id, turn_id, client.next_request_id())
+            return final_agent_text_from_output(execution_output(status, turn)), status
+        finally:
+            client.close()
+
     def execute(self, raw: Any, batch_claim: bool = False, config: dict[str, Any] | None = None) -> dict[str, Any]:
         payload = validate_execute_payload(raw)
         provider = payload["provider"]
@@ -4498,6 +5201,7 @@ class ExecutionBridge:
         if isinstance(detail, dict) and detail.get("itemKey"):
             task = detail
         payload["task"] = task
+        payload["gitBranch"] = self._ensure_requirement_git_branch(config, program_id, task)
         item_key = str(task["itemKey"])
         identity = task_identity(biz_line, program_id, item_key)
         with self.lock:
@@ -6558,6 +7262,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
         if parsed.path == "/healthz":
             self.json_response(200, self.bridge.health())
             return
+        if parsed.path == "/v1/plugin/update":
+            self.json_response(200, plugin_update_status())
+            return
         if parsed.path in {"/v1/codex/workspaces", "/v1/codex/workspace/validate"}:
             if not self.allowed_origin():
                 self.json_response(403, {"error": "origin not allowed"})
@@ -6585,6 +7292,25 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 self.json_response(400, {"error": str(exc)})
             except Exception as exc:
                 self.json_response(500, {"error": f"读取 Codex 工作目录失败：{exc}"})
+            return
+        if parsed.path == "/v1/codex/git/branches":
+            if not self.allowed_origin():
+                self.json_response(403, {"error": "origin not allowed"})
+                return
+            query = parse_qs(parsed.query)
+            program_id = program_id_of((query.get("programId") or [""])[0])
+            try:
+                self.bridge.request_config(
+                    {"programId": program_id},
+                    self.allowed_origin() or "",
+                    self.headers.get("token", "").strip(),
+                )
+                selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
+                self.json_response(200, git_branch_catalog(selected_bridge.workspace))
+            except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
+                self.json_response(400, {"error": str(exc)})
+            except Exception as exc:
+                self.json_response(500, {"error": f"读取 Git 分支失败：{exc}"})
             return
         if parsed.path in {"/v1/codex/health", "/v1/codex/models", "/v1/ai/health", "/v1/ai/models"}:
             if not self.allowed_origin():
@@ -6921,6 +7647,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
             "/v1/codex/requirement-testing/stop",
             "/v1/codex/attachments",
             "/v1/codex/prototype-directory/open",
+            "/v1/codex/git/branch",
+            "/v1/codex/git/push",
             "/v1/codex/requirement-document",
             "/v1/codex/requirement-outline",
             "/v1/codex/stop",
@@ -7009,6 +7737,14 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 self.json_response(200, selected_bridge.save_requirement_outline(
                     program_id_of(payload.get("programId")), requirement_key, markdown, config=config,
                 ))
+            elif path == "/v1/codex/git/push":
+                self.json_response(200, selected_bridge.push_requirement_branch(payload, config))
+            elif path == "/v1/codex/git/branch":
+                self.json_response(200, git_create_branch(
+                    selected_bridge.workspace,
+                    str(payload.get("baseBranch") or "").strip(),
+                    str(payload.get("branch") or "").strip(),
+                ))
             elif path == "/v1/codex/prototype-directory/open":
                 item_key = str(payload.get("itemKey") or "").strip()
                 if not item_key:
@@ -7080,8 +7816,6 @@ def main() -> None:
     # 不给就落到一个空的中性占位目录，绝不拿安装目录或启动目录冒充某个项目的仓库。
     parser.add_argument("--workspace", default="")
     parser.add_argument("--allow-origin", action="append", default=[])
-    parser.add_argument("--cert-file", default=str(DEFAULT_TLS_CERTIFICATE))
-    parser.add_argument("--key-file", default=str(DEFAULT_TLS_KEY))
     args = parser.parse_args()
     if args.host not in {"127.0.0.1", "::1", "localhost"}:
         raise SystemExit("HTTP bridge must listen on loopback")
@@ -7092,11 +7826,7 @@ def main() -> None:
     else:
         workspace = placeholder_workspace()
     origins = set(args.allow_origin or ["*"])
-    certificate = Path(args.cert_file).expanduser()
-    private_key = Path(args.key_file).expanduser()
-    if not certificate.is_file() or not private_key.is_file():
-        raise SystemExit("HTTPS bridge certificate is missing. Run scripts/start_http.sh to initialize it.")
-    httpd = create_https_server(args.host, args.port, workspace, origins, certificate, private_key)
+    httpd = create_http_server(args.host, args.port, workspace, origins)
     threading.Thread(target=httpd.bridge.reconcile_forever, daemon=True).start()  # type: ignore[attr-defined]
     httpd.serve_forever()
 
