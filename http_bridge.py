@@ -7224,6 +7224,11 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 self.send_header("Vary", "Origin")
             self.send_header("Access-Control-Allow-Headers", "Content-Type, token")
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            # 面板可能部署在公网origin，浏览器把到 127.0.0.1 的请求当作私有网络访问，
+            # preflight 会带 Access-Control-Request-Private-Network，缺了这个应答头就直接报跨域。
+            if self.headers.get("Access-Control-Request-Private-Network", "").strip().lower() == "true":
+                self.send_header("Access-Control-Allow-Private-Network", "true")
+            self.send_header("Access-Control-Max-Age", "600")
 
     def json_response(self, status: int, value: dict[str, Any]) -> None:
         raw = json.dumps(value, ensure_ascii=False).encode("utf-8")
