@@ -1564,6 +1564,85 @@ class HttpBridgeTest(unittest.TestCase):
 
         self.assertEqual(["a", "b", "c", "d"], started)
 
+    def test_batch_continues_after_an_unsubstantive_interruption(self):
+        statuses = {"a": "blocked", "b": "todo"}
+        dependencies = {"a": [], "b": ["a"]}
+        started: list[str] = []
+        executor = bridge.ExecutionBridge(Path.cwd())
+
+        def project_context(*_args):
+            return {
+                "items": [
+                    {"itemKey": key, "status": status, "dependsOnItemKeys": dependencies[key]}
+                    for key, status in statuses.items()
+                ],
+            }
+
+        def task_detail(_config, _program_id, item_key):
+            output = "# Codex 执行结果\n\n- 状态：interrupted\n"
+            return {
+                "itemKey": item_key,
+                "title": item_key,
+                "version": 1,
+                "status": statuses[item_key],
+                "actionOutput": output if item_key == "a" else "# Codex 执行结果\n\n- 状态：completed\n",
+            }
+
+        def execute(payload, batch_claim=False, config=None):
+            self.assertTrue(batch_claim)
+            item_key = payload["task"]["itemKey"]
+            started.append(item_key)
+            if item_key == "b":
+                statuses[item_key] = "done"
+            return {"accepted": True}
+
+        with (
+            patch.object(bridge.planner, "project_context", side_effect=project_context),
+            patch.object(executor, "_task_detail", side_effect=task_detail),
+            patch.object(executor, "execute", side_effect=execute),
+        ):
+            executor._run_batch("batch-soft", self.runtime_config(), 1, ["a", "b"], "")
+
+        self.assertEqual(["a", "b"], started)
+        events = executor.progress.snapshot(("", 1, "a"))
+        self.assertTrue(any("已忽略" in event["title"] for event in events))
+
+    def test_batch_stops_and_reports_a_substantive_problem(self):
+        statuses = {"a": "blocked", "b": "todo"}
+        dependencies = {"a": [], "b": ["a"]}
+        started: list[str] = []
+        executor = bridge.ExecutionBridge(Path.cwd())
+
+        def project_context(*_args):
+            return {
+                "items": [
+                    {"itemKey": key, "status": status, "dependsOnItemKeys": dependencies[key]}
+                    for key, status in statuses.items()
+                ],
+            }
+
+        def task_detail(_config, _program_id, item_key):
+            output = (
+                "# Codex 执行结果\n\n- 状态：interrupted\n\n"
+                "批量判定：需人工处理\n"
+            )
+            return {"itemKey": item_key, "title": item_key, "version": 1, "status": statuses[item_key], "actionOutput": output}
+
+        def execute(payload, batch_claim=False, config=None):
+            started.append(payload["task"]["itemKey"])
+            return {"accepted": True}
+
+        with (
+            patch.object(bridge.planner, "project_context", side_effect=project_context),
+            patch.object(executor, "_task_detail", side_effect=task_detail),
+            patch.object(executor, "execute", side_effect=execute),
+        ):
+            executor._run_batch("batch-hard", self.runtime_config(), 1, ["a", "b"], "")
+
+        self.assertEqual(["a"], started)
+        events = executor.progress.snapshot(("", 1, "a"))
+        self.assertTrue(any(event["kind"] == "error" for event in events))
+
     def test_execute_batch_accepts_ready_not_started_items(self):
         context = {
             "items": [
@@ -2240,6 +2319,29 @@ class HttpBridgeTest(unittest.TestCase):
         merged = bridge.merged_execution_output("第一轮", "第二轮")
         self.assertEqual("第一轮\n\n---\n\n第二轮\n", merged)
 
+    def test_batch_task_outcome_distinguishes_interruption_from_real_blocker(self):
+        self.assertEqual(
+            "ignorable",
+            bridge.batch_task_outcome(
+                {"status": "blocked", "actionOutput": "# Codex 执行结果\n\n- 状态：interrupted\n"}
+            )[0],
+        )
+        self.assertEqual(
+            "hard",
+            bridge.batch_task_outcome(
+                {
+                    "status": "blocked",
+                    "actionOutput": "# Codex 执行结果\n\n- 状态：interrupted\n\n编译失败，需人工处理。",
+                } 
+            )[0],
+        )
+        self.assertEqual(
+            "ignorable",
+            bridge.batch_task_outcome(
+                {"status": "blocked", "actionOutput": "# Codex 执行结果\n\n- 状态：failed\n"}
+            )[0],
+        )
+
     def test_merged_execution_output_drops_the_oldest_rounds_at_the_size_limit(self):
         merged = bridge.merged_execution_output("旧" * bridge.EXECUTION_OUTPUT_LIMIT, "最新一轮产物")
 
@@ -2613,6 +2715,37 @@ class GitBranchTest(unittest.TestCase):
             with self.assertRaises(bridge.BridgeFailure):
                 bridge.git_branch_catalog(Path(plain))
 
+    def test_workspace_status_reports_current_branch_dirty_state_and_expected_remote(self):
+        remote = self.add_origin()
+        expected = str(remote)
+        status = bridge.git_workspace_status(self.workspace, expected)
+
+        self.assertEqual("main", status["currentBranch"])
+        self.assertTrue(status["remoteMatches"])
+        self.assertFalse(status["dirty"])
+        self.assertEqual(0, status["changed"])
+        self.assertNotIn("remoteUrl", status)
+        self.assertNotIn("expectedRemoteUrl", status)
+        (self.workspace / "README.md").write_text("dirty", encoding="utf-8")
+
+        dirty = bridge.git_workspace_status(self.workspace, expected)
+        self.assertTrue(dirty["dirty"])
+        self.assertEqual(1, dirty["changed"])
+        self.assertGreaterEqual(dirty["unstaged"], 1)
+
+        subprocess.run(["git", "-C", str(self.workspace), "add", "README.md"], check=True, capture_output=True)
+        (self.workspace / "README.md").write_text("partially staged", encoding="utf-8")
+        partially_staged = bridge.git_workspace_status(self.workspace, expected)
+        self.assertEqual(1, partially_staged["changed"])
+        self.assertGreaterEqual(partially_staged["staged"], 1)
+        self.assertGreaterEqual(partially_staged["unstaged"], 1)
+
+    def test_workspace_status_detects_a_different_expected_remote(self):
+        self.add_origin()
+        status = bridge.git_workspace_status(self.workspace, "git@github.com:example/other.git")
+
+        self.assertFalse(status["remoteMatches"])
+
     def test_create_branch_switches_to_the_new_requirement_branch(self):
         result = bridge.git_create_branch(self.workspace, "main", "feature/issue_req-1787112353409")
         self.assertTrue(result["created"])
@@ -2633,6 +2766,51 @@ class GitBranchTest(unittest.TestCase):
         (self.workspace / "README.md").write_text("dirty", encoding="utf-8")
         with self.assertRaises(bridge.BridgeFailure):
             bridge.git_create_branch(self.workspace, "main", "feature/issue_req-1787112353410")
+
+    def test_prepare_branch_stashes_uncommitted_changes_before_switching(self):
+        self.add_origin()
+        branch = "feature/issue_req-1"
+        bridge.git_create_branch(self.workspace, "main", branch)
+        bridge.git_checkout_branch(self.workspace, "main")
+        (self.workspace / "README.md").write_text("dirty", encoding="utf-8")
+
+        result = bridge.git_prepare_branch(self.workspace, branch, "stash")
+
+        self.assertEqual(branch, result["branch"])
+        self.assertTrue(result["stashed"])
+        self.assertFalse(bridge.git_worktree_dirty(self.workspace))
+        stash = subprocess.run(
+            ["git", "-C", str(self.workspace), "stash", "list"], check=True, capture_output=True, text=True,
+        )
+        self.assertIn("delivery-task-planner", stash.stdout)
+
+    def test_prepare_branch_commits_uncommitted_changes_before_switching(self):
+        self.add_origin()
+        branch = "feature/issue_req-1"
+        bridge.git_create_branch(self.workspace, "main", branch)
+        bridge.git_checkout_branch(self.workspace, "main")
+        (self.workspace / "README.md").write_text("dirty", encoding="utf-8")
+
+        result = bridge.git_prepare_branch(self.workspace, branch, "commit", "chore: preserve main")
+
+        self.assertEqual(branch, result["branch"])
+        self.assertTrue(result["committed"])
+        log = subprocess.run(
+            ["git", "-C", str(self.workspace), "log", "main", "-1", "--format=%s"],
+            check=True, capture_output=True, text=True,
+        )
+        self.assertEqual("chore: preserve main", log.stdout.strip())
+
+    def test_prepare_branch_returns_a_consistent_status_shape_when_already_on_target(self):
+        result = bridge.git_prepare_branch(self.workspace, "main")
+
+        self.assertEqual("main", result["branch"])
+        self.assertIn("status", result)
+        self.assertEqual("main", result["status"]["currentBranch"])
+
+    def test_prepare_branch_rejects_an_unknown_change_strategy(self):
+        with self.assertRaises(bridge.BridgeFailure):
+            bridge.git_prepare_branch(self.workspace, "main", "discard")
 
     def add_origin(self) -> Path:
         remote = Path(tempfile.mkdtemp())

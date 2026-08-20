@@ -874,6 +874,15 @@ def build_task_prompt(payload: dict[str, Any], workspace: Path | None = None) ->
         "完成后说明修改内容和验证结果；无法完成时明确说明阻塞原因。",
         "如果生成了用户需要查看或下载的文件、文档或图片，请在最终回复中用 Markdown 链接列出其工作区相对路径。",
     ]
+    if bool(payload.get("batchMode")):
+        lines.extend(
+            [
+                "这是批量执行队列中的一项任务。完成时在最终回复最后单独输出一行："
+                "`批量判定：完成`、`批量判定：可忽略` 或 `批量判定：需人工处理`。",
+                "只有短暂的连接/会话中断，或不影响交付物的命令、验收提示噪声，才能判定为可忽略；"
+                "代码、编译、测试、权限、依赖、数据或实际实现问题必须判定为需人工处理，并说明原因。",
+            ]
+        )
     lines.extend(sibling_document_lines(payload.get("requirementDocuments")))
     execution_constraints = str(payload.get("executionConstraints") or "").strip()
     if execution_constraints:
@@ -1501,6 +1510,7 @@ def ensure_github_ssh_key(home: Path | None = None) -> dict[str, Any]:
 
 GIT_BRANCH_NAME_RE = re.compile(r"[A-Za-z0-9._/-]{1,255}")
 GIT_REMOTE_PREFIX = "remotes/"
+GIT_REMOTE_NAME_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
 
 
 def valid_git_branch_name(value: str) -> bool:
@@ -1511,6 +1521,10 @@ def valid_git_branch_name(value: str) -> bool:
     if name.startswith(("-", "/", ".")) or name.endswith(("/", ".", ".lock")):
         return False
     return ".." not in name and "//" not in name and "@{" not in name
+
+
+def valid_git_remote_name(value: str) -> bool:
+    return bool(GIT_REMOTE_NAME_RE.fullmatch(str(value or "").strip()))
 
 
 def run_git(workspace: Path, args: list[str], timeout: int = 20) -> subprocess.CompletedProcess:
@@ -1582,6 +1596,176 @@ def git_branch_catalog(workspace: Path) -> dict[str, Any]:
             branches.append(name)
     branches.sort()
     return {"branches": branches, "defaultBranch": git_default_branch(workspace, branches)}
+
+
+def normalized_git_remote_url(value: str) -> str:
+    """用于显示层面的远端比较，忽略协议和 .git 尾缀的等价形式。"""
+    text = str(value or "").strip().rstrip("/")
+    if text.endswith(".git"):
+        text = text[:-4]
+    if text.startswith("git@") and ":" in text:
+        host, path = text[4:].split(":", 1)
+        text = f"{host}/{path}"
+    for prefix in ("ssh://git@", "https://", "http://"):
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+            break
+    return text.lower().rstrip("/")
+
+
+def git_remote_url(workspace: Path, remote: str) -> str:
+    if not valid_git_remote_name(remote):
+        raise BridgeFailure("Git 远端名称不合法")
+    completed = run_git(workspace, ["remote", "get-url", remote])
+    if completed.returncode != 0:
+        return ""
+    return (completed.stdout or "").strip()
+
+
+def git_worktree_summary(workspace: Path) -> dict[str, int | bool]:
+    """把 porcelain 状态压成面板需要的数量，绝不返回文件路径。"""
+    # porcelain 的前两位就是暂存区 / 工作区状态，不能复用 git_output：它会 trim
+    # 整段输出，恰好会吞掉第一行的前导空格，把 " M" 误读成 "M "。
+    completed = run_git(workspace, ["status", "--porcelain=v1"])
+    if completed.returncode != 0:
+        raise BridgeFailure(f"读取 Git 工作区状态失败：{(completed.stdout or '').strip() or 'git 退出异常'}")
+    output = (completed.stdout or "").rstrip()
+    changed = 0
+    staged = 0
+    unstaged = 0
+    untracked = 0
+    for line in output.splitlines():
+        changed += 1
+        if line.startswith("??"):
+            untracked += 1
+            continue
+        state = line[:2]
+        if state[:1] not in {" ", "?"}:
+            staged += 1
+        if len(state) > 1 and state[1:2] not in {" ", "?"}:
+            unstaged += 1
+    return {
+        "dirty": bool(output),
+        "changed": changed,
+        "staged": staged,
+        "unstaged": unstaged,
+        "untracked": untracked,
+    }
+
+
+def git_local_branch_for_reference(workspace: Path, reference: str, remote: str) -> tuple[str, str]:
+    """解析本地或远端分支引用，返回应使用的本地名和可选远端引用。"""
+    value = str(reference or "").strip()
+    if not valid_git_branch_name(value):
+        raise BridgeFailure("需求分支名不合法")
+    if git_branch_exists(workspace, value):
+        return value, ""
+    remote_prefix = f"{remote}/"
+    if value.startswith(remote_prefix):
+        local = value[len(remote_prefix):]
+        remote_ref = value
+    else:
+        local = value
+        remote_ref = f"{remote}/{value}"
+    if not valid_git_branch_name(local):
+        raise BridgeFailure("远端需求分支名不合法")
+    exists = run_git(workspace, ["rev-parse", "--verify", "--quiet", f"refs/remotes/{remote_ref}"])
+    if exists.returncode != 0:
+        raise BridgeFailure(f"本机和远端都不存在需求分支 {value}")
+    return local, remote_ref
+
+
+def git_checkout_reference(workspace: Path, reference: str, remote: str) -> str:
+    """切到本地分支；只有远端存在时创建受跟踪的本地分支。"""
+    local, remote_ref = git_local_branch_for_reference(workspace, reference, remote)
+    if git_current_branch(workspace) == local:
+        return local
+    if git_worktree_dirty(workspace):
+        raise BridgeFailure(f"工作目录有未提交改动，无法切换到分支 {local}，请先提交或暂存")
+    args = ["checkout", local] if not remote_ref else ["checkout", "-b", local, "--track", remote_ref]
+    completed = run_git(workspace, args)
+    if completed.returncode != 0:
+        raise BridgeFailure(f"切换分支 {local} 失败：{(completed.stdout or '').strip() or 'git 退出异常'}")
+    return local
+
+
+def git_workspace_status(workspace: Path, expected_remote_url: str = "", remote: str = "origin") -> dict[str, Any]:
+    """读取项目当前 Git 状态。此函数只做本机读取，不 fetch、不切换、不写入。"""
+    require_git_workspace(workspace)
+    if not valid_git_remote_name(remote):
+        raise BridgeFailure("Git 远端名称不合法")
+    actual_remote_url = git_remote_url(workspace, remote)
+    expected = str(expected_remote_url or "").strip()
+    remote_matches = not expected or (
+        bool(actual_remote_url) and normalized_git_remote_url(actual_remote_url) == normalized_git_remote_url(expected)
+    )
+    summary = git_worktree_summary(workspace)
+    current = git_current_branch(workspace)
+    # 远端地址可能包含嵌入式凭据；浏览器只需要知道是否一致，不能回传具体地址。
+    return {
+        "workspace": str(workspace),
+        "isGitRepository": True,
+        "remoteName": remote,
+        "remoteMatches": remote_matches,
+        "currentBranch": current,
+        "detached": not bool(current),
+        "checkedAt": int(time.time()),
+        **summary,
+    }
+
+
+def git_prepare_branch(
+    workspace: Path,
+    reference: str,
+    strategy: str = "switch",
+    commit_message: str = "",
+    expected_remote_url: str = "",
+    remote: str = "origin",
+) -> dict[str, Any]:
+    """用户确认后才处理未提交改动并切分支；绝不丢弃改动或自动应用 stash。"""
+    if strategy not in {"switch", "commit", "stash"}:
+        raise BridgeFailure("未知的 Git 分支处理方式")
+    status = git_workspace_status(workspace, expected_remote_url, remote)
+    if not status["remoteMatches"]:
+        raise BridgeFailure("本机 Git 远端与项目配置不一致，请先确认项目仓库地址或工作目录")
+    if status["detached"]:
+        raise BridgeFailure("当前工作目录处于游离 HEAD，不能切换需求分支")
+    local, _ = git_local_branch_for_reference(workspace, reference, remote)
+    if status["currentBranch"] == local:
+        return {
+            "branch": local,
+            "previousBranch": status["currentBranch"],
+            "committed": False,
+            "stashed": False,
+            "status": status,
+        }
+    committed = False
+    stashed = False
+    if status["dirty"]:
+        if strategy == "commit":
+            message = git_commit_message_of(commit_message, str(status["currentBranch"]))
+            if run_git(workspace, ["add", "--all"]).returncode != 0:
+                raise BridgeFailure("暂存当前工作区改动失败")
+            completed = run_git(workspace, ["commit", "-m", message], timeout=120)
+            if completed.returncode != 0:
+                raise BridgeFailure(f"提交当前分支改动失败：{(completed.stdout or '').strip() or 'git 退出异常'}")
+            committed = True
+        elif strategy == "stash":
+            label = f"delivery-task-planner: {status['currentBranch']} -> {local}"
+            completed = run_git(workspace, ["stash", "push", "--include-untracked", "-m", label], timeout=120)
+            if completed.returncode != 0:
+                raise BridgeFailure(f"暂存当前分支改动失败：{(completed.stdout or '').strip() or 'git 退出异常'}")
+            stashed = True
+        else:
+            raise BridgeFailure("工作目录有未提交改动，请选择先提交或暂存后再切换")
+    branch = git_checkout_reference(workspace, reference, remote)
+    return {
+        "branch": branch,
+        "committed": committed,
+        "stashed": stashed,
+        "previousBranch": status["currentBranch"],
+        "status": git_workspace_status(workspace, expected_remote_url, remote),
+    }
 
 
 def git_branch_exists(workspace: Path, branch: str) -> bool:
@@ -3428,6 +3612,11 @@ class ExecutionBridge:
         self.active_sequences: set[str] = set()
         self.sequence_tasks: set[tuple[int, str]] = set()
         self.batch_tasks: set[tuple[int, str]] = set()
+        # Queue-local dependency overrides are only used after a completed
+        # review marks an interrupted task as ignorable. They never affect a
+        # direct task execution request.
+        self.sequence_satisfied: dict[str, set[str]] = {}
+        self.batch_satisfied: dict[str, set[str]] = {}
         self.lock = threading.Lock()
         self.progress = progress or ProgressStore()
         self.pending_session_syncs = pending_session_syncs or PendingSessionSyncStore()
@@ -5043,10 +5232,10 @@ class ExecutionBridge:
                     self.active_runs.pop(identity, None)
 
     def _ensure_requirement_git_branch(self, config: dict[str, Any], program_id: int, task: dict[str, Any]) -> str:
-        """任务所属需求关联了 Git 分支时，执行前把工作目录切到该分支。
+        """任务所属需求关联了 Git 分支时，验证工作目录已由用户确认切换。
 
-        分支本身由需求窗口创建，这里只负责切换：本机没有这个分支说明需求分支还没建，
-        直接拦下来，比让执行器把改动提交到主干安全。
+        自动切分支会在多人和脏工作区场景中吞掉重要上下文，因此这里不再产生副作用；
+        用户必须先在需求列表的 Git 检查里确认提交、暂存或直接切换。
         """
         requirement_key = str(task.get("requirementKey") or "").strip()
         if not requirement_key:
@@ -5073,15 +5262,29 @@ class ExecutionBridge:
         current = git_current_branch(self.workspace)
         if current == branch:
             return branch
-        # 同一个工作目录同时只能停在一个分支上；已有任务在跑时切分支会影响它们。
+        raise BridgeFailure(
+            f"当前项目位于分支 {current or 'HEAD'}，与需求分支 {branch} 不一致；请先在需求列表执行 Git 检查并确认切换"
+        )
+
+    def prepare_requirement_git_branch(self, raw: Any) -> dict[str, Any]:
+        if not isinstance(raw, dict):
+            raise BridgeFailure("请求体必须是 JSON 对象")
+        branch = str(raw.get("branch") or "").strip()
+        if not branch:
+            raise BridgeFailure("缺少需求分支")
         with self.lock:
             busy = sorted(key for _, _, key in self.active)
         if busy:
-            raise BridgeFailure(
-                f"本机仍有任务在分支 {current or 'HEAD'} 上执行（{', '.join(busy)}），无法切换到需求分支 {branch}"
-            )
-        git_checkout_branch(self.workspace, branch)
-        return branch
+            raise BridgeFailure(f"本机仍有任务在执行（{', '.join(busy)}），不能切换项目分支")
+        remote = str(raw.get("remoteName") or "origin").strip() or "origin"
+        return git_prepare_branch(
+            self.workspace,
+            branch,
+            str(raw.get("strategy") or "switch").strip(),
+            str(raw.get("commitMessage") or ""),
+            str(raw.get("expectedRemoteUrl") or ""),
+            remote,
+        )
 
     def push_requirement_branch(self, raw: Any, config: dict[str, Any] | None = None) -> dict[str, Any]:
         """需求窗口的「推送到 Git」：先在本机提交并推送，失败或冲突再交给 AI 处理一轮。"""
@@ -5193,8 +5396,19 @@ class ExecutionBridge:
         if task.get("status") == "done":
             raise BridgeFailure("已完成任务不能再次执行")
         by_key = {str(item.get("itemKey")): item for item in context["items"]}
+        queue_id = str(payload.get("batchId") or payload.get("sequenceId") or "")
+        queue_satisfied: set[str] = set()
+        if queue_id:
+            with self.lock:
+                queue_items = self.batch_tasks if payload.get("batchId") else self.sequence_tasks
+                queue_identity = task_identity(biz_line, program_id, str(task.get("itemKey") or ""))
+                if queue_identity in queue_items:
+                    queue_satisfied = set(
+                        (self.batch_satisfied if payload.get("batchId") else self.sequence_satisfied).get(queue_id, set())
+                    )
         incomplete = [
-            key for key in task.get("dependsOnItemKeys") or [] if by_key.get(str(key), {}).get("status") != "done"
+            key for key in task.get("dependsOnItemKeys") or []
+            if by_key.get(str(key), {}).get("status") != "done" and str(key) not in queue_satisfied
         ]
         if incomplete:
             raise BridgeFailure("前置任务尚未全部完成：" + ", ".join(incomplete))
@@ -5420,6 +5634,7 @@ class ExecutionBridge:
                 raise BridgeFailure("任务已经在本地执行中：" + ", ".join(active_conflicts))
             self.active_sequences.add(sequence_id)
             self.sequence_tasks.update(reserved)
+            self.sequence_satisfied[sequence_id] = set()
         threading.Thread(
             target=self._run_sequence,
             args=(sequence_id, config, program_id, ordered, model, provider, execution_constraints, reasoning_effort, fast_mode),
@@ -5448,6 +5663,8 @@ class ExecutionBridge:
         fast_mode: bool = False,
     ) -> None:
         biz_line = config_biz_line(config)
+        with self.lock:
+            self.sequence_satisfied.setdefault(sequence_id, set())
         try:
             for item_key in item_keys:
                 task = self._task_detail(config, program_id, item_key)
@@ -5461,6 +5678,8 @@ class ExecutionBridge:
                         "task": task,
                         "model": model,
                         "provider": provider,
+                        "sequenceId": sequence_id,
+                        "batchMode": True,
                         **({"executionConstraints": execution_constraints} if execution_constraints else {}),
                         **({"reasoningEffort": reasoning_effort} if reasoning_effort else {}),
                         **({"fastMode": True} if fast_mode else {}),
@@ -5475,16 +5694,32 @@ class ExecutionBridge:
                         break
                     time.sleep(0.2)
                 completed_task = self._task_detail(config, program_id, item_key)
-                if completed_task.get("status") != "done":
-                    raise BridgeFailure(
-                        f"任务 {item_key} 未成功完成，队列已停止：{completed_task.get('status') or 'unknown'}"
+                outcome, reason = batch_task_outcome(completed_task)
+                if outcome == "ignorable":
+                    with self.lock:
+                        self.sequence_satisfied.setdefault(sequence_id, set()).add(item_key)
+                    self.progress.publish(
+                        identity,
+                        "status",
+                        "任务中断已忽略，继续串行队列",
+                        reason,
+                        "success",
                     )
+                    continue
+                if outcome != "completed":
+                    self.progress.publish(identity, "error", "串行队列已暂停", reason, "failed")
+                    raise BridgeFailure(
+                        f"任务 {item_key} 未成功完成，队列已停止：{reason}"
+                    )
+                with self.lock:
+                    self.sequence_satisfied.setdefault(sequence_id, set()).add(item_key)
         except Exception as exc:
             print(f"串行执行失败 {program_id}/{sequence_id}: {exc}", file=sys.stderr, flush=True)
         finally:
             with self.lock:
                 self.active_sequences.discard(sequence_id)
                 self.sequence_tasks.difference_update(task_identity(biz_line, program_id, key) for key in item_keys)
+                self.sequence_satisfied.pop(sequence_id, None)
 
     def execute_batch(self, raw: Any, config: dict[str, Any] | None = None) -> dict[str, Any]:
         if not isinstance(raw, dict):
@@ -5551,6 +5786,7 @@ class ExecutionBridge:
             if waiting:
                 raise BridgeFailure("任务正在等待批量启动：" + ", ".join(waiting))
             self.batch_tasks.update(reserved)
+            self.batch_satisfied[batch_id] = set()
         threading.Thread(
             target=self._run_batch,
             args=(batch_id, config, program_id, requested_keys, model, provider, execution_constraints, reasoning_effort, fast_mode),
@@ -5579,6 +5815,8 @@ class ExecutionBridge:
         fast_mode: bool = False,
     ) -> None:
         biz_line = config_biz_line(config)
+        with self.lock:
+            self.batch_satisfied.setdefault(batch_id, set())
         try:
             remaining = set(item_keys)
             while remaining:
@@ -5595,9 +5833,15 @@ class ExecutionBridge:
                 if not remaining:
                     return
 
+                with self.lock:
+                    satisfied = set(self.batch_satisfied.get(batch_id, set()))
                 ready = sorted(
                     key for key in remaining
-                    if all(by_key.get(str(dep), {}).get("status") == "done" for dep in by_key[key].get("dependsOnItemKeys") or [])
+                    if all(
+                        by_key.get(str(dep), {}).get("status") == "done"
+                        or str(dep) in satisfied
+                        for dep in by_key[key].get("dependsOnItemKeys") or []
+                    )
                 )
                 if not ready:
                     waiting = []
@@ -5618,6 +5862,8 @@ class ExecutionBridge:
                             "task": task,
                             "model": model,
                             "provider": provider,
+                            "batchId": batch_id,
+                            "batchMode": True,
                             **({"executionConstraints": execution_constraints} if execution_constraints else {}),
                             **({"reasoningEffort": reasoning_effort} if reasoning_effort else {}),
                             **({"fastMode": True} if fast_mode else {}),
@@ -5634,25 +5880,37 @@ class ExecutionBridge:
                         break
                     time.sleep(0.2)
 
-                completed_context = planner.project_context(config, program_id)
-                completed_by_key = {
-                    str(item.get("itemKey") or ""): item
-                    for item in completed_context.get("items") or []
-                    if isinstance(item, dict)
-                }
-                failed = sorted(
-                    f"{item_key}（{str(completed_by_key.get(item_key, {}).get('status') or 'missing')}）"
-                    for item_key in ready
-                    if completed_by_key.get(item_key, {}).get("status") != "done"
-                )
+                failed: list[str] = []
+                for item_key in ready:
+                    reviewed_task = self._task_detail(config, program_id, item_key)
+                    outcome, reason = batch_task_outcome(reviewed_task)
+                    identity = task_identity(biz_line, program_id, item_key)
+                    if outcome == "completed":
+                        with self.lock:
+                            self.batch_satisfied.setdefault(batch_id, set()).add(item_key)
+                        continue
+                    if outcome == "ignorable":
+                        with self.lock:
+                            self.batch_satisfied.setdefault(batch_id, set()).add(item_key)
+                        self.progress.publish(
+                            identity,
+                            "status",
+                            "任务中断已忽略，继续批量队列",
+                            reason,
+                            "success",
+                        )
+                        continue
+                    failed.append(f"{item_key}（{reason}）")
+                    self.progress.publish(identity, "error", "批量队列已暂停", reason, "failed")
                 if failed:
-                    raise BridgeFailure("批量队列已停止，当前并行任务未成功完成：" + "、".join(failed))
+                    raise BridgeFailure("批量队列已停止，当前并行任务存在需要处理的问题：" + "、".join(failed))
                 remaining.difference_update(ready)
         except Exception as exc:
             print(f"批量执行失败 {program_id}/{batch_id}: {exc}", file=sys.stderr, flush=True)
         finally:
             with self.lock:
                 self.batch_tasks.difference_update(task_identity(biz_line, program_id, key) for key in item_keys)
+                self.batch_satisfied.pop(batch_id, None)
 
     def conversation(
         self,
@@ -6981,6 +7239,9 @@ def execution_output(turn_status: str, turn: dict[str, Any]) -> str:
             if isinstance(command, list):
                 command = "\n".join(str(part) for part in command)
             lines.extend(["## 执行命令", "", "```sh", str(command), "```", ""])
+            exit_code = item.get("exitCode")
+            if exit_code not in (None, 0):
+                lines.extend([f"命令结果：失败（退出码 {exit_code}）", ""])
     raw = "\n".join(lines).strip() + "\n"
     encoded = raw.encode("utf-8")
     if len(encoded) <= EXECUTION_OUTPUT_LIMIT:
@@ -7026,6 +7287,55 @@ def testing_verdict_from_output(output: str) -> str:
     final_text = final_agent_text_from_output(output)
     match = re.search(r"(?m)^\s*验收判定\s*[:：]\s*(通过|不通过|受阻)\s*$", final_text)
     return match.group(1) if match else ""
+
+
+BATCH_OUTCOME_RE = re.compile(r"(?m)^\s*批量判定\s*[:：]\s*(完成|可忽略|需人工处理)\s*$")
+BATCH_TURN_STATUS_RE = re.compile(r"(?m)^\s*-?\s*状态\s*[:：]\s*([A-Za-z]+)\s*$")
+# These markers are intentionally limited to evidence of a deliverable-level
+# problem. A generic "warning" or a command mention must not stop a queue.
+BATCH_HARD_PROBLEM_RE = re.compile(
+    r"(?:无法(?:完成|实现|继续|验证)|(?:编译|构建|测试|命令).{0,20}(?:失败|错误|不通过)|"
+    r"命令结果.{0,12}失败|退出码\s*[1-9]\d*|"
+    r"(?:需要|需)(?:人工|处理)|(?:权限|依赖|数据).{0,12}(?:不足|缺少|错误)|阻塞|受阻|冲突)",
+    re.IGNORECASE,
+)
+
+
+def batch_task_outcome(task: dict[str, Any]) -> tuple[str, str]:
+    """Classify a finished queue item without changing its authoritative task status.
+
+    ``completed`` means the task board already accepted the task. ``ignorable``
+    is a queue-local skip for a transient interruption; the task remains
+    blocked so the user can inspect and retry it later. Everything else is a
+    real queue blocker.
+    """
+    status = str(task.get("status") or "").strip().lower()
+    if status == "done":
+        return "completed", "任务已完成"
+
+    output = str(task.get("actionOutput") or task.get("testingReport") or "").strip()
+    final_text = final_agent_text_from_output(output)
+    explicit = BATCH_OUTCOME_RE.search(final_text)
+    if explicit:
+        verdict = explicit.group(1)
+        if verdict == "完成" and status == "done":
+            return "completed", "任务已完成"
+        if verdict == "可忽略":
+            return "ignorable", "执行回合已中断，但未发现代码、编译、测试或权限阻塞证据。"
+        return "hard", "执行器报告存在需要人工处理的实质问题。"
+
+    turn_status_match = BATCH_TURN_STATUS_RE.search(output)
+    turn_status = turn_status_match.group(1).lower() if turn_status_match else ""
+    if BATCH_HARD_PROBLEM_RE.search(final_text):
+        return "hard", "执行结果包含代码、编译、测试、权限、依赖或其他实质阻塞信息。"
+
+    # An interrupted turn with no substantive failure evidence is safe to
+    # bypass in the current queue. It is still blocked on the board and will
+    # remain visible for a later manual retry.
+    if turn_status in {"interrupted", "failed"}:
+        return "ignorable", "执行回合意外终止，未发现实质阻塞信息。"
+
+    return "hard", f"任务状态为 {status or 'unknown'}，且没有可忽略判定。"
 
 
 def text_from_user_item(item: dict[str, Any]) -> str:
@@ -7305,7 +7615,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self.json_response(500, {"error": f"读取 Codex 工作目录失败：{exc}"})
             return
-        if parsed.path == "/v1/codex/git/branches":
+        if parsed.path in {"/v1/codex/git/branches", "/v1/codex/git/status"}:
             if not self.allowed_origin():
                 self.json_response(403, {"error": "origin not allowed"})
                 return
@@ -7318,7 +7628,14 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     self.headers.get("token", "").strip(),
                 )
                 selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
-                self.json_response(200, git_branch_catalog(selected_bridge.workspace))
+                if parsed.path.endswith("/status"):
+                    self.json_response(200, git_workspace_status(
+                        selected_bridge.workspace,
+                        str((query.get("expectedRemoteUrl") or [""])[0]),
+                        str((query.get("remoteName") or ["origin"])[0]),
+                    ))
+                else:
+                    self.json_response(200, git_branch_catalog(selected_bridge.workspace))
             except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
                 self.json_response(400, {"error": str(exc)})
             except Exception as exc:
@@ -7660,6 +7977,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
             "/v1/codex/attachments",
             "/v1/codex/prototype-directory/open",
             "/v1/codex/git/branch",
+            "/v1/codex/git/prepare",
             "/v1/codex/git/push",
             "/v1/codex/requirement-document",
             "/v1/codex/requirement-outline",
@@ -7757,6 +8075,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     str(payload.get("baseBranch") or "").strip(),
                     str(payload.get("branch") or "").strip(),
                 ))
+            elif path == "/v1/codex/git/prepare":
+                self.json_response(200, selected_bridge.prepare_requirement_git_branch(payload))
             elif path == "/v1/codex/prototype-directory/open":
                 item_key = str(payload.get("itemKey") or "").strip()
                 if not item_key:
