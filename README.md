@@ -25,7 +25,7 @@ Install or refresh it through the standard personal marketplace flow:
 ./scripts/install_personal.sh
 ```
 
-The script publishes this source to `~/plugins/delivery-task-planner` and runs `codex plugin add delivery-task-planner@personal`. The personal marketplace entry must already exist; create it with the Codex `plugin-creator` standard flow on a new machine.
+The script publishes this source to `~/plugins/delivery-task-planner` and runs `codex plugin add delivery-task-planner@personal`. The personal marketplace entry must already exist; create it with the Codex `plugin-creator` standard flow on a new machine. If the standalone Codex CLI is absent, the installer copies the bundled CLI from Codex Desktop (or ChatGPT on macOS) into the task-board runtime directory; the bridge uses the same fallback when it starts work.
 
 On Windows, run `powershell -ExecutionPolicy Bypass -File .\scripts\install_personal.ps1` from this directory. It installs the plugin for the current user and registers the local HTTP bridge as the current user's logon task.
 

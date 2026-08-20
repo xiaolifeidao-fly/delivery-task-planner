@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
 import importlib.util
+import io
+import json
 import os
 import tempfile
 import unittest
@@ -16,6 +18,44 @@ SPEC.loader.exec_module(server)
 
 
 class DeliveryTaskPlannerTest(unittest.TestCase):
+    def test_mcp_content_length_frame_reads_utf8_and_writes_a_framed_response(self):
+        request = {"jsonrpc": "2.0", "id": 7, "method": "ping", "params": {"message": "中文"}}
+        payload = json.dumps(request, ensure_ascii=False).encode("utf-8")
+        source = io.BytesIO(b"Content-Length: " + str(len(payload)).encode("ascii") + b"\r\n\r\n" + payload)
+
+        message, framed = server.read_mcp_message(source) or ({}, False)
+        self.assertTrue(framed)
+        self.assertEqual(request, message)
+
+        target = io.BytesIO()
+        server.write_mcp_message(target, {"jsonrpc": "2.0", "id": 7, "result": {"text": "中文"}}, framed)
+        header, response_payload = target.getvalue().split(b"\r\n\r\n", 1)
+        self.assertIn(f"Content-Length: {len(response_payload)}".encode("ascii"), header)
+        self.assertEqual("中文", json.loads(response_payload.decode("utf-8"))["result"]["text"])
+
+    def test_mcp_legacy_json_line_stays_line_delimited(self):
+        source = io.BytesIO(b'{"jsonrpc":"2.0","id":1,"method":"ping"}\n')
+
+        message, framed = server.read_mcp_message(source) or ({}, True)
+        self.assertFalse(framed)
+        self.assertEqual("ping", message["method"])
+
+        target = io.BytesIO()
+        server.write_mcp_message(target, {"jsonrpc": "2.0", "id": 1, "result": {}}, framed)
+        self.assertEqual({"jsonrpc": "2.0", "id": 1, "result": {}}, json.loads(target.getvalue().decode("utf-8")))
+
+    def test_mcp_framed_request_keeps_framing_for_unexpected_errors(self):
+        payload = b'{"jsonrpc":"2.0","id":1,"method":"ping"}'
+        source = io.BytesIO(b"Content-Length: " + str(len(payload)).encode("ascii") + b"\r\n\r\n" + payload)
+        target = io.BytesIO()
+
+        with patch.object(server, "handle", side_effect=RuntimeError("broken")):
+            server.serve_stdio(source, target)
+
+        header, response_payload = target.getvalue().split(b"\r\n\r\n", 1)
+        self.assertTrue(header.startswith(b"Content-Length: "))
+        self.assertEqual("broken", json.loads(response_payload.decode("utf-8"))["error"]["message"])
+
     def test_api_request_does_not_forward_business_line_header(self):
         response = MagicMock()
         response.read.return_value = b'{"success": true, "data": []}'

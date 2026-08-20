@@ -851,6 +851,7 @@ class HttpBridgeTest(unittest.TestCase):
         self.assertIn("opus", command)
         self.assertEqual("high", command[command.index("--effort") + 1])
         self.assertIn("--fast", command)
+        self.assertEqual("utf-8", popen.call_args.kwargs["encoding"])
 
     def test_codex_models_are_limited_to_the_product_catalog(self):
         executor = bridge.ExecutionBridge(Path.cwd())
@@ -871,6 +872,31 @@ class HttpBridgeTest(unittest.TestCase):
         self.assertFalse(claude_health["ready"])
         self.assertEqual("claude", claude_health["executorType"])
         self.assertIn("Claude CLI", claude_health["message"])
+
+    def test_windows_health_recognizes_a_copied_codex_executable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            copied_cli = Path(directory) / "bin" / "codex.exe"
+            copied_cli.parent.mkdir()
+            copied_cli.write_bytes(b"codex")
+            executor = bridge.ExecutionBridge(Path.cwd())
+            with patch.object(bridge.shutil, "which", return_value=None):
+                with patch.object(bridge, "host_platform", return_value="windows"):
+                    with patch.object(bridge, "RUNTIME_DIR", Path(directory)):
+                        self.assertTrue(executor.health("codex")["ready"])
+
+    def test_codex_desktop_resource_is_copied_when_the_cli_is_missing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "resources" / "codex.exe"
+            source.parent.mkdir()
+            source.write_bytes(b"desktop-codex")
+            runtime = root / "runtime"
+            with patch.object(bridge.shutil, "which", return_value=None):
+                with patch.object(bridge, "codex_desktop_resource_paths", return_value=[source]):
+                    copied = bridge.provision_codex_cli("windows", runtime)
+
+            self.assertEqual(runtime / "bin" / "codex.exe", Path(copied))
+            self.assertEqual(b"desktop-codex", Path(copied).read_bytes())
 
     def test_bridge_rejects_project_code_as_program_id(self):
         with self.assertRaisesRegex(bridge.BridgeFailure, "数值主键"):
@@ -2525,6 +2551,89 @@ class HttpBridgeTest(unittest.TestCase):
             self.assertEqual("doc/api/a/文档.md", result["path"])
             self.assertEqual("# API 需求\n\n待梳理\n", saved.read_text(encoding="utf-8"))
 
+    def test_document_set_lists_every_document_of_the_task_document_column(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            column = workspace / "doc/api/a"
+            column.mkdir(parents=True)
+            (column / "文档.md").write_text("# 需求\n", encoding="utf-8")
+            (column / "接口设计.md").write_text("# 接口\n", encoding="utf-8")
+            (column / "截图.png").write_bytes(b"\x89PNG")
+            executor = bridge.ExecutionBridge(workspace)
+            with patch.object(executor, "_task_detail", return_value={"requirementDocumentPath": "doc/api/a/文档.md"}):
+                result = executor.document_set(1, "task-document", "a", config=self.runtime_config())
+
+            self.assertEqual("doc/api/a", result["directory"])
+            self.assertEqual("doc/api/a/文档.md", result["primaryPath"])
+            self.assertEqual(
+                {"doc/api/a/文档.md", "doc/api/a/接口设计.md"},
+                {entry["path"] for entry in result["files"]},
+            )
+
+    def test_document_set_falls_back_to_the_first_document_when_the_primary_one_is_missing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            column = workspace / "doc/test/a"
+            column.mkdir(parents=True)
+            (column / "测试计划.md").write_text("# 计划\n", encoding="utf-8")
+            executor = bridge.ExecutionBridge(workspace)
+            with patch.object(executor, "_task_detail", return_value={"requirementDocumentPath": "doc/api/a/文档.md"}):
+                result = executor.document_set(1, "task-testing", "a", config=self.runtime_config())
+
+            self.assertEqual("doc/test/a/测试计划.md", result["primaryPath"])
+
+    def test_requirement_outline_column_ignores_the_prototype_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            column = workspace / "doc/requirements/req-a"
+            (column / "prototype").mkdir(parents=True)
+            (column / "需求大纲.md").write_text("# 大纲\n", encoding="utf-8")
+            (column / "补充说明.md").write_text("# 补充\n", encoding="utf-8")
+            (column / "prototype" / "说明.md").write_text("# 原型\n", encoding="utf-8")
+            executor = bridge.ExecutionBridge(workspace)
+            with patch.object(executor, "_requirement_for_prototype", return_value={"requirementKey": "req-a"}):
+                result = executor.document_set(1, "requirement-outline", "req-a", config=self.runtime_config())
+
+            self.assertEqual(
+                {"doc/requirements/req-a/需求大纲.md", "doc/requirements/req-a/补充说明.md"},
+                {entry["path"] for entry in result["files"]},
+            )
+
+    def test_document_file_refuses_a_path_outside_its_column(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            (workspace / "doc/api/a").mkdir(parents=True)
+            (workspace / "doc/secret.md").write_text("# 机密\n", encoding="utf-8")
+            executor = bridge.ExecutionBridge(workspace)
+            with patch.object(executor, "_task_detail", return_value={"requirementDocumentPath": "doc/api/a/文档.md"}):
+                with self.assertRaises(bridge.BridgeFailure):
+                    executor.document_file(1, "task-document", "a", "doc/secret.md", config=self.runtime_config())
+
+    def test_saving_a_column_document_only_overwrites_an_existing_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            column = workspace / "doc/api/a"
+            column.mkdir(parents=True)
+            (column / "接口设计.md").write_text("# 接口\n", encoding="utf-8")
+            executor = bridge.ExecutionBridge(workspace)
+            with patch.object(executor, "_task_detail", return_value={"requirementDocumentPath": "doc/api/a/文档.md"}):
+                saved = executor.save_document_file(
+                    1, "task-document", "a", "doc/api/a/接口设计.md", "# 接口\n\n新增字段", config=self.runtime_config(),
+                )
+                with self.assertRaisesRegex(bridge.BridgeFailure, "文档不存在"):
+                    executor.save_document_file(
+                        1, "task-document", "a", "doc/api/a/新文档.md", "# 新", config=self.runtime_config(),
+                    )
+
+            self.assertTrue(saved["exists"])
+            self.assertEqual("# 接口\n\n新增字段\n", (column / "接口设计.md").read_text(encoding="utf-8"))
+
+    def test_unknown_document_column_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            executor = bridge.ExecutionBridge(Path(directory))
+            with self.assertRaisesRegex(bridge.BridgeFailure, "未知的文档栏目"):
+                executor.document_set(1, "task-unknown", "a", config=self.runtime_config())
+
     def test_legacy_task_outline_is_migrated_without_overwriting_the_new_document(self):
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
@@ -2801,6 +2910,45 @@ class GitBranchTest(unittest.TestCase):
         )
         self.assertEqual("chore: preserve main", log.stdout.strip())
 
+    def test_prepare_branch_stashes_dirty_submodules_before_switching(self):
+        submodule = self.add_submodule()
+        branch = "feature/issue_req-submodule-stash"
+        bridge.git_create_branch(self.workspace, "main", branch)
+        bridge.git_checkout_branch(self.workspace, "main")
+        (submodule / "README.md").write_text("dirty", encoding="utf-8")
+
+        result = bridge.git_prepare_branch(self.workspace, branch, "stash")
+
+        self.assertEqual(branch, result["branch"])
+        self.assertTrue(result["stashed"])
+        self.assertFalse(bridge.git_worktree_dirty(self.workspace))
+        stash = subprocess.run(
+            ["git", "-C", str(submodule), "stash", "list"], check=True, capture_output=True, text=True,
+        )
+        self.assertIn("delivery-task-planner", stash.stdout)
+
+    def test_prepare_branch_commits_dirty_submodules_before_switching(self):
+        submodule = self.add_submodule()
+        branch = "feature/issue_req-submodule-commit"
+        bridge.git_create_branch(self.workspace, "main", branch)
+        bridge.git_checkout_branch(self.workspace, "main")
+        (submodule / "README.md").write_text("dirty", encoding="utf-8")
+
+        result = bridge.git_prepare_branch(self.workspace, branch, "commit", "chore: preserve work")
+
+        self.assertEqual(branch, result["branch"])
+        self.assertTrue(result["committed"])
+        self.assertFalse(bridge.git_worktree_dirty(self.workspace))
+        submodule_log = subprocess.run(
+            ["git", "-C", str(submodule), "log", "main", "-1", "--format=%s"], check=True, capture_output=True, text=True,
+        )
+        self.assertEqual("chore: preserve work (plugin/test-submodule)", submodule_log.stdout.strip())
+        parent_log = subprocess.run(
+            ["git", "-C", str(self.workspace), "log", "main", "-1", "--format=%s"],
+            check=True, capture_output=True, text=True,
+        )
+        self.assertEqual("chore: preserve work", parent_log.stdout.strip())
+
     def test_prepare_branch_returns_a_consistent_status_shape_when_already_on_target(self):
         result = bridge.git_prepare_branch(self.workspace, "main")
 
@@ -2818,6 +2966,29 @@ class GitBranchTest(unittest.TestCase):
         subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
         subprocess.run(["git", "-C", str(self.workspace), "remote", "add", "origin", str(remote)], check=True, capture_output=True)
         return remote
+
+    def add_submodule(self) -> Path:
+        source = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(source, ignore_errors=True))
+        for args in (
+            ["init", "--initial-branch=main"],
+            ["config", "user.email", "submodule@test"],
+            ["config", "user.name", "submodule"],
+        ):
+            subprocess.run(["git", "-C", str(source), *args], check=True, capture_output=True)
+        (source / "README.md").write_text("submodule", encoding="utf-8")
+        subprocess.run(["git", "-C", str(source), "add", "."], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(source), "commit", "-m", "init"], check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-C", str(self.workspace), "-c", "protocol.file.allow=always", "submodule", "add", str(source), "plugin/test-submodule"],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(["git", "-C", str(self.workspace), "commit", "-am", "add submodule"], check=True, capture_output=True)
+        submodule = self.workspace / "plugin/test-submodule"
+        subprocess.run(["git", "-C", str(submodule), "config", "user.email", "submodule@test"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(submodule), "config", "user.name", "submodule"], check=True, capture_output=True)
+        return submodule
 
     def test_push_commits_the_worktree_before_pushing(self):
         self.add_origin()

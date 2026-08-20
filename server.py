@@ -15,7 +15,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 
 CONFIG_PATH = Path(
@@ -1824,21 +1824,123 @@ def handle(message: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-def main() -> None:
-    for line in sys.stdin:
+class MCPProtocolError(Exception):
+    """A malformed stdio message together with the response format to use."""
+
+    def __init__(self, message: str, framed: bool = False):
+        super().__init__(message)
+        self.framed = framed
+
+
+def _read_exact(stream: BinaryIO, size: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining:
+        chunk = stream.read(remaining)
+        if not chunk:
+            raise MCPProtocolError("Content-Length 帧不完整", framed=True)
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def read_mcp_message(stream: BinaryIO) -> tuple[dict[str, Any], bool] | None:
+    """Read one JSON-RPC message in either legacy line or Content-Length form.
+
+    Older plugin hosts send one JSON object per line. Other MCP stdio clients
+    use HTTP-like headers followed by an exact UTF-8 byte payload. The response
+    mirrors the request framing, so the boolean records the received form.
+    """
+    while True:
+        first_line = stream.readline()
+        if not first_line:
+            return None
+        stripped = first_line.strip()
+        if stripped:
+            break
+
+    framed = b":" in stripped and not stripped.startswith((b"{", b"["))
+    if not framed:
         try:
-            message = json.loads(line)
+            message = json.loads(first_line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise MCPProtocolError(f"无效的 JSON-RPC 消息：{exc}") from exc
+    else:
+        headers: dict[str, str] = {}
+        line = first_line
+        while True:
+            if not line:
+                raise MCPProtocolError("Content-Length 帧缺少报文头结束标记", framed=True)
+            header = line.strip()
+            if not header:
+                break
+            name, separator, value = header.partition(b":")
+            if not separator:
+                raise MCPProtocolError("Content-Length 帧报文头无效", framed=True)
+            try:
+                headers[name.decode("ascii").strip().lower()] = value.decode("ascii").strip()
+            except UnicodeDecodeError as exc:
+                raise MCPProtocolError("Content-Length 帧报文头必须是 ASCII", framed=True) from exc
+            line = stream.readline()
+        raw_length = headers.get("content-length")
+        if raw_length is None:
+            raise MCPProtocolError("Content-Length 帧缺少 Content-Length", framed=True)
+        try:
+            content_length = int(raw_length)
+        except ValueError as exc:
+            raise MCPProtocolError("Content-Length 必须是非负整数", framed=True) from exc
+        if content_length < 0:
+            raise MCPProtocolError("Content-Length 必须是非负整数", framed=True)
+        try:
+            message = json.loads(_read_exact(stream, content_length).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise MCPProtocolError(f"无效的 Content-Length JSON-RPC 消息：{exc}", framed=True) from exc
+
+    if not isinstance(message, dict):
+        raise MCPProtocolError("JSON-RPC 消息必须是对象", framed=framed)
+    return message, framed
+
+
+def write_mcp_message(stream: BinaryIO, message: dict[str, Any], framed: bool) -> None:
+    """Write a JSON-RPC response using the same framing as the request."""
+    payload = json.dumps(message, ensure_ascii=False).encode("utf-8")
+    if framed:
+        stream.write(
+            b"Content-Length: " + str(len(payload)).encode("ascii")
+            + b"\r\nContent-Type: application/json; charset=utf-8\r\n\r\n" + payload
+        )
+    else:
+        stream.write(payload + b"\n")
+    stream.flush()
+
+
+def serve_stdio(input_stream: BinaryIO, output_stream: BinaryIO) -> None:
+    while True:
+        framed = False
+        try:
+            packet = read_mcp_message(input_stream)
+            if packet is None:
+                return
+            message, framed = packet
             response = handle(message)
             if response is not None:
-                print(json.dumps(response, ensure_ascii=False), flush=True)
-        except Exception as exc:
-            print(
-                json.dumps(
-                    {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": str(exc)}},
-                    ensure_ascii=False,
-                ),
-                flush=True,
+                write_mcp_message(output_stream, response, framed)
+        except MCPProtocolError as exc:
+            write_mcp_message(
+                output_stream,
+                {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": str(exc)}},
+                exc.framed,
             )
+        except Exception as exc:
+            write_mcp_message(
+                output_stream,
+                {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": str(exc)}},
+                framed,
+            )
+
+
+def main() -> None:
+    serve_stdio(sys.stdin.buffer, sys.stdout.buffer)
 
 
 if __name__ == "__main__":

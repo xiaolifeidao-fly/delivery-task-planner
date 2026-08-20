@@ -204,6 +204,14 @@ MAX_REQUIREMENT_OUTLINE_BYTES = 2 * 1024 * 1024
 # 面板直接编辑大纲时走 POST，请求体本身限制在 64KB 级别，这里留出同量级的正文上限。
 MAX_EDITABLE_OUTLINE_BYTES = 512 * 1024
 MAX_WORKSPACE_ARTIFACT_BYTES = 50 * 1024 * 1024
+# 需求大纲、任务文档、设计文档、测试用例这几个栏目都从「一个固定文件」升级成「一个目录里的多份文档」：
+# 目录里所有文本文档都能在面板上选择预览，原来的固定文件名继续作为默认主文档，存量数据不受影响。
+DOCUMENT_SET_SUFFIXES = {".md", ".markdown", ".txt"}
+MAX_DOCUMENT_SET_FILES = 200
+MAX_DOCUMENT_SET_FILE_BYTES = 2 * 1024 * 1024
+# 测试技能把一条需求或一条任务的全部测试资产写在 doc/test/<键>/ 下。
+TESTING_ASSET_ROOT = "test"
+TESTING_CASES_FILE_NAME = "测试用例.md"
 PLANNING_ITEM_KEY = "__project_planning__"
 GIT_ENVIRONMENT_SESSIONS_PATH = RUNTIME_DIR / "git-environment-sessions.json"
 MAX_GIT_ENVIRONMENT_CONVERSATIONS = 12
@@ -294,6 +302,7 @@ CODEX_REASONING_EFFORTS = {"minimal", "low", "medium", "high", "xhigh"}
 CLAUDE_REASONING_EFFORTS = {"minimal", "low", "medium", "high", "max"}
 DEFAULT_BIZ_LINE = ""
 CODEX_GLOBAL_STATE_PATH = Path.home() / ".codex" / ".codex-global-state.json"
+CODEX_DESKTOP_RESOURCE_COMPANIONS = ("codex-code-mode-host",)
 
 
 class BridgeFailure(Exception):
@@ -393,6 +402,83 @@ def host_platform() -> str:
 
 def host_platform_label(value: str = "") -> str:
     return {"macos": "macOS", "windows": "Windows"}.get(value or host_platform(), "Linux")
+
+
+def codex_cli_name(host: str = "") -> str:
+    return "codex.exe" if (host or host_platform()) == "windows" else "codex"
+
+
+def codex_cli_cache_path(host: str = "", runtime_dir: Path | None = None) -> Path:
+    return (runtime_dir or RUNTIME_DIR) / "bin" / codex_cli_name(host)
+
+
+def codex_desktop_resource_paths(host: str = "") -> list[Path]:
+    """Known Codex Desktop resource locations, ordered by the per-user install first."""
+    system = host or host_platform()
+    executable = codex_cli_name(system)
+    if system == "windows":
+        local_app_data = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local"))
+        program_files = Path(os.environ.get("ProgramFiles") or r"C:\Program Files")
+        roots = [
+            local_app_data / "Programs" / "Codex",
+            local_app_data / "Programs" / "Codex Desktop",
+            local_app_data / "Codex",
+            local_app_data / "Codex Desktop",
+            program_files / "Codex",
+            program_files / "Codex Desktop",
+        ]
+        return [root / "resources" / executable for root in roots]
+    if system == "macos":
+        roots = [
+            Path.home() / "Applications" / "Codex.app",
+            Path("/Applications/Codex.app"),
+            Path.home() / "Applications" / "ChatGPT.app",
+            Path("/Applications/ChatGPT.app"),
+        ]
+        return [root / "Contents" / "Resources" / executable for root in roots]
+    return []
+
+
+def available_codex_cli(host: str = "", runtime_dir: Path | None = None) -> str:
+    """Locate a PATH CLI, a previously copied local CLI, or a Desktop resource."""
+    command = shutil.which("codex")
+    if command:
+        return command
+    cache_path = codex_cli_cache_path(host, runtime_dir)
+    if cache_path.is_file():
+        return str(cache_path)
+    for resource_path in codex_desktop_resource_paths(host):
+        if resource_path.is_file():
+            return str(resource_path)
+    return ""
+
+
+def provision_codex_cli(host: str = "", runtime_dir: Path | None = None) -> str:
+    """Copy Codex Desktop's bundled CLI locally when no standalone CLI exists."""
+    command = shutil.which("codex")
+    if command:
+        return command
+    cache_path = codex_cli_cache_path(host, runtime_dir)
+    if cache_path.is_file():
+        return str(cache_path)
+    source = next((path for path in codex_desktop_resource_paths(host) if path.is_file()), None)
+    if source is None:
+        return ""
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, cache_path)
+        source_suffix = ".exe" if source.suffix.lower() == ".exe" else ""
+        for companion in CODEX_DESKTOP_RESOURCE_COMPANIONS:
+            companion_source = source.with_name(f"{companion}{source_suffix}")
+            if companion_source.is_file():
+                shutil.copy2(companion_source, cache_path.with_name(companion_source.name))
+        if (host or host_platform()) != "windows":
+            cache_path.chmod(cache_path.stat().st_mode | 0o111)
+        return str(cache_path)
+    except OSError:
+        # Desktop resources are directly executable too. Keep the board usable
+        # when a restrictive filesystem prevents creating the local copy.
+        return str(source)
 
 
 def environment_setup_workspace() -> Path:
@@ -1682,7 +1768,9 @@ def git_checkout_reference(workspace: Path, reference: str, remote: str) -> str:
         return local
     if git_worktree_dirty(workspace):
         raise BridgeFailure(f"工作目录有未提交改动，无法切换到分支 {local}，请先提交或暂存")
-    args = ["checkout", local] if not remote_ref else ["checkout", "-b", local, "--track", remote_ref]
+    args = ["checkout", "--recurse-submodules", local] if not remote_ref else [
+        "checkout", "--recurse-submodules", "-b", local, "--track", remote_ref,
+    ]
     completed = run_git(workspace, args)
     if completed.returncode != 0:
         raise BridgeFailure(f"切换分支 {local} 失败：{(completed.stdout or '').strip() or 'git 退出异常'}")
@@ -1742,8 +1830,20 @@ def git_prepare_branch(
     committed = False
     stashed = False
     if status["dirty"]:
+        dirty_submodules = git_dirty_submodule_workspaces(workspace)
         if strategy == "commit":
             message = git_commit_message_of(commit_message, str(status["currentBranch"]))
+            for submodule in dirty_submodules:
+                submodule_label = git_submodule_label(workspace, submodule)
+                if not git_current_branch(submodule):
+                    raise BridgeFailure(f"子模块 {submodule_label} 处于游离 HEAD，不能自动提交，请改选暂存后切换")
+                if run_git(submodule, ["add", "--all"]).returncode != 0:
+                    raise BridgeFailure(f"暂存子模块 {submodule_label} 改动失败")
+                completed = run_git(submodule, ["commit", "-m", f"{message} ({submodule_label})"], timeout=120)
+                if completed.returncode != 0:
+                    raise BridgeFailure(
+                        f"提交子模块 {submodule_label} 改动失败：{(completed.stdout or '').strip() or 'git 退出异常'}"
+                    )
             if run_git(workspace, ["add", "--all"]).returncode != 0:
                 raise BridgeFailure("暂存当前工作区改动失败")
             completed = run_git(workspace, ["commit", "-m", message], timeout=120)
@@ -1752,12 +1852,28 @@ def git_prepare_branch(
             committed = True
         elif strategy == "stash":
             label = f"delivery-task-planner: {status['currentBranch']} -> {local}"
+            for submodule in dirty_submodules:
+                submodule_label = git_submodule_label(workspace, submodule)
+                completed = run_git(
+                    submodule,
+                    ["stash", "push", "--include-untracked", "-m", f"{label} ({submodule_label})"],
+                    timeout=120,
+                )
+                if completed.returncode != 0:
+                    raise BridgeFailure(
+                        f"暂存子模块 {submodule_label} 改动失败：{(completed.stdout or '').strip() or 'git 退出异常'}"
+                    )
             completed = run_git(workspace, ["stash", "push", "--include-untracked", "-m", label], timeout=120)
             if completed.returncode != 0:
                 raise BridgeFailure(f"暂存当前分支改动失败：{(completed.stdout or '').strip() or 'git 退出异常'}")
             stashed = True
         else:
             raise BridgeFailure("工作目录有未提交改动，请选择先提交或暂存后再切换")
+        if git_worktree_dirty(workspace):
+            remaining = git_worktree_summary(workspace)
+            raise BridgeFailure(
+                f"处理改动后工作目录仍有 {remaining['changed']} 个待提交文件，可能有其它进程正在写入；请停止写入后重试"
+            )
     branch = git_checkout_reference(workspace, reference, remote)
     return {
         "branch": branch,
@@ -1776,13 +1892,54 @@ def git_worktree_dirty(workspace: Path) -> bool:
     return bool(git_output(workspace, ["status", "--porcelain"], "读取 Git 工作区状态失败"))
 
 
+def git_submodule_workspaces(workspace: Path) -> list[Path]:
+    """返回已初始化的子模块，按最内层到最外层排列，便于先处理嵌套工作区。"""
+    root = workspace.resolve()
+    seen: set[Path] = set()
+    result: list[Path] = []
+
+    def collect(parent: Path) -> None:
+        completed = run_git(parent, ["config", "--file", ".gitmodules", "--null", "--get-regexp", r"^submodule\..*\.path$"])
+        if completed.returncode == 1:
+            return
+        if completed.returncode != 0:
+            raise BridgeFailure(f"读取子模块配置失败：{(completed.stdout or '').strip() or 'git 退出异常'}")
+        for record in (completed.stdout or "").split("\0"):
+            if not record:
+                continue
+            _, separator, raw_path = record.partition("\n")
+            child = (parent / raw_path.strip()).resolve()
+            if not separator or not raw_path.strip():
+                raise BridgeFailure("子模块路径配置无效")
+            try:
+                child.relative_to(root)
+            except ValueError as exc:
+                raise BridgeFailure("子模块路径超出项目工作目录") from exc
+            if child in seen or run_git(child, ["rev-parse", "--is-inside-work-tree"]).returncode != 0:
+                continue
+            seen.add(child)
+            collect(child)
+            result.append(child)
+
+    collect(root)
+    return result
+
+
+def git_dirty_submodule_workspaces(workspace: Path) -> list[Path]:
+    return [submodule for submodule in git_submodule_workspaces(workspace) if git_worktree_dirty(submodule)]
+
+
+def git_submodule_label(workspace: Path, submodule: Path) -> str:
+    return submodule.resolve().relative_to(workspace.resolve()).as_posix()
+
+
 def git_checkout_branch(workspace: Path, branch: str) -> None:
     """切换到已存在的本地分支；工作区有未提交改动时不强行切，交回给用户处理。"""
     if git_current_branch(workspace) == branch:
         return
     if git_worktree_dirty(workspace):
         raise BridgeFailure(f"工作目录有未提交改动，无法切换到分支 {branch}，请先提交或暂存")
-    completed = run_git(workspace, ["checkout", branch])
+    completed = run_git(workspace, ["checkout", "--recurse-submodules", branch])
     if completed.returncode != 0:
         raise BridgeFailure(f"切换分支 {branch} 失败：{(completed.stdout or '').strip() or 'git 退出异常'}")
 
@@ -1904,7 +2061,7 @@ def git_create_branch(workspace: Path, base_branch: str, branch: str) -> dict[st
         return {"created": False, "baseBranch": base_branch, "branch": branch}
     if git_worktree_dirty(workspace):
         raise BridgeFailure("工作目录有未提交改动，无法创建需求分支，请先提交或暂存")
-    completed = run_git(workspace, ["checkout", "-b", branch, base_branch])
+    completed = run_git(workspace, ["checkout", "--recurse-submodules", "-b", branch, base_branch])
     if completed.returncode != 0:
         raise BridgeFailure(f"创建需求分支失败：{(completed.stdout or '').strip() or 'git 退出异常'}")
     return {"created": True, "baseBranch": base_branch, "branch": branch}
@@ -2316,6 +2473,92 @@ def write_outline_document(workspace: Path, relative: Path, markdown: str) -> di
 def requirement_outline_document(workspace: Path, requirement_key: str) -> dict[str, Any]:
     """Read the outline markdown without letting the requirement key escape the workspace."""
     return outline_document(workspace, requirement_outline_path_of(requirement_key))
+
+
+def testing_asset_directory_of(key: str) -> Path:
+    """Return the workspace-relative directory the testing skills write for one requirement or task."""
+    value = str(key or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", value):
+        raise BridgeFailure("测试资产标识无效")
+    return Path("doc") / TESTING_ASSET_ROOT / value
+
+
+def document_set_entries(workspace: Path, relative_directory: Path, recursive: bool) -> list[dict[str, Any]]:
+    """List the readable text documents of one column, newest naming order first stable by path.
+
+    只列目录里真实存在的文本文档：栏目从单文件升级成多文档后，面板的下拉框和文件列表都以这份清单为准，
+    不存在的文件不该出现在选项里。
+    """
+    root = workspace.resolve()
+    directory = (workspace / relative_directory).resolve()
+    try:
+        directory.relative_to(root)
+    except ValueError as exc:
+        raise BridgeFailure("文档目录超出当前项目") from exc
+    if not directory.is_dir():
+        return []
+    entries: list[dict[str, Any]] = []
+    for path in sorted(directory.rglob("*") if recursive else directory.glob("*")):
+        if not path.is_file() or path.suffix.lower() not in DOCUMENT_SET_SUFFIXES:
+            continue
+        resolved = path.resolve()
+        try:
+            relative = resolved.relative_to(root)
+            name = resolved.relative_to(directory).as_posix()
+        except ValueError:
+            continue
+        stat = resolved.stat()
+        entries.append({
+            "path": relative.as_posix(),
+            "name": name,
+            "size": stat.st_size,
+            "updatedAt": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat().replace("+00:00", "Z"),
+        })
+        if len(entries) >= MAX_DOCUMENT_SET_FILES:
+            break
+    return entries
+
+
+def document_in_set(workspace: Path, relative_directory: Path, raw_path: str) -> Path:
+    """Resolve one document of a column and refuse anything outside that column's directory."""
+    value = str(raw_path or "").strip()
+    candidate = Path(value)
+    if not value or candidate.is_absolute() or ".." in candidate.parts:
+        raise BridgeFailure("文档路径无效")
+    if candidate.suffix.lower() not in DOCUMENT_SET_SUFFIXES:
+        raise BridgeFailure("该文档不支持预览")
+    path = (workspace / candidate).resolve()
+    directory = (workspace / relative_directory).resolve()
+    try:
+        path.relative_to(directory)
+    except ValueError as exc:
+        raise BridgeFailure("文档超出当前栏目目录") from exc
+    return path
+
+
+def document_payload(workspace: Path, path: Path) -> dict[str, Any]:
+    """Read one column document as UTF-8 text, or report that it has not been written yet."""
+    relative = path.relative_to(workspace.resolve()).as_posix()
+    if not path.exists():
+        return {"path": relative, "exists": False, "content": "", "size": 0, "modifiedAt": ""}
+    if not path.is_file():
+        raise BridgeFailure("文档路径不是文件")
+    size = path.stat().st_size
+    if size > MAX_DOCUMENT_SET_FILE_BYTES:
+        raise BridgeFailure("文档超过 2 MB，无法预览")
+    try:
+        content = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise BridgeFailure("文档不是 UTF-8 文本文件") from exc
+    if "\x00" in content:
+        raise BridgeFailure("文档不是可预览的文本文件")
+    return {
+        "path": relative,
+        "exists": True,
+        "content": content,
+        "size": size,
+        "modifiedAt": datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
 
 
 def requirement_prototype_item_key(requirement_key: str) -> str:
@@ -2758,12 +3001,16 @@ class AppServerClient:
         self.event_callback = event_callback
         process_environment = os.environ.copy()
         process_environment.update(environment or {})
+        codex_cli = provision_codex_cli()
+        if not codex_cli:
+            raise BridgeFailure("未找到 Codex CLI 或 Codex Desktop 资源目录中的可执行文件")
         self.process = subprocess.Popen(
-            ["codex", "app-server"],
+            [codex_cli, "app-server"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
             bufsize=1,
             cwd=workspace,
             env=process_environment,
@@ -3131,7 +3378,16 @@ class ClaudeCLIClient:
         turn = {"id": self.turn_id, "status": "running", "createdAt": utc_now(), "items": [{"id": secrets.token_urlsafe(8), "type": "userMessage", "content": prompt}]}
         self.turns.append(turn)
         self._persist()
-        self.process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1, cwd=self.workspace, env=self.environment)
+        self.process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            bufsize=1,
+            cwd=self.workspace,
+            env=self.environment,
+        )
         threading.Thread(target=self._consume, args=(turn,), daemon=True).start()
         return self.thread_id, self.turn_id
 
@@ -4671,7 +4927,9 @@ class ExecutionBridge:
 
     def health(self, provider: str = "codex") -> dict[str, Any]:
         provider = ai_provider_of(provider)
-        executable_available = shutil.which(provider) is not None
+        codex_cli = available_codex_cli()
+        claude_cli = shutil.which("claude")
+        executable_available = bool(codex_cli) if provider == "codex" else claude_cli is not None
         configured = True
         api_reachable = True
         message = "ready"
@@ -4681,8 +4939,8 @@ class ExecutionBridge:
         return {
             "ready": ready,
             "bridge": True,
-            "codex": shutil.which("codex") is not None,
-            "claude": shutil.which("claude") is not None,
+            "codex": bool(codex_cli),
+            "claude": claude_cli is not None,
             "configured": configured,
             "apiReachable": api_reachable,
             "executorType": provider,
@@ -6104,6 +6362,105 @@ class ExecutionBridge:
             "size": stat.st_size,
             "modifiedAt": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
         }
+
+    def _document_set_layout(
+        self, config: dict[str, Any], program_id: int, scope: str, key: str,
+    ) -> tuple[Path, str, bool]:
+        """把栏目解析成 (目录, 默认主文档, 是否递归)，顺带校验这个键真属于当前项目。
+
+        面板不能只凭一个字符串就去读工作区里的任意目录：需求键走需求详情校验，任务键走任务详情校验，
+        与需求大纲、需求文档两个老接口保持同一条防线。
+        """
+        scope_value = str(scope or "").strip()
+        key_value = str(key or "").strip()
+        if not key_value:
+            raise BridgeFailure("缺少文档栏目标识")
+        if scope_value in {"requirement-outline", "requirement-testing"}:
+            self._requirement_for_prototype(config, program_id, key_value)
+            if scope_value == "requirement-outline":
+                outline = requirement_outline_path_of(key_value)
+                # 需求目录下还挂着 prototype/，大纲栏目只列顶层的文本文档。
+                return outline.parent, outline.as_posix(), False
+            testing = testing_asset_directory_of(key_value)
+            return testing, (testing / TESTING_CASES_FILE_NAME).as_posix(), True
+        if scope_value in {"task-document", "task-design", "task-testing"}:
+            task = self._task_detail(config, program_id, key_value)
+            document = Path(document_path_of(task))
+            if document.is_absolute() or ".." in document.parts:
+                raise BridgeFailure("任务需求文档路径无效")
+            if scope_value == "task-document":
+                return document.parent, document.as_posix(), False
+            if scope_value == "task-design":
+                return document.parent / "design", "", True
+            testing = testing_asset_directory_of(key_value)
+            return testing, (testing / TESTING_CASES_FILE_NAME).as_posix(), True
+        raise BridgeFailure("未知的文档栏目")
+
+    def document_set(
+        self,
+        program_id: int,
+        scope: str,
+        key: str,
+        biz_line: str = DEFAULT_BIZ_LINE,
+        config: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """List every document of one column so the board can offer them in a picker."""
+        config = request_scoped_config(config, biz_line, program_id)
+        directory, primary, recursive = self._document_set_layout(config, program_id, scope, key)
+        files = document_set_entries(self.workspace, directory, recursive)
+        paths = {entry["path"] for entry in files}
+        # 主文档还没落盘时退回目录里的第一份，面板打开就有东西可看。
+        selected = primary if primary in paths else (files[0]["path"] if files else "")
+        return {
+            "scope": str(scope or "").strip(),
+            "key": str(key or "").strip(),
+            "directory": directory.as_posix(),
+            "primaryPath": selected,
+            "files": files,
+        }
+
+    def document_file(
+        self,
+        program_id: int,
+        scope: str,
+        key: str,
+        path: str,
+        biz_line: str = DEFAULT_BIZ_LINE,
+        config: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Read one document the picker selected."""
+        config = request_scoped_config(config, biz_line, program_id)
+        directory, _, _ = self._document_set_layout(config, program_id, scope, key)
+        return document_payload(self.workspace, document_in_set(self.workspace, directory, path))
+
+    def save_document_file(
+        self,
+        program_id: int,
+        scope: str,
+        key: str,
+        path: str,
+        content: str,
+        biz_line: str = DEFAULT_BIZ_LINE,
+        config: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Overwrite one existing document of a column from the board editor.
+
+        面板只编辑已有文档：新增文档一律由会话产出，避免在面板上凭空造出执行器不认识的文件。
+        """
+        if not isinstance(content, str):
+            raise BridgeFailure("文档正文必须是字符串")
+        if len(content.encode("utf-8")) > MAX_DOCUMENT_SET_FILE_BYTES:
+            raise BridgeFailure("文档不能超过 2 MB")
+        if "\x00" in content:
+            raise BridgeFailure("文档不能包含空字符")
+        config = request_scoped_config(config, biz_line, program_id)
+        directory, _, _ = self._document_set_layout(config, program_id, scope, key)
+        target = document_in_set(self.workspace, directory, path)
+        if not target.is_file():
+            raise BridgeFailure("文档不存在，请先由会话生成后再编辑")
+        text = content if content.endswith("\n") or not content.strip() else content + "\n"
+        target.write_text(text, encoding="utf-8")
+        return document_payload(self.workspace, target)
 
     @staticmethod
     def _requirement_prototype_identity(program_id: int, requirement_key: str) -> tuple[str, int, str]:
@@ -7829,6 +8186,34 @@ class BridgeHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self.json_response(500, {"error": f"读取任务测试用例会话失败：{exc}"})
             return
+        if parsed.path in {"/v1/codex/document-set", "/v1/codex/document-file"}:
+            if not self.allowed_origin():
+                self.json_response(403, {"error": "origin not allowed"})
+                return
+            query = parse_qs(parsed.query)
+            try:
+                program_id = program_id_of((query.get("programId") or [""])[0])
+                scope = str((query.get("scope") or [""])[0]).strip()
+                key = str((query.get("key") or [""])[0]).strip()
+                if not program_id or not scope or not key:
+                    raise BridgeFailure("programId、scope 和 key 都是必填项")
+                selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
+                config = self.bridge.request_config(
+                    {"programId": program_id},
+                    self.allowed_origin() or "",
+                    self.headers.get("token", "").strip(),
+                )
+                if parsed.path == "/v1/codex/document-set":
+                    self.json_response(200, selected_bridge.document_set(program_id, scope, key, config=config))
+                else:
+                    self.json_response(200, selected_bridge.document_file(
+                        program_id, scope, key, str((query.get("path") or [""])[0]), config=config,
+                    ))
+            except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
+                self.json_response(400, {"error": str(exc)})
+            except Exception as exc:
+                self.json_response(500, {"error": f"读取文档失败：{exc}"})
+            return
         if parsed.path == "/v1/codex/requirement-document":
             if not self.allowed_origin():
                 self.json_response(403, {"error": "origin not allowed"})
@@ -7981,6 +8366,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
             "/v1/codex/git/push",
             "/v1/codex/requirement-document",
             "/v1/codex/requirement-outline",
+            "/v1/codex/document-file",
             "/v1/codex/stop",
         }:
             self.json_response(404, {"error": "not found"})
@@ -8002,6 +8388,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 if path == "/v1/codex/requirement-document"
                 else MAX_EDITABLE_OUTLINE_BYTES + 4 * 1024
                 if path == "/v1/codex/requirement-outline"
+                else MAX_DOCUMENT_SET_FILE_BYTES + 4 * 1024
+                if path == "/v1/codex/document-file"
                 else 64 * 1024
             )
             if length <= 0 or length > limit:
@@ -8066,6 +8454,15 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     raise BridgeFailure("需求大纲正文必须是字符串")
                 self.json_response(200, selected_bridge.save_requirement_outline(
                     program_id_of(payload.get("programId")), requirement_key, markdown, config=config,
+                ))
+            elif path == "/v1/codex/document-file":
+                self.json_response(200, selected_bridge.save_document_file(
+                    program_id_of(payload.get("programId")),
+                    str(payload.get("scope") or "").strip(),
+                    str(payload.get("key") or "").strip(),
+                    str(payload.get("path") or "").strip(),
+                    payload.get("content"),
+                    config=config,
                 ))
             elif path == "/v1/codex/git/push":
                 self.json_response(200, selected_bridge.push_requirement_branch(payload, config))
