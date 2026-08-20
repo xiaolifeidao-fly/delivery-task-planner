@@ -439,31 +439,55 @@ def codex_desktop_resource_paths(host: str = "") -> list[Path]:
     return []
 
 
+WINDOWS_CLI_WRAPPER_SUFFIXES = ("", ".cmd", ".bat", ".ps1")
+
+
+def path_codex_cli(host: str = "") -> tuple[str, str]:
+    """PATH 上的 codex，拆成「能直接起进程的可执行文件」和「只能兜底的包装脚本」。
+
+    Windows 上 npm 全局安装和 Codex Desktop 都会往 PATH 里塞 `codex.cmd` / `codex.ps1`
+    这类包装脚本，CreateProcess 起不动它们（WinError 193），所以宁可退回到本地复制出来的
+    codex.exe；实在什么都没有时再拿包装脚本兜底，好过直接报"未找到 CLI"。
+    """
+    command = shutil.which("codex") or ""
+    if not command:
+        return "", ""
+    if (host or host_platform()) == "windows" and Path(command).suffix.lower() in WINDOWS_CLI_WRAPPER_SUFFIXES:
+        return "", command
+    return command, ""
+
+
 def available_codex_cli(host: str = "", runtime_dir: Path | None = None) -> str:
     """Locate a PATH CLI, a previously copied local CLI, or a Desktop resource."""
-    command = shutil.which("codex")
+    cache_path = codex_cli_cache_path(host, runtime_dir)
+    # 已经复制到运行时目录的 codex.exe 是确定能跑的，Windows 上优先用它。
+    if (host or host_platform()) == "windows" and cache_path.is_file():
+        return str(cache_path)
+    command, wrapper = path_codex_cli(host)
     if command:
         return command
-    cache_path = codex_cli_cache_path(host, runtime_dir)
     if cache_path.is_file():
         return str(cache_path)
     for resource_path in codex_desktop_resource_paths(host):
         if resource_path.is_file():
             return str(resource_path)
-    return ""
+    return wrapper
 
 
 def provision_codex_cli(host: str = "", runtime_dir: Path | None = None) -> str:
     """Copy Codex Desktop's bundled CLI locally when no standalone CLI exists."""
-    command = shutil.which("codex")
+    cache_path = codex_cli_cache_path(host, runtime_dir)
+    # 与 available_codex_cli 保持同一优先级，避免"检测到的"和"真正拉起的"不是同一个。
+    if (host or host_platform()) == "windows" and cache_path.is_file():
+        return str(cache_path)
+    command, wrapper = path_codex_cli(host)
     if command:
         return command
-    cache_path = codex_cli_cache_path(host, runtime_dir)
     if cache_path.is_file():
         return str(cache_path)
     source = next((path for path in codex_desktop_resource_paths(host) if path.is_file()), None)
     if source is None:
-        return ""
+        return wrapper
     try:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, cache_path)
