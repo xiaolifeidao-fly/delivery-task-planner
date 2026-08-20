@@ -4512,6 +4512,10 @@ class ExecutionBridge:
         if not token:
             raise BridgeFailure("当前用户凭证为空")
         api_url = self._resolve_task_board_api(str(raw.get("apiUrl") or "").strip(), origin, token, program_id)
+        # 走到这里这个凭证已经被面板验过了（_resolve_task_board_api 打过一次真实接口），
+        # 此时才落盘：普通 MCP 会话没有运行期环境变量，只能读那份文件，切账号后不刷新
+        # 就会继续拿旧账号写入，而面板那边报出来只是一句权限不足，排查方向会被带偏。
+        planner.remember_browser_identity(token)
         config = {
             "api_url": api_url,
             "key": token,
@@ -4532,6 +4536,9 @@ class ExecutionBridge:
             raise BridgeFailure("请求体必须是 JSON 对象")
         if not token:
             raise BridgeFailure("当前用户凭证为空")
+        # 环境检测不打任何面板接口，凭证没被验证过；只认得出用户的面板 JWT 才落盘。
+        if planner.token_subject(token):
+            planner.remember_browser_identity(token)
         return {
             "key": token,
             "key_header": "token",

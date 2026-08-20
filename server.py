@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -94,6 +95,8 @@ def load_config() -> dict[str, Any]:
             "key": runtime_token,
             "key_header": os.environ.get(RUNTIME_TOKEN_HEADER_ENV, "token").strip() or "token",
             "user_id": os.environ.get(RUNTIME_USER_ID_ENV, "task-executor").strip() or "task-executor",
+            # 面板入口注入的凭证，跟着控制台当前登录账号走。
+            "_source": "runtime",
         }
         return config
     config_path = CONFIG_PATH if CONFIG_PATH.exists() else LEGACY_CONFIG_PATH
@@ -105,6 +108,7 @@ def load_config() -> dict[str, Any]:
         raise ToolFailure(f"无法读取插件配置：{exc}") from exc
     if not config.get("api_url") or not config.get("key"):
         raise ToolFailure("配置不完整，请重新初始化接口地址和用户 key。")
+    config["_source"] = "config"
     return config
 
 
@@ -137,6 +141,8 @@ def normalize_api_url(value: str) -> str:
 
 
 def save_config(config: dict[str, Any]) -> None:
+    # 下划线开头的是运行期标记（凭证来源、桥接项目），不属于持久化配置。
+    config = {key: value for key, value in config.items() if not key.startswith("_")}
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_name = tempfile.mkstemp(prefix=".delivery-task-planner-", dir=CONFIG_PATH.parent)
     try:
@@ -151,6 +157,89 @@ def save_config(config: dict[str, Any]) -> None:
             os.unlink(temp_name)
 
 
+def token_subject(token: str) -> str:
+    """Read the user id out of a panel JWT without verifying it.
+
+    The value is only a label: authorization is decided by the server from the
+    token itself. Any malformed token simply yields an empty label.
+    """
+    try:
+        payload = token.split(".")[1]
+        raw = base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4))
+        subject = json.loads(raw).get("sub")
+    except (IndexError, ValueError, TypeError, json.JSONDecodeError):
+        return ""
+    return str(subject) if subject not in (None, "") else ""
+
+
+def remember_browser_identity(token: str) -> None:
+    """Persist the console's current credential as the fallback identity.
+
+    Sessions started from the task panel get the logged-in user's token through
+    the runtime environment. Plain MCP sessions have no such environment, so they fall
+    back to the config file — and that file used to keep whichever token was
+    present at initialization. After switching console accounts the fallback
+    kept writing as the *previous* user, which the panel rejects as a plain
+    permission error and sends the investigation the wrong way. Refreshing the
+    file on every bridge request keeps both paths on the same account.
+
+    Never raises: a failure here must not break the request being served.
+    """
+    if not token:
+        return
+    try:
+        config_path = CONFIG_PATH if CONFIG_PATH.exists() else LEGACY_CONFIG_PATH
+        if not config_path.exists():
+            return
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        if not isinstance(config, dict) or config.get("key") == token:
+            return
+        subject = token_subject(token)
+        updated = {**config, "key": token}
+        if subject:
+            updated["user_id"] = subject
+        save_config(updated)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return
+
+
+# 服务端对失效凭证的两种说法：token 解不开，或者用户的 token 版本已经作废。
+AUTH_FAILURE_HINTS = ("not login", "登录凭证已失效")
+
+
+def is_auth_failure(message: str) -> bool:
+    lowered = str(message).lower()
+    return any(hint.lower() in lowered for hint in AUTH_FAILURE_HINTS)
+
+
+def refresh_credential(config: dict[str, Any]) -> bool:
+    """把桥接保持最新的那份凭证换进 config，成功换到新值返回 True。
+
+    面板入口启动的会话在**启动那一刻**把 token 冻进环境变量，之后一直用它。
+    token 过期、或者中途在控制台换了账号，这个长期会话就会一直拿着废凭证请求，
+    服务端只回一句 not login —— 用户明明是登录状态，看着像面板坏了。
+    配置文件那份由桥接每次请求刷新，所以失效时回头读它就能自愈。
+    """
+    try:
+        config_path = CONFIG_PATH if CONFIG_PATH.exists() else LEGACY_CONFIG_PATH
+        if not config_path.exists():
+            return False
+        stored = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+    if not isinstance(stored, dict):
+        return False
+    key = str(stored.get("key") or "").strip()
+    if not key or key == config.get("key"):
+        return False
+    # 原地替换：同一个 config 会在一次工具调用里被反复使用，换掉之后后续请求直接复用。
+    config["key"] = key
+    subject = token_subject(key)
+    if subject:
+        config["user_id"] = subject
+    return True
+
+
 def request_api(
     config: dict[str, Any],
     method: str,
@@ -158,6 +247,7 @@ def request_api(
     *,
     query: dict[str, Any] | None = None,
     body: dict[str, Any] | None = None,
+    allow_credential_refresh: bool = True,
 ) -> Any:
     query_values = {key: value for key, value in (query or {}).items() if value not in (None, "")}
     url = config["api_url"] + path
@@ -188,6 +278,14 @@ def request_api(
             message = envelope.get("error") or envelope.get("message") or "未知错误"
         else:
             message = "响应格式错误"
+        if allow_credential_refresh and is_auth_failure(message) and refresh_credential(config):
+            return request_api(
+                config, method, path, query=query, body=body, allow_credential_refresh=False
+            )
+        if is_auth_failure(message):
+            raise ToolFailure(
+                "任务面板登录凭证已失效。请在控制台重新登录，再从任务面板入口重新发起本次操作。"
+            )
         raise ToolFailure(f"任务面板接口请求失败：{message}")
     return envelope.get("data")
 
@@ -396,6 +494,12 @@ def configuration() -> dict[str, Any]:
     if not config_path.exists():
         return {"configured": False, "configPath": str(CONFIG_PATH)}
     config = load_config()
+    # userId 是自填标签，认不出凭证背后到底是谁。真实账号一律问服务端 ——
+    # 「用错账号」和「没有权限」在面板那边报出来是同一句话，这里必须能一眼分辨。
+    try:
+        account = request_api(config, "GET", "/auth/me") or {}
+    except ToolFailure as exc:
+        account = {"error": str(exc)}
     return {
         "configured": True,
         "apiUrl": config["api_url"],
@@ -404,6 +508,13 @@ def configuration() -> dict[str, Any]:
         "userId": config.get("user_id", "task-executor"),
         "key": "***" + config["key"][-4:] if len(config["key"]) >= 4 else "***",
         "configPath": str(config_path),
+        "credentialSource": config.get("_source", "config"),
+        "account": {
+            "id": account.get("id"),
+            "username": account.get("username"),
+            "displayName": account.get("displayName"),
+            "error": account.get("error"),
+        },
     }
 
 
