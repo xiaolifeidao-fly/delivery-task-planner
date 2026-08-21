@@ -5191,7 +5191,7 @@ class ExecutionBridge:
         # 走到这里这个凭证已经被面板验过了（_resolve_task_board_api 打过一次真实接口），
         # 此时才落盘：普通 MCP 会话没有运行期环境变量，只能读那份文件，切账号后不刷新
         # 就会继续拿旧账号写入，而面板那边报出来只是一句权限不足，排查方向会被带偏。
-        planner.remember_browser_identity(token)
+        planner.remember_browser_identity(token, str(raw.get("userId") or "").strip())
         config = {
             "api_url": api_url,
             "key": token,
@@ -5214,7 +5214,7 @@ class ExecutionBridge:
             raise BridgeFailure("当前用户凭证为空")
         # 环境检测不打任何面板接口，凭证没被验证过；只认得出用户的面板 JWT 才落盘。
         if planner.token_subject(token):
-            planner.remember_browser_identity(token)
+            planner.remember_browser_identity(token, str(raw.get("userId") or "").strip())
         return {
             "key": token,
             "key_header": "token",
@@ -8587,6 +8587,12 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
+        if path == "/v1/session/heartbeat":
+            if not self.allowed_origin():
+                self.json_response(403, {"error": "origin not allowed"})
+                return
+            self.handle_heartbeat()
+            return
         if path not in {
             "/v1/codex/execute",
             "/v1/codex/task-testing-cases",
@@ -8743,6 +8749,35 @@ class BridgeHandler(BaseHTTPRequestHandler):
             self.json_response(400, {"error": str(exc)})
         except Exception as exc:
             self.json_response(500, {"error": f"启动 AI 工具失败：{exc}"})
+
+    def handle_heartbeat(self) -> None:
+        """控制台每分钟送一次当前账号的 token 和 user_id，插件存下来当作凭证来源。
+
+        配置文件只维护接口地址；普通 MCP 会话没有面板注入的环境变量，全靠这里
+        存下来的凭证。心跳不打任何面板接口，凭证真伪由后续真实请求判定。
+        """
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            if length < 0 or length > 8 * 1024:
+                raise BridgeFailure("请求体大小无效")
+            payload = json.loads(self.rfile.read(length)) if length else {}
+            if not isinstance(payload, dict):
+                raise BridgeFailure("请求体必须是 JSON 对象")
+            token = self.headers.get("token", "").strip() or str(payload.get("token") or "").strip()
+            if not token:
+                raise BridgeFailure("当前用户凭证为空")
+            user_id = str(payload.get("userId") or "").strip()
+            subject = planner.token_subject(token)
+            if not subject:
+                raise BridgeFailure("凭证不是任务面板登录凭证")
+            if user_id and user_id != subject:
+                raise BridgeFailure("凭证与用户标识不一致")
+            planner.save_credential(token, user_id or subject)
+            self.json_response(200, {"stored": True, "userId": user_id or subject})
+        except (BridgeFailure, planner.ToolFailure, json.JSONDecodeError, ValueError) as exc:
+            self.json_response(400, {"error": str(exc)})
+        except Exception as exc:
+            self.json_response(500, {"error": f"保存任务面板凭证失败：{exc}"})
 
     def handle_attachment_upload(self) -> None:
         content_length = int(self.headers.get("Content-Length") or 0)

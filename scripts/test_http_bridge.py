@@ -2,6 +2,7 @@
 
 import importlib.util
 import base64
+import io
 import json
 import subprocess
 import sys
@@ -2866,6 +2867,53 @@ class HttpBridgeTest(unittest.TestCase):
             # 指定的会话不在目录里时回落到最近一条，不至于把聊天面板打空。
             self.assertEqual("thread-1", store.load("codex", "missing")["threadId"])
 
+
+    @staticmethod
+    def panel_token(subject: int = 4) -> str:
+        payload = base64.urlsafe_b64encode(
+            json.dumps({"sub": subject, "ver": 2}).encode("utf-8")
+        ).decode("ascii").rstrip("=")
+        return f"header.{payload}.signature"
+
+    @staticmethod
+    def heartbeat_handler(token: str, body: dict) -> tuple[list, dict]:
+        raw = json.dumps(body).encode("utf-8")
+        handler = object.__new__(bridge.BridgeHandler)
+        handler.server = SimpleNamespace(allowed_origins={"*"})
+        handler.headers = {"Origin": "http://console.test", "token": token, "Content-Length": str(len(raw))}
+        handler.rfile = io.BytesIO(raw)
+        handler.path = "/v1/session/heartbeat"
+        responses: list = []
+        handler.json_response = lambda status, payload: responses.append((status, payload))
+        return responses, handler
+
+    def test_heartbeat_stores_the_console_credential(self):
+        token = self.panel_token()
+        responses, handler = self.heartbeat_handler(token, {"userId": "4"})
+
+        with patch.object(bridge.planner, "save_credential", return_value=True) as save_credential:
+            handler.do_POST()
+
+        save_credential.assert_called_once_with(token, "4")
+        self.assertEqual([(200, {"stored": True, "userId": "4"})], responses)
+
+    def test_heartbeat_rejects_a_credential_that_is_not_a_panel_token(self):
+        responses, handler = self.heartbeat_handler("not-a-jwt", {"userId": "4"})
+
+        with patch.object(bridge.planner, "save_credential") as save_credential:
+            handler.do_POST()
+
+        save_credential.assert_not_called()
+        self.assertEqual(400, responses[0][0])
+
+    def test_heartbeat_rejects_a_user_id_that_does_not_match_the_credential(self):
+        responses, handler = self.heartbeat_handler(self.panel_token(4), {"userId": "9"})
+
+        with patch.object(bridge.planner, "save_credential") as save_credential:
+            handler.do_POST()
+
+        save_credential.assert_not_called()
+        self.assertEqual(400, responses[0][0])
 
 class GitBranchTest(unittest.TestCase):
     """需求分支相关的命令全部落在真实仓库上，用临时仓库跑，不 mock 掉 Git 本身。"""

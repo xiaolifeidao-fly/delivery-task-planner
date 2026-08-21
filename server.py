@@ -10,6 +10,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -25,6 +26,13 @@ CONFIG_PATH = Path(
     )
 )
 LEGACY_CONFIG_PATH = Path.home() / ".config" / "codex" / "delivery-task-planner.json"
+# 配置文件只维护后端接口地址；token 与 user_id 由控制台心跳接口送进来，单独落在这里。
+CREDENTIAL_PATH = Path(
+    os.environ.get(
+        "DELIVERY_TASK_PLANNER_CREDENTIAL",
+        str(CONFIG_PATH.parent / "credential.json"),
+    )
+)
 VALID_KINDS = {"gap", "capability", "asset"}
 MAX_BENEFIT_TAGS = 3
 MAX_BENEFIT_TAG_LENGTH = 32
@@ -99,17 +107,83 @@ def load_config() -> dict[str, Any]:
             "_source": "runtime",
         }
         return config
+    settings = stored_settings()
+    api_url = str(settings.get("api_url") or "").strip()
+    if not api_url:
+        raise ToolFailure("尚未配置任务面板接口地址。请先初始化接口地址。")
+    credential = load_credential()
+    # 老版本把 token 写在配置文件里，升级后第一次心跳到达前仍然可用。
+    key = credential.get("key") or str(settings.get("key") or "").strip()
+    if not key:
+        raise ToolFailure(
+            "尚未收到任务面板凭证。请在控制台登录并保持任务面板打开，"
+            "控制台会通过心跳接口把 token 和 user_id 送给插件。"
+        )
+    user_id = credential.get("user_id") or str(settings.get("user_id") or "").strip()
+    return {
+        "api_url": api_url,
+        "key": key,
+        "key_header": str(settings.get("key_header") or "token").strip() or "token",
+        "user_id": user_id or token_subject(key) or "task-executor",
+        "_source": "heartbeat" if credential.get("key") else "config",
+    }
+
+
+def stored_settings() -> dict[str, Any]:
+    """读取配置文件里的接口地址等设置；读不出来就当没配置过。"""
     config_path = CONFIG_PATH if CONFIG_PATH.exists() else LEGACY_CONFIG_PATH
     if not config_path.exists():
-        raise ToolFailure("尚未初始化。请提供任务面板接口地址和用户 key。")
+        return {}
     try:
-        config = json.loads(config_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        settings = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
         raise ToolFailure(f"无法读取插件配置：{exc}") from exc
-    if not config.get("api_url") or not config.get("key"):
-        raise ToolFailure("配置不完整，请重新初始化接口地址和用户 key。")
-    config["_source"] = "config"
-    return config
+    return settings if isinstance(settings, dict) else {}
+
+
+def load_credential() -> dict[str, Any]:
+    """读取心跳接口存下来的当前控制台账号凭证。
+
+    永不抛错：凭证文件缺失或损坏时退回空字典，由调用方决定怎么提示。
+    """
+    try:
+        if not CREDENTIAL_PATH.exists():
+            return {}
+        credential = json.loads(CREDENTIAL_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+    if not isinstance(credential, dict):
+        return {}
+    key = str(credential.get("key") or "").strip()
+    if not key:
+        return {}
+    return {
+        "key": key,
+        "user_id": str(credential.get("user_id") or "").strip() or token_subject(key),
+        "updated_at": int(credential.get("updated_at") or 0),
+    }
+
+
+def save_credential(token: str, user_id: str = "") -> bool:
+    """把心跳送来的凭证落盘，凭证内容有变化时返回 True。
+
+    永不抛错：心跳失败不该影响控制台，也不该打断正在服务的请求。
+    """
+    token = str(token or "").strip()
+    if not token:
+        return False
+    # user_id 只是标签，真正认账号的是 token 本身；能从凭证里读出来就以它为准。
+    user_id = token_subject(token) or str(user_id or "").strip() or "task-executor"
+    current = load_credential()
+    changed = current.get("key") != token or current.get("user_id") != user_id
+    try:
+        write_json_file(
+            CREDENTIAL_PATH,
+            {"key": token, "user_id": user_id, "updated_at": int(time.time())},
+        )
+    except OSError:
+        return False
+    return changed
 
 
 def bridge_api_url() -> str:
@@ -142,16 +216,26 @@ def normalize_api_url(value: str) -> str:
 
 def save_config(config: dict[str, Any]) -> None:
     # 下划线开头的是运行期标记（凭证来源、桥接项目），不属于持久化配置。
-    config = {key: value for key, value in config.items() if not key.startswith("_")}
-    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp_name = tempfile.mkstemp(prefix=".delivery-task-planner-", dir=CONFIG_PATH.parent)
+    # key/user_id 也不再写进配置文件：它们由控制台心跳接口维护在凭证文件里。
+    config = {
+        key: value
+        for key, value in config.items()
+        if not key.startswith("_") and key not in {"key", "user_id"}
+    }
+    write_json_file(CONFIG_PATH, config)
+
+
+def write_json_file(path: Path, payload: dict[str, Any]) -> None:
+    """同目录临时文件 + 原子替换，避免半截内容被别的会话读到。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=".delivery-task-planner-", dir=path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(config, handle, ensure_ascii=False, indent=2)
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
             handle.write("\n")
         os.chmod(temp_name, 0o600)
-        os.replace(temp_name, CONFIG_PATH)
-        os.chmod(CONFIG_PATH, 0o600)
+        os.replace(temp_name, path)
+        os.chmod(path, 0o600)
     finally:
         if os.path.exists(temp_name):
             os.unlink(temp_name)
@@ -172,35 +256,20 @@ def token_subject(token: str) -> str:
     return str(subject) if subject not in (None, "") else ""
 
 
-def remember_browser_identity(token: str) -> None:
+def remember_browser_identity(token: str, user_id: str = "") -> None:
     """Persist the console's current credential as the fallback identity.
 
     Sessions started from the task panel get the logged-in user's token through
-    the runtime environment. Plain MCP sessions have no such environment, so they fall
-    back to the config file — and that file used to keep whichever token was
-    present at initialization. After switching console accounts the fallback
-    kept writing as the *previous* user, which the panel rejects as a plain
-    permission error and sends the investigation the wrong way. Refreshing the
-    file on every bridge request keeps both paths on the same account.
+    the runtime environment. Plain MCP sessions have no such environment, so they
+    read the credential file that the console keeps fresh — through the
+    heartbeat endpoint every minute, and through every bridge request on top of
+    that. Without the refresh the fallback kept writing as the *previous*
+    account after a console switch, which the panel rejects as a plain
+    permission error and sends the investigation the wrong way.
 
     Never raises: a failure here must not break the request being served.
     """
-    if not token:
-        return
-    try:
-        config_path = CONFIG_PATH if CONFIG_PATH.exists() else LEGACY_CONFIG_PATH
-        if not config_path.exists():
-            return
-        config = json.loads(config_path.read_text(encoding="utf-8"))
-        if not isinstance(config, dict) or config.get("key") == token:
-            return
-        subject = token_subject(token)
-        updated = {**config, "key": token}
-        if subject:
-            updated["user_id"] = subject
-        save_config(updated)
-    except (OSError, ValueError, json.JSONDecodeError):
-        return
+    save_credential(token, user_id)
 
 
 # 服务端对失效凭证的两种说法：token 解不开，或者用户的 token 版本已经作废。
@@ -218,23 +287,21 @@ def refresh_credential(config: dict[str, Any]) -> bool:
     面板入口启动的会话在**启动那一刻**把 token 冻进环境变量，之后一直用它。
     token 过期、或者中途在控制台换了账号，这个长期会话就会一直拿着废凭证请求，
     服务端只回一句 not login —— 用户明明是登录状态，看着像面板坏了。
-    配置文件那份由桥接每次请求刷新，所以失效时回头读它就能自愈。
+    凭证文件那份由控制台心跳每分钟刷新，所以失效时回头读它就能自愈。
     """
-    try:
-        config_path = CONFIG_PATH if CONFIG_PATH.exists() else LEGACY_CONFIG_PATH
-        if not config_path.exists():
+    credential = load_credential()
+    key = credential.get("key") or ""
+    if not key:
+        # 心跳还没送过凭证时，退回老版本写在配置文件里的那份。
+        try:
+            key = str(stored_settings().get("key") or "").strip()
+        except ToolFailure:
             return False
-        stored = json.loads(config_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, json.JSONDecodeError):
-        return False
-    if not isinstance(stored, dict):
-        return False
-    key = str(stored.get("key") or "").strip()
     if not key or key == config.get("key"):
         return False
     # 原地替换：同一个 config 会在一次工具调用里被反复使用，换掉之后后续请求直接复用。
     config["key"] = key
-    subject = token_subject(key)
+    subject = credential.get("user_id") or token_subject(key)
     if subject:
         config["user_id"] = subject
     return True
@@ -440,9 +507,8 @@ def topological_order(tasks: list[dict[str, Any]]) -> list[str]:
 
 
 def initialize(arguments: dict[str, Any]) -> dict[str, Any]:
-    key = str(arguments.get("key", "")).strip()
-    if not key:
-        raise ToolFailure("用户 key 不能为空。")
+    # key 现在由控制台心跳送达，初始化只负责接口地址；显式传了就当作一次手工心跳。
+    key = str(arguments.get("key", "")).strip() or load_credential().get("key", "")
     key_header = str(arguments.get("key_header") or "token").strip()
     if not re.fullmatch(r"[A-Za-z0-9-]+", key_header):
         raise ToolFailure("header 名只能包含字母、数字和连字符。")
@@ -451,19 +517,20 @@ def initialize(arguments: dict[str, Any]) -> dict[str, Any]:
         "bridge_api_url": normalize_api_url(str(arguments.get("api_url", ""))),
         "key": key,
         "key_header": key_header,
-        "user_id": str(arguments.get("user_id") or "task-executor").strip(),
+        "user_id": str(arguments.get("user_id") or "").strip() or token_subject(key) or "task-executor",
     }
-    if arguments.get("verify_connection", True):
-        programs = request_api(config, "GET", "/delivery/programs") or []
-    else:
-        programs = []
+    verify = bool(arguments.get("verify_connection", True)) and bool(key)
+    programs = request_api(config, "GET", "/delivery/programs") or [] if verify else []
     save_config(config)
+    if str(arguments.get("key", "")).strip():
+        save_credential(key, config["user_id"])
     return {
         "configured": True,
         "apiUrl": config["api_url"],
         "keyHeader": config["key_header"],
         "userId": config["user_id"],
-        "verified": bool(arguments.get("verify_connection", True)),
+        "credentialReceived": bool(key),
+        "verified": verify,
         "projectCount": len(programs),
     }
 
@@ -472,11 +539,20 @@ def update_api_url(arguments: dict[str, Any]) -> dict[str, Any]:
     """Update the normal MCP and HTTP bridge panel targets together."""
     if os.environ.get(RUNTIME_TOKEN_ENV, "").strip() and os.environ.get(RUNTIME_API_URL_ENV, "").strip():
         raise ToolFailure("任务面板桥接运行态不能修改共享接口地址，请在普通 @delivery-task-planner 会话中执行此操作。")
-    config = load_config()
     api_url = normalize_api_url(str(arguments.get("api_url", "")))
-    updated = {**config, "api_url": api_url, "bridge_api_url": api_url}
-    if arguments.get("verify_connection", True):
-        programs = request_api(updated, "GET", "/delivery/programs") or []
+    settings = stored_settings()
+    updated = {**settings, "api_url": api_url, "bridge_api_url": api_url}
+    credential = load_credential()
+    # 地址可以在收到心跳凭证之前就先配好，那时没法真连一次。
+    verify = bool(arguments.get("verify_connection", True)) and bool(credential.get("key"))
+    if verify:
+        probe = {
+            "api_url": api_url,
+            "key": credential["key"],
+            "key_header": str(settings.get("key_header") or "token").strip() or "token",
+            "user_id": credential.get("user_id") or "task-executor",
+        }
+        programs = request_api(probe, "GET", "/delivery/programs") or []
     else:
         programs = []
     save_config(updated)
@@ -484,7 +560,7 @@ def update_api_url(arguments: dict[str, Any]) -> dict[str, Any]:
         "configured": True,
         "apiUrl": api_url,
         "bridgeApiUrl": api_url,
-        "verified": bool(arguments.get("verify_connection", True)),
+        "verified": verify,
         "projectCount": len(programs),
     }
 
@@ -493,7 +569,20 @@ def configuration() -> dict[str, Any]:
     config_path = CONFIG_PATH if CONFIG_PATH.exists() else LEGACY_CONFIG_PATH
     if not config_path.exists():
         return {"configured": False, "configPath": str(CONFIG_PATH)}
-    config = load_config()
+    credential = load_credential()
+    try:
+        config = load_config()
+    except ToolFailure as exc:
+        # 地址配好了但心跳还没送来凭证：这是等待状态，不是坏配置。
+        return {
+            "configured": False,
+            "apiUrl": str(stored_settings().get("api_url") or ""),
+            "bridgeApiUrl": bridge_api_url(),
+            "configPath": str(config_path),
+            "credentialPath": str(CREDENTIAL_PATH),
+            "credentialSource": "none",
+            "error": str(exc),
+        }
     # userId 是自填标签，认不出凭证背后到底是谁。真实账号一律问服务端 ——
     # 「用错账号」和「没有权限」在面板那边报出来是同一句话，这里必须能一眼分辨。
     try:
@@ -508,7 +597,9 @@ def configuration() -> dict[str, Any]:
         "userId": config.get("user_id", "task-executor"),
         "key": "***" + config["key"][-4:] if len(config["key"]) >= 4 else "***",
         "configPath": str(config_path),
+        "credentialPath": str(CREDENTIAL_PATH),
         "credentialSource": config.get("_source", "config"),
+        "credentialUpdatedAt": credential.get("updated_at") or 0,
         "account": {
             "id": account.get("id"),
             "username": account.get("username"),
@@ -1517,17 +1608,17 @@ TOOLS = [
     {
         "name": "initialize_task_board",
         "title": "初始化任务面板连接",
-        "description": "保存任务面板接口地址和用户 key；key 会放入指定请求 header。默认验证连接后再保存。",
+        "description": "保存任务面板接口地址；token 与 user_id 由控制台心跳接口送达，无需在此提供。默认验证连接后再保存。",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "api_url": {"type": "string", "description": "服务根地址或以 /api 结尾的 API 地址"},
-                "key": {"type": "string", "description": "用户凭证 key"},
+                "key": {"type": "string", "description": "可选；仅在没有控制台心跳时手工写入一次凭证"},
                 "key_header": {"type": "string", "default": "token"},
                 "user_id": {"type": "string", "default": "task-executor"},
                 "verify_connection": {"type": "boolean", "default": True},
             },
-            "required": ["api_url", "key"],
+            "required": ["api_url"],
             "additionalProperties": False,
         },
         "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True},

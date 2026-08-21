@@ -78,7 +78,9 @@ class DeliveryTaskPlannerTest(unittest.TestCase):
             patch.object(server, "request_api", return_value=[]),
             patch.object(server, "save_config") as save_config,
         ):
-            result = server.initialize({"api_url": "http://example.test", "key": "secret", "biz_line": "legacy"})
+            with patch.object(server, "save_credential") as save_credential:
+                result = server.initialize({"api_url": "http://example.test", "key": "secret", "biz_line": "legacy"})
+        save_credential.assert_called_once_with("secret", "task-executor")
 
         config = save_config.call_args.args[0]
         self.assertNotIn("biz_line", config)
@@ -92,9 +94,10 @@ class DeliveryTaskPlannerTest(unittest.TestCase):
                 self.assertEqual("http://47.110.3.214:8691/api", server.bridge_api_url())
 
     def test_update_api_url_updates_the_bridge_target_without_requiring_the_key_again(self):
-        config = {"api_url": "http://old.test/api", "key": "secret", "key_header": "token", "user_id": "planner"}
+        settings = {"api_url": "http://old.test/api", "key_header": "token"}
         with (
-            patch.object(server, "load_config", return_value=config),
+            patch.object(server, "stored_settings", return_value=settings),
+            patch.object(server, "load_credential", return_value={"key": "secret", "user_id": "4"}),
             patch.object(server, "request_api", return_value=[{"programId": 4}]) as request_api,
             patch.object(server, "save_config") as save_config,
         ):
@@ -103,9 +106,22 @@ class DeliveryTaskPlannerTest(unittest.TestCase):
         saved = save_config.call_args.args[0]
         self.assertEqual("https://board.example.test/api", saved["api_url"])
         self.assertEqual("https://board.example.test/api", saved["bridge_api_url"])
-        self.assertEqual("secret", saved["key"])
+        self.assertNotIn("key", saved)
         self.assertEqual("https://board.example.test/api", request_api.call_args.args[0]["api_url"])
+        self.assertEqual("secret", request_api.call_args.args[0]["key"])
         self.assertEqual("https://board.example.test/api", result["bridgeApiUrl"])
+
+    def test_update_api_url_skips_verification_before_the_first_heartbeat(self):
+        with (
+            patch.object(server, "stored_settings", return_value={}),
+            patch.object(server, "load_credential", return_value={}),
+            patch.object(server, "request_api") as request_api,
+            patch.object(server, "save_config"),
+        ):
+            result = server.update_api_url({"api_url": "https://board.example.test"})
+
+        request_api.assert_not_called()
+        self.assertFalse(result["verified"])
 
     def test_preview_mode_blocks_task_board_writes(self):
         with patch.dict(os.environ, {server.RUNTIME_WRITE_MODE_ENV: "preview"}):
@@ -392,7 +408,7 @@ class DeliveryTaskPlannerTest(unittest.TestCase):
                     }
                 )
 
-    def test_config_is_private_and_key_is_masked(self):
+    def test_config_file_keeps_only_the_api_address(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.json"
             with patch.object(server, "CONFIG_PATH", path):
@@ -400,11 +416,64 @@ class DeliveryTaskPlannerTest(unittest.TestCase):
                     {
                         "api_url": "http://localhost:8691/api",
                         "key": "secret-key",
+                        "user_id": "4",
                         "key_header": "token",
                     }
                 )
                 self.assertEqual(0o600, os.stat(path).st_mode & 0o777)
-                self.assertEqual("***-key", server.configuration()["key"])
+                stored = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual({"api_url": "http://localhost:8691/api", "key_header": "token"}, stored)
+
+    def test_configuration_masks_the_key_received_from_the_heartbeat(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.json"
+            credential_path = Path(directory) / "credential.json"
+            with (
+                patch.object(server, "CONFIG_PATH", config_path),
+                patch.object(server, "LEGACY_CONFIG_PATH", config_path),
+                patch.object(server, "CREDENTIAL_PATH", credential_path),
+                patch.object(server, "request_api", return_value={"id": 4, "username": "fly"}),
+            ):
+                server.save_config({"api_url": "http://localhost:8691/api", "key_header": "token"})
+                self.assertFalse(server.configuration()["configured"])
+                self.assertTrue(server.save_credential("secret-key", "4"))
+                configuration = server.configuration()
+                self.assertEqual(0o600, os.stat(credential_path).st_mode & 0o777)
+        self.assertEqual("***-key", configuration["key"])
+        self.assertEqual("heartbeat", configuration["credentialSource"])
+        self.assertEqual("4", configuration["userId"])
+
+    def test_heartbeat_credential_feeds_plain_mcp_sessions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.json"
+            credential_path = Path(directory) / "credential.json"
+            with (
+                patch.object(server, "CONFIG_PATH", config_path),
+                patch.object(server, "LEGACY_CONFIG_PATH", config_path),
+                patch.object(server, "CREDENTIAL_PATH", credential_path),
+            ):
+                server.save_config({"api_url": "http://localhost:8691/api", "key_header": "token"})
+                with self.assertRaisesRegex(server.ToolFailure, "尚未收到任务面板凭证"):
+                    server.load_config()
+                server.remember_browser_identity("first-token", "4")
+                first = server.load_config()
+                # 控制台换了账号，下一次心跳把新凭证换进来。
+                server.remember_browser_identity("second-token", "9")
+                second = server.load_config()
+        self.assertEqual("first-token", first["key"])
+        self.assertEqual("4", first["user_id"])
+        self.assertEqual("second-token", second["key"])
+        self.assertEqual("9", second["user_id"])
+
+    def test_expired_credential_is_replaced_by_the_latest_heartbeat(self):
+        with tempfile.TemporaryDirectory() as directory:
+            credential_path = Path(directory) / "credential.json"
+            with patch.object(server, "CREDENTIAL_PATH", credential_path):
+                server.save_credential("fresh-token", "4")
+                config = {"api_url": "http://example.test/api", "key": "stale-token", "user_id": "4"}
+                refreshed = server.refresh_credential(config)
+        self.assertTrue(refreshed)
+        self.assertEqual("fresh-token", config["key"])
 
     def test_created_tasks_report_pending_session_bindings(self):
         context = {"program": {"programId": 1}, "stages": [], "modules": [], "items": []}
