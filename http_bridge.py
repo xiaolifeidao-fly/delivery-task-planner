@@ -48,6 +48,11 @@ def taskboard_command(action: str) -> str:
 PLUGIN_GITHUB_REPOSITORY = "https://github.com/xiaolifeidao-fly/delivery-task-planner.git"
 PLUGIN_GITHUB_RAW_BASE_URL = "https://raw.githubusercontent.com/xiaolifeidao-fly/delivery-task-planner"
 PLUGIN_VERSION_CHECK_CACHE_SECONDS = 60
+PLUGIN_UPDATE_RESTART_POLL_SECONDS = 2
+# This value intentionally lives in the running Python process. Change it in a
+# later release to verify that silent installation restarted the bridge and
+# loaded the new code instead of only replacing files on disk.
+PLUGIN_RUNTIME_TEST_VALUE = "delivery-task-planner-python-runtime-v1"
 SESSION_STATUS = {"completed": "completed", "failed": "blocked", "interrupted": "blocked"}
 TERMINAL_TURN_STATUSES = set(SESSION_STATUS)
 
@@ -310,6 +315,32 @@ def schedule_bridge_restart() -> None:
         creationflags=(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)) if sys.platform == "win32" else 0,
         close_fds=True,
     )
+
+
+def complete_plugin_update_in_background(job_id: str, bridge: Any) -> None:
+    """Wait for installation and restart the bridge once active runs are safe."""
+    def monitor() -> None:
+        while True:
+            try:
+                job = PLUGIN_UPDATES.get_job(job_id)
+            except UpdateFailure:
+                return
+            status = str(job.get("status") or "")
+            if status in {"completed", "failed", "restarting"}:
+                return
+            if status == "restart_required":
+                if bridge.active_run_count() > 0:
+                    time.sleep(PLUGIN_UPDATE_RESTART_POLL_SECONDS)
+                    continue
+                try:
+                    PLUGIN_UPDATES.mark_restarting(job_id)
+                except UpdateFailure:
+                    return
+                schedule_bridge_restart()
+                return
+            time.sleep(PLUGIN_UPDATE_RESTART_POLL_SECONDS)
+
+    threading.Thread(target=monitor, daemon=True, name=f"plugin-update-{job_id[:8]}").start()
 
 
 def ai_provider_of(value: Any) -> str:
@@ -8161,6 +8192,15 @@ class BridgeHandler(BaseHTTPRequestHandler):
         if parsed.path == "/healthz":
             self.json_response(200, self.bridge.health())
             return
+        if parsed.path == "/v1/plugin/info":
+            self.json_response(200, {
+                "installed": True,
+                "version": installed_plugin_version(),
+            })
+            return
+        if parsed.path == "/v1/plugin/runtime-test":
+            self.json_response(200, {"value": PLUGIN_RUNTIME_TEST_VALUE})
+            return
         if parsed.path == "/v1/plugin/update":
             force = str((parse_qs(parsed.query).get("force") or [""])[0]).lower() in {"1", "true", "yes"}
             status = PLUGIN_UPDATES.status(force=force)
@@ -8611,6 +8651,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 if path.endswith("/install"):
                     job = PLUGIN_UPDATES.start(str(payload.get("expectedVersion") or "").strip())
                     job["activeRuns"] = self.bridge.active_run_count()
+                    complete_plugin_update_in_background(str(job.get("jobId") or ""), self.bridge)
                     self.json_response(202, job)
                     return
                 active_runs = self.bridge.active_run_count()
