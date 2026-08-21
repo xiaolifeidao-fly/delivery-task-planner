@@ -346,8 +346,6 @@ class PluginUpdateManager:
             self._validate_package(staged, remote["version"])
             self._log("发布包结构、插件名称和双端版本校验通过。", "success")
 
-            old_python_digest = directory_digest(self.plugin_root)
-            new_python_digest = directory_digest(staged)
             backup = self.backup_dir / f"{int(time.time())}-{self.installed_version().replace('/', '_')}"
             backup.parent.mkdir(parents=True, exist_ok=True)
             copy_package(self.plugin_root, backup)
@@ -368,20 +366,19 @@ class PluginUpdateManager:
             if claude_result:
                 components.append("claude")
 
-            restart_required = old_python_digest != new_python_digest
-            final_status = "restart_required" if restart_required else "completed"
-            final_message = (
-                "插件与双端缓存已更新，请重启桥接服务完成 Python 代码切换。"
-                if restart_required
-                else "插件与双端缓存更新完成，新建会话即可使用。"
-            )
+            # Every successful package replacement gets a fresh bridge process.
+            # A manifest-only release must not leave the old in-memory Python
+            # process running, and the detached helper owns the forced restart.
+            restart_required = True
+            final_status = "restart_required"
+            final_message = "插件与双端缓存已更新，正在强制重启桥接服务。"
             self._patch_job(
                 status=final_status,
-                progress=96 if restart_required else 100,
+                progress=96,
                 message=final_message,
                 restartRequired=restart_required,
                 components=components,
-                finishedAt="" if restart_required else utc_now(),
+                finishedAt="",
             )
             self._log(final_message, "success")
             with self.lock:

@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
@@ -29,6 +30,7 @@ def make_package(root: Path, version: str = "0.3.0") -> Path:
     for name in ("http_bridge.py", "server.py", "taskboard.py"):
         (root / name).write_text(f"# {version}\n", encoding="utf-8")
     (root / "delivery_bridge" / "update_manager.py").write_text(f"# {version}\n", encoding="utf-8")
+    (root / "delivery_bridge" / "restart_helper.py").write_text(f"# {version}\n", encoding="utf-8")
     return root
 
 
@@ -118,10 +120,45 @@ class PluginUpdateTest(unittest.TestCase):
 
             job = manager.get_job("job-1")
 
-            self.assertEqual("restart_required", job["status"])
+            self.assertEqual("restart_required", job["status"], job)
             self.assertEqual(96, job["progress"])
             self.assertIn("重新尝试", job["message"])
             self.assertEqual("warning", job["logs"][-1]["level"])
+
+    def test_successful_install_always_requires_a_forced_bridge_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = Path(directory)
+            plugin_root = make_package(temporary / "installed", "0.2.0")
+            staged = make_package(temporary / "staged", "0.3.0")
+            manager = PluginUpdateManager(
+                plugin_root,
+                temporary / "runtime",
+                "https://example.test/plugin.git",
+                "https://example.test/plugin",
+                home_dir=temporary / "home",
+            )
+            manager.job = {"jobId": "job-1", "logs": []}
+            remote = {
+                "version": "0.3.0",
+                "commit": "a" * 40,
+                "revision": "a" * 40,
+            }
+
+            with (
+                patch.object(manager, "_resolve_remote", return_value=remote),
+                patch.object(manager, "_download_archive", return_value=temporary / "release.zip"),
+                patch.object(manager, "_sha256", return_value="a" * 64),
+                patch.object(manager, "_extract_archive", return_value=staged),
+                patch.object(manager, "_install_codex", return_value=False),
+                patch.object(manager, "_install_claude_cache", return_value=False),
+            ):
+                manager._install("job-1", "0.3.0")
+
+            job = manager.get_job("job-1")
+            self.assertEqual("restart_required", job["status"], job)
+            self.assertTrue(job["restartRequired"])
+            self.assertEqual(96, job["progress"])
+            self.assertEqual("", job["finishedAt"])
 
 
 if __name__ == "__main__":

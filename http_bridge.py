@@ -324,7 +324,7 @@ def schedule_bridge_restart() -> None:
 
 
 def complete_plugin_update_in_background(job_id: str, bridge: Any) -> None:
-    """Wait for installation and restart the bridge once active runs are safe."""
+    """Force the detached restart helper after a completed package replacement."""
     def monitor() -> None:
         while True:
             try:
@@ -335,9 +335,6 @@ def complete_plugin_update_in_background(job_id: str, bridge: Any) -> None:
             if status in {"completed", "failed", "restarting"}:
                 return
             if status == "restart_required":
-                if bridge.active_run_count() > 0:
-                    time.sleep(PLUGIN_UPDATE_RESTART_POLL_SECONDS)
-                    continue
                 try:
                     PLUGIN_UPDATES.mark_restarting(job_id)
                 except UpdateFailure:

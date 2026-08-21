@@ -150,23 +150,21 @@ class HttpBridgeTest(unittest.TestCase):
         self.assertEqual((200, {"installed": True, "version": "0.4.0+codex.test"}), responses[0])
         self.assertEqual((200, {"value": "delivery-task-planner-python-runtime-v5"}), responses[1])
 
-    def test_silent_update_waits_for_active_runs_then_restarts_the_bridge(self):
+    def test_silent_update_forces_restart_without_waiting_for_active_runs(self):
         local_bridge = unittest.mock.MagicMock()
-        local_bridge.active_run_count.side_effect = [1, 0]
         job = {"jobId": "job-1", "status": "restart_required"}
 
         with (
             patch.object(bridge.PLUGIN_UPDATES, "get_job", return_value=job),
             patch.object(bridge.PLUGIN_UPDATES, "mark_restarting") as mark_restarting,
             patch.object(bridge, "schedule_bridge_restart") as schedule_restart,
-            patch.object(bridge.time, "sleep") as sleep,
             patch.object(bridge.threading, "Thread") as thread,
         ):
             bridge.complete_plugin_update_in_background("job-1", local_bridge)
             monitor = thread.call_args.kwargs["target"]
             monitor()
 
-        sleep.assert_called_once_with(bridge.PLUGIN_UPDATE_RESTART_POLL_SECONDS)
+        local_bridge.active_run_count.assert_not_called()
         mark_restarting.assert_called_once_with("job-1")
         schedule_restart.assert_called_once_with()
 
