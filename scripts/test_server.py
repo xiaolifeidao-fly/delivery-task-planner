@@ -690,13 +690,52 @@ class DeliveryTaskPlannerTest(unittest.TestCase):
         # 地址写死之后，改地址的动作不该再存在。
         self.assertNotIn("set_task_board_api_url", names)
 
+    def test_listing_spaces_drops_entries_without_a_code(self):
+        with (
+            patch.object(server, "load_config", return_value={"api_url": "http://example.test/api", "key": "secret"}),
+            patch.object(server, "request_api", return_value=[{"code": "yinni", "name": "印尼业务线"}, {"name": "坏数据"}]),
+        ):
+            result = server.list_spaces()
+
+        self.assertEqual(1, result["count"])
+        self.assertEqual("yinni", result["spaces"][0]["code"])
+
+    def test_listing_projects_walks_every_visible_space_and_tags_each_project(self):
+        responses = [
+            [{"code": "yinni"}, {"code": "dipei"}],
+            [{"programId": 5, "programCode": "whatsapp"}],
+            [{"programId": 3, "programCode": "wangyou"}],
+        ]
+        with (
+            patch.object(server, "load_config", return_value={"api_url": "http://example.test/api", "key": "secret"}),
+            patch.object(server, "request_api", side_effect=responses) as request,
+        ):
+            result = server.list_projects()
+
+        self.assertEqual(["yinni", "dipei"], result["bizLines"])
+        self.assertEqual([5, 3], [project["programId"] for project in result["projects"]])
+        # 同一个 programCode 会跨空间重名，所以每条项目都要带回它属于哪个空间。
+        self.assertEqual(["yinni", "dipei"], [project["bizLine"] for project in result["projects"]])
+        self.assertEqual({"bizLine": "yinni"}, request.call_args_list[1].kwargs["query"])
+
+    def test_listing_projects_for_one_space_skips_the_space_lookup(self):
+        with (
+            patch.object(server, "load_config", return_value={"api_url": "http://example.test/api", "key": "secret"}),
+            patch.object(server, "request_api", return_value=[{"programId": 6}]) as request,
+        ):
+            result = server.list_projects({"biz_line": "yinni"})
+
+        request.assert_called_once()
+        self.assertEqual("/delivery/programs", request.call_args.args[2])
+        self.assertEqual(["yinni"], result["bizLines"])
+
     def test_create_project_refuses_existing_code(self):
         with (
             patch.object(server, "load_config", return_value={"api_url": "http://example.test/api", "key": "secret"}),
             patch.object(server, "request_api", return_value=[{"programId": 1, "programCode": "existing"}]),
         ):
             with self.assertRaisesRegex(server.ToolFailure, "已存在"):
-                server.create_project({"program_code": "existing", "name": "Existing"})
+                server.create_project({"biz_line": "yinni", "program_code": "existing", "name": "Existing"})
 
     def test_create_project_returns_numeric_primary_key(self):
         with (
@@ -707,11 +746,15 @@ class DeliveryTaskPlannerTest(unittest.TestCase):
                 side_effect=[[], None, [{"programId": 7, "programCode": "universe", "name": "Universe"}]],
             ) as request,
         ):
-            result = server.create_project({"program_code": "universe", "name": "Universe"})
+            result = server.create_project({"biz_line": "yinni", "program_code": "universe", "name": "Universe"})
 
         self.assertEqual(7, result["programId"])
         self.assertEqual("universe", result["programCode"])
+        self.assertEqual("yinni", result["bizLine"])
         self.assertEqual(0, request.call_args_list[1].kwargs["body"]["programId"])
+        # 建项目的空间由请求上下文决定，三次请求都要带上它。
+        for call in request.call_args_list:
+            self.assertEqual({"bizLine": "yinni"}, call.kwargs["query"])
 
     def test_create_stage_appends_sequence(self):
         context = {

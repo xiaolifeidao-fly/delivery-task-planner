@@ -559,10 +559,35 @@ def configuration() -> dict[str, Any]:
     }
 
 
-def list_projects() -> dict[str, Any]:
+def list_spaces(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+    """列出当前账号可见的空间（业务线）。项目按空间分片，选项目前先知道有哪些空间。"""
+    del arguments
+    spaces = fetch_spaces(load_config())
+    return {"spaces": spaces, "count": len(spaces)}
+
+
+def fetch_spaces(config: dict[str, Any]) -> list[dict[str, Any]]:
+    spaces = request_api(config, "GET", "/bizline/lines") or []
+    return [space for space in spaces if isinstance(space, dict) and str(space.get("code") or "").strip()]
+
+
+def list_projects(arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+    """列出项目。
+
+    服务端的项目列表按空间分片，没有「全部项目」这个接口：不给 biz_line 时
+    遍历当前账号可见的每个空间再合并，并给每条项目补上它所属的空间。
+    projectCode 会跨空间重名，只有 programId 能唯一定位项目。
+    """
+    arguments = arguments or {}
     config = load_config()
-    programs = request_api(config, "GET", "/delivery/programs") or []
-    return {"projects": programs, "count": len(programs)}
+    requested = str(arguments.get("biz_line") or "").strip()
+    codes = [requested] if requested else [str(space["code"]).strip() for space in fetch_spaces(config)]
+    projects: list[dict[str, Any]] = []
+    for code in codes:
+        for item in request_api(config, "GET", "/delivery/programs", query={"bizLine": code}) or []:
+            if isinstance(item, dict):
+                projects.append({**item, "bizLine": str(item.get("bizLine") or code)})
+    return {"projects": projects, "count": len(projects), "bizLines": codes}
 
 
 def require_business_key(value: Any, label: str) -> str:
@@ -583,13 +608,16 @@ def create_project(arguments: dict[str, Any]) -> dict[str, Any]:
     name = str(arguments.get("name") or "").strip()
     if not name:
         raise ToolFailure("项目名称不能为空。")
-    programs = request_api(config, "GET", "/delivery/programs") or []
+    # 新建项目的空间由请求上下文决定，服务端不会替我们猜。
+    biz_line = require_business_key(arguments.get("biz_line"), "空间编码")
+    programs = request_api(config, "GET", "/delivery/programs", query={"bizLine": biz_line}) or []
     if any(str(item.get("programCode") or "") == program_code for item in programs):
         raise ToolFailure(f"项目编码已存在：{program_code}")
     request_api(
         config,
         "POST",
         "/delivery/program/save",
+        query={"bizLine": biz_line},
         body={
             "programId": 0,
             "programCode": program_code,
@@ -599,10 +627,23 @@ def create_project(arguments: dict[str, Any]) -> dict[str, Any]:
             "actorName": str(arguments.get("actor_name") or "task-planner").strip(),
         },
     )
-    created = next((item for item in request_api(config, "GET", "/delivery/programs") or [] if str(item.get("programCode") or "") == program_code), None)
+    created = next(
+        (
+            item
+            for item in request_api(config, "GET", "/delivery/programs", query={"bizLine": biz_line}) or []
+            if str(item.get("programCode") or "") == program_code
+        ),
+        None,
+    )
     if not isinstance(created, dict) or int(created.get("programId") or 0) <= 0:
         raise ToolFailure("项目已创建，但未能读取项目主键。")
-    return {"created": True, "programId": int(created["programId"]), "programCode": program_code, "name": name}
+    return {
+        "created": True,
+        "programId": int(created["programId"]),
+        "programCode": program_code,
+        "name": name,
+        "bizLine": biz_line,
+    }
 
 
 def create_stage(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -1577,10 +1618,22 @@ ACTIONS = [
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {
+        "name": "list_task_board_spaces",
+        "title": "列出空间",
+        "description": "列出当前账号可见的空间（业务线）。项目按空间分片，创建项目和按空间筛项目都要先拿到空间编码。",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
         "name": "list_task_board_projects",
         "title": "列出任务面板项目",
-        "description": "读取用户可以选择的交付项目。执行任务拆解前必须先选项目。",
-        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        "description": "读取用户可以选择的交付项目；不传 biz_line 时遍历全部可见空间并合并。执行任务拆解前必须先选项目。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "biz_line": {"type": "string", "description": "可选；只看某个空间的项目，缺省时遍历全部可见空间"},
+            },
+            "additionalProperties": False,
+        },
     },
     {
         "name": "create_task_board_project",
@@ -1589,13 +1642,14 @@ ACTIONS = [
         "inputSchema": {
             "type": "object",
             "properties": {
+                "biz_line": {"type": "string", "description": "项目所属空间编码，用 list_task_board_spaces 获取"},
                 "program_code": {"type": "string", "description": "唯一项目业务编码，不作为任务关联标识"},
                 "name": {"type": "string", "description": "项目名称"},
                 "summary": {"type": "string"},
                 "status": {"type": "string", "default": "active"},
                 "actor_name": {"type": "string", "default": "task-planner"},
             },
-            "required": ["program_code", "name"],
+            "required": ["biz_line", "program_code", "name"],
             "additionalProperties": False,
         },
     },
@@ -1768,8 +1822,10 @@ def run_action(name: str, arguments: dict[str, Any]) -> Any:
         return store_credential(arguments)
     if name == "get_task_board_configuration":
         return configuration()
+    if name == "list_task_board_spaces":
+        return list_spaces()
     if name == "list_task_board_projects":
-        return list_projects()
+        return list_projects(arguments)
     if name == "create_task_board_project":
         return create_project(arguments)
     if name == "create_task_board_stage":

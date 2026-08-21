@@ -61,7 +61,8 @@ TASKBOARD="python3 ${CLAUDE_PLUGIN_ROOT:-$HOME/plugins/delivery-task-planner}/ta
 
 用户明确要求新建项目、里程碑或模块时：
 
-- 新建项目执行 `"$TASKBOARD" create-task-board-project`，要求唯一 `program_code` 和项目名称；工具会返回后续操作使用的数值主键 `programId`。
+- 项目按**空间**（业务线）分片：先执行 `"$TASKBOARD" list-task-board-spaces` 看当前账号有哪些空间，拿到空间编码。
+- 新建项目执行 `"$TASKBOARD" create-task-board-project`，要求所属空间 `--biz-line`、唯一 `program_code` 和项目名称；它会返回后续操作使用的数值主键 `programId`。
 - 新建里程碑执行 `"$TASKBOARD" create-task-board-stage`，要求里程碑键、里程碑名称和里程碑目标；未指定顺序时追加到最后。
 - 新建模块执行 `"$TASKBOARD" create-task-board-module`，要求模块键和模块名称；未指定顺序时追加到最后。
 - 创建里程碑和模块前必须确定项目；不覆盖已有相同业务键。
@@ -70,7 +71,8 @@ TASKBOARD="python3 ${CLAUDE_PLUGIN_ROOT:-$HOME/plugins/delivery-task-planner}/ta
 
 - 命令行参数 `--program-id` 一律传项目表数值主键（`programId`），任何情况下都不要传项目名称或 `program_code`。会话提示词给出的 `项目 program_id` 就是它；项目名称只用于向用户描述，不作为参数。
 - 会话已经绑定项目时（从任务面板发起的拆解都属于这种），可以直接省略 `program_id`，命令行会用绑定的那个项目。
-- 用户用名称指代项目时，先用 `"$TASKBOARD" list-task-board-projects` 换成 `programId` 再执行命令。
+- 用户用名称指代项目时，先用 `"$TASKBOARD" list-task-board-projects` 换成 `programId` 再执行命令。不带参数时它会遍历全部可见空间并合并，每条项目带回自己的 `bizLine`；只看某个空间时加 `--biz-line <空间编码>`。
+- `programCode` 会跨空间重名（同一个 `test` 可能同时存在于多个空间），认项目只认 `programId`，展示给用户时带上空间名以免选错。
 - 如果当前执行器没有关联项目，执行 `"$TASKBOARD" list-task-board-projects` 展示项目并要求选择；匹配失败时展示可选项目，不得创建同名新项目。
 
 规划需求时还必须得到：
