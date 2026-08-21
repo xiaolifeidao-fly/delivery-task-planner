@@ -58,15 +58,6 @@ New-Item -ItemType Directory -Path $installRoot -Force | Out-Null
 if ($LASTEXITCODE -gt 7) {
   throw "Could not copy the plugin to $installRoot."
 }
-$mcpPath = Join-Path $installRoot ".mcp.json"
-try {
-  $mcp = Get-Content -LiteralPath $mcpPath -Raw | ConvertFrom-Json
-  $mcp.mcpServers."delivery-task-planner".command = "python"
-  $encoding = New-Object System.Text.UTF8Encoding($false)
-  [System.IO.File]::WriteAllText($mcpPath, ($mcp | ConvertTo-Json -Depth 10), $encoding)
-} catch {
-  throw "Could not configure the Windows MCP Python command: $($_.Exception.Message)"
-}
 & $codexCommand plugin add delivery-task-planner@personal
 if ($LASTEXITCODE -ne 0) {
   throw "Could not install the delivery-task-planner plugin."

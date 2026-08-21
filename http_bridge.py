@@ -36,6 +36,13 @@ import server as planner
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 PLUGIN_MANIFEST_PATH = Path(__file__).resolve().parent / ".codex-plugin" / "plugin.json"
+# 执行器一律走这个命令行入口写任务面板。
+TASKBOARD_CLI = str(Path(__file__).resolve().parent / "taskboard.py")
+
+
+def taskboard_command(action: str) -> str:
+    return f'python3 "{TASKBOARD_CLI}" {action}'
+
 PLUGIN_GITHUB_REPOSITORY = "https://github.com/xiaolifeidao-fly/delivery-task-planner.git"
 PLUGIN_GITHUB_RAW_BASE_URL = "https://raw.githubusercontent.com/xiaolifeidao-fly/delivery-task-planner"
 PLUGIN_VERSION_CHECK_CACHE_SECONDS = 60
@@ -1164,23 +1171,25 @@ def build_planning_prompt(
     mode_lines = (
         [
             f"本轮用户已在任务面板点击「确认并写入」，请遵循 {PLANNING_SKILL} 技能执行写入："
-            "把上一轮预览过的方案（含用户后续提出的修改）用 create_task_board_tasks 一次性提交。",
-            "必须通过插件工具写入，不要用 shell、HTTP 请求、或手工修改文件来创建任务面板数据。",
-            "可用工具：get_task_board_context、create_task_board_stage、create_task_board_module、create_task_board_tasks。当前项目已确定，所有工具的 program_id 一律传下面给出的项目表数值主键，不要传项目名称或项目编码。",
+            f"把上一轮预览过的方案（含用户后续提出的修改）用 `{taskboard_command('create-task-board-tasks')}` 一次性提交。",
+            f"任务面板数据只能通过这个命令行写入：`{taskboard_command('<动作>')}`（参数用连字符，数组参数走 `--json`，内容长时先写文件再 `--json @文件`）。不要自己拼 HTTP 请求、也不要手工改文件来创建任务面板数据。",
+            "可用动作：get-task-board-context、create-task-board-stage、create-task-board-module、create-task-board-tasks；"
+            f"`{taskboard_command('actions')}` 可以打印全部动作和参数，拿不准时先看它。"
+            "当前项目已确定，所有动作的 --program-id 一律传下面给出的项目表数值主键，不要传项目名称或项目编码。",
             "任务描述应包含目标、范围和验收标准；依赖仅表达真正的前置关系。",
             "每个任务必须传 benefit_tags：用 1-3 个不超过 32 字的简短标签描述该任务完成后带来的收益或作用，不能留空，也不要把任务标题重复写成标签。",
-            "任务负责人由写入工具从下面这条需求的主负责人自动继承：任务模型只能保存一位负责人，因此会使用需求的第一位主负责人；不要在任务数组中自行改写负责人。",
-            "调用 create_task_board_tasks 时必须原样传入下面给出的 requirement_key 和 phase，让新任务挂回本需求并落在指定的起始阶段。",
-            "用户已选择里程碑或模块时，将相同的 stage_key/module_key 传给 create_task_board_tasks 并不要自行改写；未选择时根据当前项目已有选项为每项任务分配归属。",
+            "任务负责人由写入命令从下面这条需求的主负责人自动继承：任务模型只能保存一位负责人，因此会使用需求的第一位主负责人；不要在任务数组中自行改写负责人。",
+            "执行 create-task-board-tasks 时必须原样传入下面给出的 requirement_key 和 phase，让新任务挂回本需求并落在指定的起始阶段。",
+            "用户已选择里程碑或模块时，将相同的 stage_key/module_key 传给 create-task-board-tasks 并不要自行改写；未选择时根据当前项目已有选项为每项任务分配归属。",
             "本需求已有任务列表在下方给出：只补齐缺少的部分，不要重建已经存在的任务；若本轮无需新建任务，直接说明原因。",
             "不重复创建与已有任务语义相同的任务。完成后用简洁中文总结实际创建的里程碑、模块和任务。",
         ]
         if write_allowed
         else [
             f"这是交付任务面板的需求梳理会话，请遵循 {PLANNING_SKILL} 技能。本轮只做梳理和预览，禁止写入任何任务面板数据。",
-            "禁止调用 create_task_board_tasks、create_task_board_stage、create_task_board_module，也不要借 shell、HTTP 请求或手工改文件绕过任务面板写入限制；未确认前这些写入调用会被工具直接拒绝。",
+            "禁止执行 create-task-board-tasks、create-task-board-stage、create-task-board-module，也不要借 HTTP 请求或手工改文件绕过任务面板写入限制；未确认前这些写入命令会被命令行直接拒绝。",
             "本轮的限制只针对任务面板数据：默认除下面给出的需求大纲文件外不修改工作区其他文件；如果用户明确要求生成或更新独立的流程图、图表、HTML 或其他需求资产，允许写入当前需求文档目录，但只能写该目录。已授予项目工作目录及需求指定关联目录的只读勘察权限；可使用终端的只读命令和当前会话可用的读取工具列目录、搜索并读取代码、配置、技能和文档。某个可选读取工具不可用时，改用其他可用的只读工具继续勘察，不要因此停止。",
-            "拆解前必须先勘察下方给出的项目工作目录：加载该目录下项目自己的开发技能（如 backend-development、web-development），读相关目录和现有实现，据此判断需求真正的落点。get_task_board_context 只给出面板侧上下文，不包含工程现状，不能拿它替代看代码。",
+            "拆解前必须先勘察下方给出的项目工作目录：加载该目录下项目自己的开发技能（如 backend-development、web-development），读相关目录和现有实现，据此判断需求真正的落点。get-task-board-context 只给出面板侧上下文，不包含工程现状，不能拿它替代看代码。",
             "任务要落到勘察出的真实模块、目录或接口上，不要只按业务名词泛化出通用分层；工作区里找不到需求所指的模块时，先向用户说明并确认工作目录或范围，不要硬拆。",
             "请与用户对话把需求问清楚，然后输出一份可评审的拆解预览：先用 Markdown 表格列出「序号 / 任务标题 / 收益标签 / 负责人 / 里程碑 / 模块 / 类型 / 前置依赖」，每项给 1-3 个简短收益或作用标签；负责人统一展示为该需求的第一位主负责人（未指定则标为未指派）；再在表格下方逐条补充目标、范围和验收标准。",
             "里程碑、模块、类型的取值只能来自下方给出的现有选项；预览里也要说明哪些是新建、哪些复用已有任务。",
@@ -1195,8 +1204,8 @@ def build_planning_prompt(
         if split_tasks
         else (
             [
-                "本需求已关闭「拆解成多条任务」：调用 create_task_board_tasks 时 tasks 数组只能包含一条覆盖整条需求的任务，"
-                "该任务的 depends_on 传空数组；启用原型图时工具自动追加的原型任务不计入这条限制。",
+                "本需求已关闭「拆解成多条任务」：执行 create-task-board-tasks 时 tasks 数组只能包含一条覆盖整条需求的任务，"
+                "该任务的 depends_on 传空数组；启用原型图时命令行自动追加的原型任务不计入这条限制。",
             ]
             if write_allowed
             else [
@@ -1209,8 +1218,8 @@ def build_planning_prompt(
     prototype_lines = (
         [
             "本需求已启用“拆解后生成原型图”。预览时必须在任务表的最后列出一条“生成需求原型图”任务，"
-            "并说明它依赖本轮其余任务；确认写入时，调用 create_task_board_tasks 必须传 generate_prototype: true。"
-            "工具会自动创建并标识这条末尾任务，任务执行时将把图片保存到自身文档目录的 prototype/ 中。",
+            "并说明它依赖本轮其余任务；确认写入时，执行 create-task-board-tasks 必须传 generate_prototype: true。"
+            "命令行会自动创建并标识这条末尾任务，任务执行时将把图片保存到自身文档目录的 prototype/ 中。",
         ]
         if prototype_enabled else []
     )
@@ -1222,7 +1231,7 @@ def build_planning_prompt(
     task_document_required = pre_generate_task_documents or not split_tasks
     task_document_lines = (
         [
-            "本需求已关闭“拆解成多条任务”：确认写入后，create_task_board_tasks 返回的唯一业务任务（prototypeTask=false）"
+            "本需求已关闭“拆解成多条任务”：确认写入后，create-task-board-tasks 返回的唯一业务任务（prototypeTask=false）"
             "就是本条需求的交付载体。必须把本轮梳理出的完整需求文档直接创建或覆盖到该任务返回的 requirementDocumentPath"
             "（即 `doc/<moduleKey>/<itemKey>/文档.md`），不能只留在需求级大纲或任务数据库的简短说明中。",
             "这条规则不依赖“预生成任务需求文档”开关；若同时生成原型图，不要把需求正文写进 prototypeTask=true 的原型任务文档。",
@@ -1232,7 +1241,7 @@ def build_planning_prompt(
         ]
         if write_allowed and not split_tasks
         else [
-            "本需求已启用“预生成任务需求文档”。create_task_board_tasks 返回每条任务的 moduleKey 和 itemKey 后，"
+            "本需求已启用“预生成任务需求文档”。create-task-board-tasks 返回每条任务的 moduleKey 和 itemKey 后，"
             "必须为本轮每条新建任务创建或覆盖 `doc/<moduleKey>/<itemKey>/文档.md`，一条任务一份，不能另建任务需求大纲。",
             "这份文件是后续任务“梳理需求”和“动作执行”共同读取的唯一需求文档；先写可实施初稿，"
             "再由梳理需求阶段基于真实代码增量校正和补全。",
@@ -1367,7 +1376,7 @@ def build_requirement_testing_prompt(
             "不得输出验收判定、不得创建或覆盖测试报告、不得修改业务实现。",
         ]
         if test_case_only else [
-            "这是交付任务面板的一次需求总体测试。遵循 delivery-requirement-testing 技能执行真实测试，不要调用任务拆解工具或修改业务实现。",
+            "这是交付任务面板的一次需求总体测试。遵循 delivery-requirement-testing 技能执行真实测试，不要执行任务拆解命令或修改业务实现。",
             "先读取已有 doc/test/<需求键>/测试用例.md 并按其中用例真实验证；没有明确执行和证据，不得写通过。",
         ]
     )
@@ -2413,7 +2422,7 @@ def build_environment_setup_prompt(
         [
             "这是交付任务面板「项目管理 → 偏好设置 → 高级设置 → 预设环境」发起的一次本机环境预设。",
             "它装的是本机全局环境，不属于任何项目：不要读取、修改或提交任何业务仓库的代码，"
-            "也不要调用任务面板的任务拆解、执行或测试工具。",
+            "也不要执行任务面板的任务拆解、执行或测试命令。",
             f"本机系统是 {label}，下面的命令已经按 {label} 给好了，照着执行，不要换成别的系统那一套。",
             f"本轮 cwd 是一个专用空目录：{environment_setup_workspace()}；只在需要落临时文件时用它。",
             "只做下面这份清单，逐项先检测再动手，并把执行过的命令和真实输出讲清楚：",
@@ -5194,7 +5203,7 @@ class ExecutionBridge:
             raise BridgeFailure("当前用户凭证为空")
         api_url = self._resolve_task_board_api(str(raw.get("apiUrl") or "").strip(), origin, token, program_id)
         # 走到这里这个凭证已经被面板验过了（_resolve_task_board_api 打过一次真实接口），
-        # 此时才落盘：普通 MCP 会话没有运行期环境变量，只能读那份文件，切账号后不刷新
+        # 此时才落盘：普通命令行会话没有运行期环境变量，只能读那份文件，切账号后不刷新
         # 就会继续拿旧账号写入，而面板那边报出来只是一句权限不足，排查方向会被带偏。
         planner.remember_browser_identity(token, str(raw.get("userId") or "").strip())
         config = {
@@ -8758,7 +8767,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
     def handle_heartbeat(self) -> None:
         """控制台每分钟送一次当前账号的 token 和 user_id，插件存下来当作凭证来源。
 
-        配置文件只维护接口地址；普通 MCP 会话没有面板注入的环境变量，全靠这里
+        配置文件只维护接口地址；普通命令行会话没有面板注入的环境变量，全靠这里
         存下来的凭证。心跳不打任何面板接口，凭证真伪由后续真实请求判定。
         """
         try:

@@ -71,7 +71,7 @@ class DeliveryTaskPlannerTest(unittest.TestCase):
     def test_writes_are_allowed_when_no_write_mode_is_declared(self):
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop(server.RUNTIME_WRITE_MODE_ENV, None)
-            # 只要不是 preview 就放行：普通 MCP 工作流没有这个环境变量。
+            # 只要不是 preview 就放行：普通命令行工作流没有这个环境变量。
             self.assertIsNone(server.assert_write_allowed("写入任务"))
 
     def test_program_id_is_required_when_runtime_scope_is_absent(self):
@@ -376,7 +376,7 @@ class DeliveryTaskPlannerTest(unittest.TestCase):
         self.assertEqual("heartbeat", configuration["credentialSource"])
         self.assertEqual("4", configuration["userId"])
 
-    def test_heartbeat_credential_feeds_plain_mcp_sessions(self):
+    def test_heartbeat_credential_feeds_plain_cli_sessions(self):
         with tempfile.TemporaryDirectory() as directory:
             config_path = Path(directory) / "config.json"
             credential_path = Path(directory) / "credential.json"

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """任务面板命令行入口。
 
-技能通过它调用任务面板接口，不再需要 MCP：服务端地址写死在 server.py 里，
+技能通过它调用任务面板接口：服务端地址写死在 server.py 里，
 凭证由控制台心跳写进 ~/.config/delivery-task-planner/credential.json。
 
     taskboard.py actions                     列出全部动作和参数

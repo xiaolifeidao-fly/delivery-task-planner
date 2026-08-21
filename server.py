@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""MCP tools for planning and writing Universe delivery-board tasks."""
+"""Actions for planning and writing Universe delivery-board tasks.
+
+技能通过 taskboard.py 调用这里的动作；本地桥接把本模块当函数库直接 import。
+"""
 
 from __future__ import annotations
 
@@ -54,7 +57,7 @@ class ToolFailure(Exception):
 def assert_write_allowed(action: str) -> None:
     """需求梳理的预览轮次只给只读工具；写入要等用户在任务面板确认。
 
-    环境变量缺省表示允许写入，普通 MCP 用法不受影响；只有面板发起的
+    环境变量缺省表示允许写入，普通命令行用法不受影响；只有面板发起的
     梳理会话会把它设成 preview。
     """
     if os.environ.get(RUNTIME_WRITE_MODE_ENV, "").strip().lower() != "preview":
@@ -181,7 +184,7 @@ def save_credential(token: str, user_id: str = "") -> bool:
 
 
 def bridge_api_url() -> str:
-    """固定的服务端地址：普通 MCP 会话和本地桥接共用，不可配置。"""
+    """固定的服务端地址：命令行和本地桥接共用，不可配置。"""
     return TASK_BOARD_API_URL
 
 
@@ -241,7 +244,7 @@ def remember_browser_identity(token: str, user_id: str = "") -> None:
     """Persist the console's current credential as the fallback identity.
 
     Sessions started from the task panel get the logged-in user's token through
-    the runtime environment. Plain MCP sessions have no such environment, so they
+    the runtime environment. Plain CLI sessions have no such environment, so they
     read the credential file that the console keeps fresh — through the
     heartbeat endpoint every minute, and through every bridge request on top of
     that. Without the refresh the fallback kept writing as the *previous*

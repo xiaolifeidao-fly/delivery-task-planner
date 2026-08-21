@@ -705,13 +705,17 @@ class HttpBridgeTest(unittest.TestCase):
 
         preview_prompt = client.start_task.call_args[0][1]
         write_prompt = client.start_turn.call_args[0][1]
-        self.assertIn("禁止调用 create_task_board_tasks", preview_prompt)
+        self.assertIn("禁止执行 create-task-board-tasks", preview_prompt)
+        # 提示词必须给出命令行入口，不能再点名已经撤掉的工具。
+        self.assertNotIn("create_task_board_tasks", preview_prompt)
+        self.assertNotIn("create_task_board_tasks", write_prompt)
+        self.assertIn("taskboard.py", write_prompt)
         self.assertIn("已授予项目工作目录及需求指定关联目录的只读勘察权限", preview_prompt)
         self.assertIn("终端的只读命令", preview_prompt)
         self.assertIn("收益标签 / 负责人", preview_prompt)
         self.assertIn("preview", environments[0][bridge.planner.RUNTIME_WRITE_MODE_ENV])
         self.assertIn("确认并写入", write_prompt)
-        self.assertIn("任务负责人由写入工具", write_prompt)
+        self.assertIn("任务负责人由写入命令", write_prompt)
         self.assertEqual("write", environments[1][bridge.planner.RUNTIME_WRITE_MODE_ENV])
         # 面板上下文整段裹在标记里，聊天记录只回显用户自己输入的那句。
         self.assertEqual("拆解这个需求", bridge.text_without_attachment_context(preview_prompt))
