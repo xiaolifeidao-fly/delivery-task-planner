@@ -43,7 +43,7 @@ The bridge entry point remains `http_bridge.py`, but reusable runtime concerns l
 
 - `versioning.py` owns SemVer comparison shared by update checks and installation.
 - `update_manager.py` resolves an immutable Git commit, downloads and validates the release archive, backs up the active package, refreshes Codex and Claude Code caches, and persists bounded installation logs.
-- `restart_helper.py` restarts the bridge after the HTTP response is delivered. On macOS it hands control back to the per-user LaunchAgent; other platforms relaunch the same bridge arguments from a detached helper.
+- `restart_helper.py` preserves the bridge command-line arguments and restarts the bridge after the HTTP response is delivered. On macOS it hands control back to the per-user LaunchAgent; other platforms relaunch the same bridge arguments from a detached helper. Restart diagnostics are written to `~/.local/state/delivery-task-planner/restart-helper.log`, and a stale `restarting` job becomes retryable after 45 seconds instead of polling forever.
 
 The console checks `GET /v1/plugin/update` once a minute and silently starts `POST /v1/plugin/update/install` whenever the repository contains a newer SemVer release. Installation no longer requires an update dialog or operator confirmation. The install endpoint accepts only the expected version; executable files are always downloaded by the loopback bridge from the fixed repository and never uploaded by a browser origin. The archive is size-limited, path-checked, pinned to one Git commit, and must contain matching Codex and Claude plugin manifests plus the bridge entry points and skills.
 

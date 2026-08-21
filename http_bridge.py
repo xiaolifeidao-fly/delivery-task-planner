@@ -52,7 +52,7 @@ PLUGIN_UPDATE_RESTART_POLL_SECONDS = 2
 # This value intentionally lives in the running Python process. Change it in a
 # later release to verify that silent installation restarted the bridge and
 # loaded the new code instead of only replacing files on disk.
-PLUGIN_RUNTIME_TEST_VALUE = "delivery-task-planner-python-runtime-v2"
+PLUGIN_RUNTIME_TEST_VALUE = "delivery-task-planner-python-runtime-v3"
 SESSION_STATUS = {"completed": "completed", "failed": "blocked", "interrupted": "blocked"}
 TERMINAL_TURN_STATUSES = set(SESSION_STATUS)
 
@@ -60,6 +60,9 @@ PLUGIN_UPDATES: PluginUpdateManager
 
 
 def default_runtime_dir() -> Path:
+    configured = os.environ.get("DELIVERY_TASK_PLANNER_RUNTIME_DIR", "").strip()
+    if configured:
+        return Path(configured).expanduser().resolve()
     if sys.platform == "win32" and os.environ.get("LOCALAPPDATA"):
         return Path(os.environ["LOCALAPPDATA"]) / "delivery-task-planner"
     return Path.home() / ".local" / "state" / "delivery-task-planner"
@@ -298,23 +301,26 @@ def create_http_server(
 def schedule_bridge_restart() -> None:
     """Hand restart ownership to a detached helper so this request can finish."""
     helper = Path(__file__).resolve().parent / "delivery_bridge" / "restart_helper.py"
-    subprocess.Popen(
-        [
-            sys.executable,
-            str(helper),
-            "--pid",
-            str(os.getpid()),
-            "--plugin-root",
-            str(Path(__file__).resolve().parent),
-            *sys.argv[1:],
-        ],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=sys.platform != "win32",
-        creationflags=(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)) if sys.platform == "win32" else 0,
-        close_fds=True,
-    )
+    restart_log = RUNTIME_DIR / "restart-helper.log"
+    restart_log.parent.mkdir(parents=True, exist_ok=True)
+    with restart_log.open("a", encoding="utf-8") as output:
+        subprocess.Popen(
+            [
+                sys.executable,
+                str(helper),
+                "--pid",
+                str(os.getpid()),
+                "--plugin-root",
+                str(Path(__file__).resolve().parent),
+                *sys.argv[1:],
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=output,
+            stderr=output,
+            start_new_session=sys.platform != "win32",
+            creationflags=(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)) if sys.platform == "win32" else 0,
+            close_fds=True,
+        )
 
 
 def complete_plugin_update_in_background(job_id: str, bridge: Any) -> None:

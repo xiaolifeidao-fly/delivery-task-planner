@@ -97,6 +97,32 @@ class PluginUpdateTest(unittest.TestCase):
             self.assertTrue(old_cache.is_dir())
             self.assertTrue(list(metadata_path.parent.glob("installed_plugins.json.backup-*")))
 
+    def test_stale_restarting_job_recovers_to_retryable_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plugin_root = make_package(Path(directory) / "installed", "0.4.3")
+            manager = PluginUpdateManager(
+                plugin_root,
+                Path(directory) / "runtime",
+                "https://example.test/plugin.git",
+                "https://example.test/plugin",
+                home_dir=Path(directory) / "home",
+            )
+            manager.job = {
+                "jobId": "job-1",
+                "status": "restarting",
+                "progress": 98,
+                "restartRequired": True,
+                "restartRequestedAt": "2020-01-01T00:00:00Z",
+                "logs": [],
+            }
+
+            job = manager.get_job("job-1")
+
+            self.assertEqual("restart_required", job["status"])
+            self.assertEqual(96, job["progress"])
+            self.assertIn("重新尝试", job["message"])
+            self.assertEqual("warning", job["logs"][-1]["level"])
+
 
 if __name__ == "__main__":
     unittest.main()

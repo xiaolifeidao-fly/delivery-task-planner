@@ -4,6 +4,7 @@ import importlib.util
 import base64
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -15,6 +16,8 @@ from unittest.mock import patch
 
 BRIDGE_PATH = Path(__file__).resolve().parents[1] / "http_bridge.py"
 PLUGIN_ROOT = BRIDGE_PATH.parent
+TEST_RUNTIME_DIRECTORY = tempfile.TemporaryDirectory()
+os.environ["DELIVERY_TASK_PLANNER_RUNTIME_DIR"] = TEST_RUNTIME_DIRECTORY.name
 if str(PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(PLUGIN_ROOT))
 SPEC = importlib.util.spec_from_file_location("delivery_task_http_bridge", BRIDGE_PATH)
@@ -145,7 +148,7 @@ class HttpBridgeTest(unittest.TestCase):
             handler.do_GET()
 
         self.assertEqual((200, {"installed": True, "version": "0.4.0+codex.test"}), responses[0])
-        self.assertEqual((200, {"value": "delivery-task-planner-python-runtime-v2"}), responses[1])
+        self.assertEqual((200, {"value": "delivery-task-planner-python-runtime-v3"}), responses[1])
 
     def test_silent_update_waits_for_active_runs_then_restarts_the_bridge(self):
         local_bridge = unittest.mock.MagicMock()

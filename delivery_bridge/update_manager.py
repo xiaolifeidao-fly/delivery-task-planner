@@ -32,6 +32,7 @@ MAX_ARCHIVE_BYTES = 80 * 1024 * 1024
 MAX_EXTRACTED_BYTES = 180 * 1024 * 1024
 MAX_ARCHIVE_FILES = 4000
 UPDATE_TERMINAL_STATES = {"completed", "failed", "restart_required"}
+RESTART_STALE_SECONDS = 45
 PACKAGE_EXCLUDES = {".git", "__pycache__", ".pytest_cache", ".DS_Store"}
 
 
@@ -280,7 +281,33 @@ class PluginUpdateManager:
         with self.lock:
             if not self.job or (job_id and self.job.get("jobId") != job_id):
                 raise UpdateFailure("未找到插件更新记录")
+            self._recover_stale_restart()
             return json.loads(json.dumps(self.job, ensure_ascii=False))
+
+    def _recover_stale_restart(self) -> None:
+        if not self.job or self.job.get("status") != "restarting":
+            return
+        requested_at = str(self.job.get("restartRequestedAt") or "")
+        if not requested_at:
+            logs = self.job.get("logs") if isinstance(self.job.get("logs"), list) else []
+            requested_at = str((logs[-1] if logs else {}).get("at") or self.job.get("startedAt") or "")
+        try:
+            requested = datetime.fromisoformat(requested_at.replace("Z", "+00:00"))
+        except ValueError:
+            return
+        if (datetime.now(timezone.utc) - requested).total_seconds() < RESTART_STALE_SECONDS:
+            return
+        self.job.update({
+            "status": "restart_required",
+            "progress": 96,
+            "message": "上次自动重启未完成，正在重新尝试。",
+            "restartRequired": True,
+            "restartRequestedAt": "",
+        })
+        logs = self.job.setdefault("logs", [])
+        logs.append({"at": utc_now(), "level": "warning", "message": "自动重启等待超时，已恢复为可重试状态。"})
+        self.job["logs"] = logs[-400:]
+        self._save_job()
 
     def mark_restarting(self, job_id: str) -> dict[str, Any]:
         with self.lock:
@@ -288,7 +315,12 @@ class PluginUpdateManager:
                 raise UpdateFailure("未找到插件更新记录")
             if self.job.get("status") != "restart_required":
                 raise UpdateFailure("当前更新不需要重启桥接服务")
-            self.job.update({"status": "restarting", "progress": 98, "message": "正在重启桥接服务。"})
+            self.job.update({
+                "status": "restarting",
+                "progress": 98,
+                "message": "正在重启桥接服务。",
+                "restartRequestedAt": utc_now(),
+            })
             self._log("安装结果已落盘，开始重启桥接服务。")
             return self.get_job(job_id)
 
