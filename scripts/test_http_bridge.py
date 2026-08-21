@@ -148,7 +148,7 @@ class HttpBridgeTest(unittest.TestCase):
             handler.do_GET()
 
         self.assertEqual((200, {"installed": True, "version": "0.4.0+codex.test"}), responses[0])
-        self.assertEqual((200, {"value": "delivery-task-planner-python-runtime-v3"}), responses[1])
+        self.assertEqual((200, {"value": "delivery-task-planner-python-runtime-v5"}), responses[1])
 
     def test_silent_update_waits_for_active_runs_then_restarts_the_bridge(self):
         local_bridge = unittest.mock.MagicMock()

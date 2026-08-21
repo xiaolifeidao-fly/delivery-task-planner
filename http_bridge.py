@@ -52,7 +52,7 @@ PLUGIN_UPDATE_RESTART_POLL_SECONDS = 2
 # This value intentionally lives in the running Python process. Change it in a
 # later release to verify that silent installation restarted the bridge and
 # loaded the new code instead of only replacing files on disk.
-PLUGIN_RUNTIME_TEST_VALUE = "delivery-task-planner-python-runtime-v3"
+PLUGIN_RUNTIME_TEST_VALUE = "delivery-task-planner-python-runtime-v5"
 SESSION_STATUS = {"completed": "completed", "failed": "blocked", "interrupted": "blocked"}
 TERMINAL_TURN_STATUSES = set(SESSION_STATUS)
 
