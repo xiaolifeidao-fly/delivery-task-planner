@@ -1746,7 +1746,12 @@ def git_branch_catalog(workspace: Path) -> dict[str, Any]:
         if name not in branches:
             branches.append(name)
     branches.sort()
-    return {"branches": branches, "defaultBranch": git_default_branch(workspace, branches)}
+    return {
+        "branches": branches,
+        "defaultBranch": git_default_branch(workspace, branches),
+        # 面板要标注项目此刻所处的分支，游离 HEAD 时为空串。
+        "currentBranch": git_current_branch(workspace),
+    }
 
 
 def normalized_git_remote_url(value: str) -> str:
