@@ -47,6 +47,18 @@ class HttpBridgeTest(unittest.TestCase):
         self.assertIn(("Access-Control-Allow-Origin", "*"), headers)
         self.assertNotIn(("Vary", "Origin"), headers)
 
+    def test_cors_allows_a_direct_request_without_an_origin_header(self):
+        handler = object.__new__(bridge.BridgeHandler)
+        handler.server = SimpleNamespace(allowed_origins={"http://restricted.example"})
+        handler.headers = {}
+        headers = []
+        handler.send_header = lambda name, value: headers.append((name, value))
+
+        self.assertEqual("null", handler.allowed_origin())
+        handler.cors()
+
+        self.assertIn(("Access-Control-Allow-Origin", "*"), headers)
+
     def test_content_disposition_encodes_non_latin_file_names(self):
         header = bridge.content_disposition_of("需求大纲.md")
 
