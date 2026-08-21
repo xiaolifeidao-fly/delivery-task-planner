@@ -54,7 +54,7 @@ if (-not (Get-Content -LiteralPath $marketplaceFile -Raw | Select-String -Quiet 
 }
 
 New-Item -ItemType Directory -Path $installRoot -Force | Out-Null
-& robocopy $pluginRoot $installRoot /MIR /XD __pycache__ /XF *.pyc | Out-Null
+& robocopy $pluginRoot $installRoot /MIR /XD .git __pycache__ .pytest_cache /XF *.pyc | Out-Null
 if ($LASTEXITCODE -gt 7) {
   throw "Could not copy the plugin to $installRoot."
 }

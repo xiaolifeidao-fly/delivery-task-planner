@@ -47,7 +47,9 @@ fi
 
 mkdir -p "${install_root}"
 rsync -a --delete \
+  --exclude '.git/' \
   --exclude '__pycache__/' \
+  --exclude '.pytest_cache/' \
   --exclude '*.pyc' \
   "${plugin_root}/" "${install_root}/"
 

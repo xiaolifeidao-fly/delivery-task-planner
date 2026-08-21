@@ -31,6 +31,8 @@ from urllib.parse import parse_qs, quote, urlparse
 from urllib.request import Request, urlopen
 
 import server as planner
+from delivery_bridge.update_manager import PluginUpdateManager, UpdateFailure
+from delivery_bridge.versioning import compare_versions, manifest_version
 
 
 DEFAULT_HOST = "127.0.0.1"
@@ -49,11 +51,7 @@ PLUGIN_VERSION_CHECK_CACHE_SECONDS = 60
 SESSION_STATUS = {"completed": "completed", "failed": "blocked", "interrupted": "blocked"}
 TERMINAL_TURN_STATUSES = set(SESSION_STATUS)
 
-_PLUGIN_VERSION_RE = re.compile(
-    r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$"
-)
-_remote_plugin_version_cache: tuple[float, str] | None = None
-_remote_plugin_version_cache_lock = threading.Lock()
+PLUGIN_UPDATES: PluginUpdateManager
 
 
 def default_runtime_dir() -> Path:
@@ -64,99 +62,38 @@ def default_runtime_dir() -> Path:
 
 def plugin_version_from_manifest(path: Path) -> str:
     try:
-        manifest = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise BridgeFailure(f"无法读取插件版本信息：{exc}") from exc
-    version = str(manifest.get("version") or "").strip() if isinstance(manifest, dict) else ""
-    if not version:
-        raise BridgeFailure("插件版本信息为空")
-    return version
+        return manifest_version(path)
+    except ValueError as exc:
+        raise BridgeFailure(str(exc)) from exc
 
 
 def installed_plugin_version() -> str:
     return plugin_version_from_manifest(PLUGIN_MANIFEST_PATH)
 
 
-def semver_parts(value: str) -> tuple[tuple[int, int, int], tuple[str, ...] | None]:
-    """Parse a SemVer release, deliberately ignoring its build metadata."""
-    normalized = str(value or "").strip().lstrip("v").split("+", 1)[0]
-    match = _PLUGIN_VERSION_RE.fullmatch(normalized)
-    if not match:
-        raise ValueError(f"无效的插件版本号：{value}")
-    release = tuple(int(match.group(index)) for index in range(1, 4))
-    pre_release = tuple(match.group(4).split(".")) if match.group(4) else None
-    return release, pre_release
-
-
 def compare_plugin_versions(left: str, right: str) -> int:
-    """Compare SemVer values. A positive result means left is newer than right."""
-    left_release, left_pre_release = semver_parts(left)
-    right_release, right_pre_release = semver_parts(right)
-    if left_release != right_release:
-        return 1 if left_release > right_release else -1
-    if left_pre_release is None and right_pre_release is None:
-        return 0
-    if left_pre_release is None:
-        return 1
-    if right_pre_release is None:
-        return -1
-    for left_identifier, right_identifier in zip(left_pre_release, right_pre_release):
-        if left_identifier == right_identifier:
-            continue
-        left_numeric = left_identifier.isdigit()
-        right_numeric = right_identifier.isdigit()
-        if left_numeric and right_numeric:
-            return 1 if int(left_identifier) > int(right_identifier) else -1
-        if left_numeric != right_numeric:
-            return -1 if left_numeric else 1
-        return 1 if left_identifier > right_identifier else -1
-    if len(left_pre_release) == len(right_pre_release):
-        return 0
-    return 1 if len(left_pre_release) > len(right_pre_release) else -1
+    return compare_versions(left, right)
 
 
 def remote_plugin_default_branch() -> str:
-    """Ask Git for the default branch, then retain main as an offline-safe fallback."""
     try:
-        result = subprocess.run(
-            ["git", "ls-remote", "--symref", PLUGIN_GITHUB_REPOSITORY, "HEAD"],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except (OSError, subprocess.SubprocessError):
+        return PLUGIN_UPDATES._resolve_remote().get("branch", "main")
+    except (UpdateFailure, NameError):
         return "main"
-    match = re.search(r"^ref:\s+refs/heads/(.+?)\s+HEAD$", result.stdout, re.MULTILINE)
-    return match.group(1) if match else "main"
 
 
 def fetch_remote_plugin_version() -> str:
-    branch = remote_plugin_default_branch()
-    manifest_url = f"{PLUGIN_GITHUB_RAW_BASE_URL}/{quote(branch, safe='/')}/.codex-plugin/plugin.json"
-    request = Request(manifest_url, headers={"User-Agent": "delivery-task-planner-version-check"})
     try:
-        with urlopen(request, timeout=5) as response:
-            manifest = json.loads(response.read().decode("utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise BridgeFailure(f"无法读取 Git 仓库中的插件版本：{exc}") from exc
-    version = str(manifest.get("version") or "").strip() if isinstance(manifest, dict) else ""
-    if not version:
-        raise BridgeFailure("Git 仓库中的插件版本信息为空")
-    return version
+        return PLUGIN_UPDATES._resolve_remote(force=True)["version"]
+    except UpdateFailure as exc:
+        raise BridgeFailure(str(exc)) from exc
 
 
 def cached_remote_plugin_version() -> str:
-    global _remote_plugin_version_cache
-    now = time.monotonic()
-    with _remote_plugin_version_cache_lock:
-        cached = _remote_plugin_version_cache
-        if cached is not None and now - cached[0] < PLUGIN_VERSION_CHECK_CACHE_SECONDS:
-            return cached[1]
-    version = fetch_remote_plugin_version()
-    with _remote_plugin_version_cache_lock:
-        _remote_plugin_version_cache = (now, version)
-    return version
+    try:
+        return PLUGIN_UPDATES._resolve_remote()["version"]
+    except UpdateFailure as exc:
+        raise BridgeFailure(str(exc)) from exc
 
 
 def plugin_update_status() -> dict[str, Any]:
@@ -182,16 +119,28 @@ def plugin_update_status() -> dict[str, Any]:
             "checkedAt": checked_at,
             "message": str(exc),
         }
-    return {
+    result = {
         "localVersion": local_version,
         "remoteVersion": remote_version,
         "updateAvailable": update_available,
         "checkedAt": checked_at,
         "message": "",
     }
+    try:
+        result["installation"] = PLUGIN_UPDATES.get_job()
+    except (UpdateFailure, NameError):
+        result["installation"] = None
+    return result
 
 
 RUNTIME_DIR = default_runtime_dir()
+PLUGIN_UPDATES = PluginUpdateManager(
+    Path(__file__).resolve().parent,
+    RUNTIME_DIR,
+    PLUGIN_GITHUB_REPOSITORY,
+    PLUGIN_GITHUB_RAW_BASE_URL,
+    PLUGIN_VERSION_CHECK_CACHE_SECONDS,
+)
 PENDING_SESSION_SYNCS_PATH = RUNTIME_DIR / "pending-session-syncs.json"
 # Claude 是 print 模式的一次性子进程，没有常驻线程服务可读；会话记录只能自己落盘。
 CLAUDE_TRANSCRIPTS_DIR = RUNTIME_DIR / "claude-transcripts"
@@ -339,6 +288,28 @@ def create_http_server(
     httpd.bridge = ExecutionBridge(workspace)  # type: ignore[attr-defined]
     httpd.allowed_origins = allowed_origins  # type: ignore[attr-defined]
     return httpd
+
+
+def schedule_bridge_restart() -> None:
+    """Hand restart ownership to a detached helper so this request can finish."""
+    helper = Path(__file__).resolve().parent / "delivery_bridge" / "restart_helper.py"
+    subprocess.Popen(
+        [
+            sys.executable,
+            str(helper),
+            "--pid",
+            str(os.getpid()),
+            "--plugin-root",
+            str(Path(__file__).resolve().parent),
+            *sys.argv[1:],
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=sys.platform != "win32",
+        creationflags=(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)) if sys.platform == "win32" else 0,
+        close_fds=True,
+    )
 
 
 def ai_provider_of(value: Any) -> str:
@@ -5193,6 +5164,16 @@ class ExecutionBridge:
             "checkedAt": int(time.time()),
         }
 
+    def active_run_count(self) -> int:
+        """Count in-flight runs across every workspace owned by this bridge."""
+        with self.workspace_bridges_lock:
+            bridges = list(self.workspace_bridges.values())
+        count = 0
+        for bridge in bridges:
+            with bridge.lock:
+                count += len(bridge.active_runs)
+        return count
+
     def request_config(self, raw: Any, origin: str, token: str) -> dict[str, Any]:
         if not isinstance(raw, dict):
             raise BridgeFailure("请求体必须是 JSON 对象")
@@ -8181,7 +8162,11 @@ class BridgeHandler(BaseHTTPRequestHandler):
             self.json_response(200, self.bridge.health())
             return
         if parsed.path == "/v1/plugin/update":
-            self.json_response(200, plugin_update_status())
+            force = str((parse_qs(parsed.query).get("force") or [""])[0]).lower() in {"1", "true", "yes"}
+            status = PLUGIN_UPDATES.status(force=force)
+            if isinstance(status.get("installation"), dict):
+                status["installation"]["activeRuns"] = self.bridge.active_run_count()
+            self.json_response(200, status)
             return
         if parsed.path in {"/v1/codex/workspaces", "/v1/codex/workspace/validate"}:
             if not self.allowed_origin():
@@ -8606,6 +8591,41 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 self.json_response(403, {"error": "origin not allowed"})
                 return
             self.handle_heartbeat()
+            return
+        if path in {"/v1/plugin/update/install", "/v1/plugin/update/restart"}:
+            if not self.allowed_origin():
+                self.json_response(403, {"error": "origin not allowed"})
+                return
+            try:
+                token = self.headers.get("token", "").strip()
+                if not token or not planner.token_subject(token):
+                    raise BridgeFailure("当前用户凭证无效")
+                if self.headers.get_content_type() != "application/json":
+                    raise BridgeFailure("application/json required")
+                length = int(self.headers.get("Content-Length") or 0)
+                if length < 0 or length > 8 * 1024:
+                    raise BridgeFailure("请求体大小无效")
+                payload = json.loads(self.rfile.read(length)) if length else {}
+                if not isinstance(payload, dict):
+                    raise BridgeFailure("请求体必须是 JSON 对象")
+                if path.endswith("/install"):
+                    job = PLUGIN_UPDATES.start(str(payload.get("expectedVersion") or "").strip())
+                    job["activeRuns"] = self.bridge.active_run_count()
+                    self.json_response(202, job)
+                    return
+                active_runs = self.bridge.active_run_count()
+                if active_runs:
+                    self.json_response(409, {"error": f"当前还有 {active_runs} 个执行会话运行中，请等待完成后再重启"})
+                    return
+                job = PLUGIN_UPDATES.mark_restarting(str(payload.get("jobId") or "").strip())
+                job["activeRuns"] = 0
+                self.json_response(202, job)
+                schedule_bridge_restart()
+                return
+            except (BridgeFailure, UpdateFailure, json.JSONDecodeError, ValueError) as exc:
+                self.json_response(400, {"error": str(exc)})
+            except Exception as exc:
+                self.json_response(500, {"error": f"更新插件失败：{exc}"})
             return
         if path not in {
             "/v1/codex/execute",

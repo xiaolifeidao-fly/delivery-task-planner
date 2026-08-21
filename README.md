@@ -37,6 +37,18 @@ The CLI does not expose queue, claim, session-binding, status-transition, or fin
 
 Installation starts a loopback HTTP bridge at `http://127.0.0.1:8765`; no local certificate is required. The bridge sends `Access-Control-Allow-Origin: *`, so the delivery board may be served from any browser origin. This bridge is private infrastructure for the delivery board's execution buttons and session views; it is not a Codex chat command. Every board request carries the selected numeric project primary key `programId`, the browser-local confirmed `workspace`, `bizLine`, and the current login `token` header. The bridge verifies that token can access the selected project, validates the workspace as an existing absolute directory, creates a temporary project-scoped API context, and starts or resumes Codex in that workspace. It never persists the board token or accepts another project ID for that child process. The project management page can discover Codex Desktop's local projects through `GET /v1/codex/workspaces`; the selected path remains browser-local. Project discovery is the only endpoint that does not require `workspace`; every Codex interaction rejects a missing workspace instead of falling back to the bridge installation or startup directory. The board can call `POST /v1/codex/execute` for one task, `POST /v1/codex/execute-batch` to run selected incomplete tasks by dependency layer (parallel within each layer, then automatically release successors), or `POST /v1/codex/execute-sequence` for selected incomplete tasks in dependency order. Every mode validates task completion, dependencies, local queue conflicts, creates persisted Codex threads, and synchronizes readable output. Runtime state and logs live under `~/.local/state/delivery-task-planner/`.
 
+## Runtime layout and updates
+
+The bridge entry point remains `http_bridge.py`, but reusable runtime concerns live under `delivery_bridge/`:
+
+- `versioning.py` owns SemVer comparison shared by update checks and installation.
+- `update_manager.py` resolves an immutable Git commit, downloads and validates the release archive, backs up the active package, refreshes Codex and Claude Code caches, and persists bounded installation logs.
+- `restart_helper.py` restarts the bridge after the HTTP response is delivered. On macOS it hands control back to the per-user LaunchAgent; other platforms relaunch the same bridge arguments from a detached helper.
+
+The console checks `GET /v1/plugin/update` once a minute. `POST /v1/plugin/update/install` accepts only the expected version; executable files are always downloaded by the loopback bridge from the fixed repository and never uploaded by a browser origin. The archive is size-limited, path-checked, pinned to one Git commit, and must contain matching Codex and Claude plugin manifests plus the bridge entry points and skills.
+
+An installation refreshes the Codex personal-marketplace source and invokes `codex plugin add`. Existing Claude Code installations are copied into a new versioned cache directory and `installed_plugins.json` is replaced atomically, leaving the previous cache available to already running Claude sessions. Skill-only releases become available to new sessions immediately. When Python files change, the job stops in `restart_required`; `POST /v1/plugin/update/restart` refuses to restart while delivery runs are active. After a safe restart, new bridge requests use the new Python release. Backups and update state live under `~/.local/state/delivery-task-planner/`.
+
 ## Install prompt for Codex or Claude
 
 When the task board reports that the local plugin is unavailable, paste the following into Codex or Claude:
