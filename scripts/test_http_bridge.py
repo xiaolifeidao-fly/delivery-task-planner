@@ -173,6 +173,29 @@ class HttpBridgeTest(unittest.TestCase):
         with self.assertRaisesRegex(bridge.BridgeFailure, "需求标识无效"):
             bridge.requirement_outline_path_of("../../etc")
 
+    def test_requirement_document_directory_is_scoped_to_the_requirement(self):
+        self.assertEqual(
+            Path("doc/requirements/req-a"),
+            bridge.requirement_document_directory_of("req-a"),
+        )
+        with self.assertRaisesRegex(bridge.BridgeFailure, "需求标识无效"):
+            bridge.requirement_document_directory_of("../../etc")
+
+    def test_planning_prompt_routes_explicit_standalone_assets_to_the_workspace(self):
+        prompt = bridge.build_planning_prompt(
+            1,
+            {"program": {"name": "Universe"}},
+            "再生成一份独立的流程图",
+            requirement={"requirementKey": "req-a"},
+        )
+
+        self.assertIn("doc/requirements/req-a/", prompt)
+        self.assertIn("独立流程图、图表、HTML 或其他文件", prompt)
+        self.assertIn("doc/requirements/req-a/prototype/", prompt)
+        self.assertIn("doc/test/req-a/", prompt)
+        self.assertIn("不得写入 `.codex/visualizations`", prompt)
+        self.assertIn("除当前需求文档目录外仍不得修改工作区其他文件", prompt)
+
     def test_planning_prompt_always_carries_the_requirement_outline_path(self):
         prompt = bridge.build_planning_prompt(
             1, {"program": {"name": "Universe"}}, "拆一下", requirement={"requirementKey": "req-a"},
@@ -409,6 +432,8 @@ class HttpBridgeTest(unittest.TestCase):
         self.assertEqual("req-a", created["requirementKey"])
         self.assertEqual("thread-1", continued["threadId"])
         client.steer_turn.assert_called_once()
+        self.assertIn("doc/requirements/req-a/", client.steer_turn.call_args.args[2])
+        self.assertIn("不得写入 `.codex/visualizations`", client.steer_turn.call_args.args[2])
         thread.return_value.start.assert_called_once()
 
     def test_planning_keeps_the_conversation_list_when_the_transcript_is_not_on_this_machine(self):
@@ -1826,6 +1851,8 @@ class HttpBridgeTest(unittest.TestCase):
         self.assertIn("base", prompt)
         self.assertIn("已由 HTTP 执行桥领取", prompt)
         self.assertIn("不要调用 claim_next_task", prompt)
+        self.assertIn("`doc/api/a/`，支持多份文档", prompt)
+        self.assertIn("`doc/api/a/design/`，支持多份文档", prompt)
 
     def test_prompt_includes_non_empty_group_execution_constraints(self):
         prompt = bridge.build_task_prompt(
@@ -1908,6 +1935,7 @@ class HttpBridgeTest(unittest.TestCase):
         )
 
         self.assertIn("doc/test/api-smoke-123/", prompt)
+        self.assertIn("该目录支持多份文档", prompt)
 
     def test_requirement_testing_prompt_lists_linked_tasks_and_requirement_scoped_artifacts(self):
         prompt = bridge.build_requirement_testing_prompt(
@@ -2609,6 +2637,45 @@ class HttpBridgeTest(unittest.TestCase):
             self.assertEqual(
                 {"doc/requirements/req-a/需求大纲.md", "doc/requirements/req-a/补充说明.md"},
                 {entry["path"] for entry in result["files"]},
+            )
+
+    def test_requirement_outline_column_lists_standalone_html_assets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            column = workspace / "doc/requirements/req-a"
+            column.mkdir(parents=True)
+            (column / "需求大纲.md").write_text("# 大纲\n", encoding="utf-8")
+            (column / "流程图.html").write_text("<!doctype html><title>流程</title>", encoding="utf-8")
+            executor = bridge.ExecutionBridge(workspace)
+            with patch.object(executor, "_requirement_for_prototype", return_value={"requirementKey": "req-a"}):
+                result = executor.document_set(1, "requirement-outline", "req-a", config=self.runtime_config())
+
+            self.assertIn("doc/requirements/req-a/流程图.html", {entry["path"] for entry in result["files"]})
+
+    def test_document_sets_support_multiple_design_and_requirement_testing_documents(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            design = workspace / "doc/api/a/design"
+            design.mkdir(parents=True)
+            (design / "接口.md").write_text("# 接口\n", encoding="utf-8")
+            (design / "流程.html").write_text("<h1>流程</h1>", encoding="utf-8")
+            requirement_testing = workspace / "doc/test/req-a"
+            requirement_testing.mkdir(parents=True)
+            (requirement_testing / "测试用例.md").write_text("# 用例\n", encoding="utf-8")
+            (requirement_testing / "补充场景.md").write_text("# 场景\n", encoding="utf-8")
+            executor = bridge.ExecutionBridge(workspace)
+            with patch.object(executor, "_task_detail", return_value={"requirementDocumentPath": "doc/api/a/文档.md"}):
+                design_result = executor.document_set(1, "task-design", "a", config=self.runtime_config())
+            with patch.object(executor, "_requirement_for_prototype", return_value={"requirementKey": "req-a"}):
+                testing_result = executor.document_set(1, "requirement-testing", "req-a", config=self.runtime_config())
+
+            self.assertEqual(
+                {"doc/api/a/design/接口.md", "doc/api/a/design/流程.html"},
+                {entry["path"] for entry in design_result["files"]},
+            )
+            self.assertEqual(
+                {"doc/test/req-a/测试用例.md", "doc/test/req-a/补充场景.md"},
+                {entry["path"] for entry in testing_result["files"]},
             )
 
     def test_document_file_refuses_a_path_outside_its_column(self):

@@ -205,8 +205,8 @@ MAX_REQUIREMENT_OUTLINE_BYTES = 2 * 1024 * 1024
 MAX_EDITABLE_OUTLINE_BYTES = 512 * 1024
 MAX_WORKSPACE_ARTIFACT_BYTES = 50 * 1024 * 1024
 # 需求大纲、任务文档、设计文档、测试用例这几个栏目都从「一个固定文件」升级成「一个目录里的多份文档」：
-# 目录里所有文本文档都能在面板上选择预览，原来的固定文件名继续作为默认主文档，存量数据不受影响。
-DOCUMENT_SET_SUFFIXES = {".md", ".markdown", ".txt"}
+# 目录里所有可读的 Markdown、纯文本和 HTML 文档都能在面板上选择预览，原来的固定文件名继续作为默认主文档，存量数据不受影响。
+DOCUMENT_SET_SUFFIXES = {".md", ".markdown", ".txt", ".html", ".htm"}
 MAX_DOCUMENT_SET_FILES = 200
 MAX_DOCUMENT_SET_FILE_BYTES = 2 * 1024 * 1024
 # 测试技能把一条需求或一条任务的全部测试资产写在 doc/test/<键>/ 下。
@@ -936,6 +936,8 @@ def build_task_prompt(payload: dict[str, Any], workspace: Path | None = None) ->
     phase = str(task.get("phase") or "requirement")
     phase_name = {"requirement": "梳理需求", "development": "动作执行", "testing": "成品测试"}.get(phase, phase)
     document_path = document_path_of(task)
+    document_directory = Path(document_path).parent.as_posix()
+    design_directory = (Path(document_path).parent / "design").as_posix()
     prototype_directory = prototype_directory_of(task)
     test_artifact_directory = Path("doc") / "test" / str(task.get("itemKey") or "task")
     # 每个阶段各有一个技能，明确点名让执行器去加载，别让它自己猜「当前项目的 skill」是哪个。
@@ -952,7 +954,7 @@ def build_task_prompt(payload: dict[str, Any], workspace: Path | None = None) ->
             f"本次只进行成品测试：遵循 {PHASE_SKILLS['testing']} 技能，先读取 `{document_path}`，"
             f"再读取已有 `{test_artifact_directory / '测试用例.md'}`（不存在时说明缺口并补充最小用例），"
             "先准备环境、账号、鉴权和测试数据，再按代码与业务依赖编排实测；"
-            f"验证命令沿用当前项目开发技能里的约定；所有测试资产必须写入 `{test_artifact_directory}/`，"
+            f"验证命令沿用当前项目开发技能里的约定；所有测试资产必须写入 `{test_artifact_directory}/`，该目录支持多份文档；"
             "并生成带明确验收判定的测试报告。"
         ),
     }.get(phase, "按任务当前阶段执行。")
@@ -974,6 +976,8 @@ def build_task_prompt(payload: dict[str, Any], workspace: Path | None = None) ->
         f"标题: {task['title']}",
         f"说明: {task.get('description') or '无'}",
         f"需求文档路径: {document_path}（本任务唯一的需求文档；默认加载：开始前先完整读一遍）",
+        f"任务需求文档目录: `{document_directory}/`，支持多份文档；`文档.md` 是主文档，独立任务说明使用独立文件名写在此目录。",
+        f"任务设计文档目录: `{design_directory}/`，支持多份文档；需要交付独立设计说明时写入此目录，不要写入 `.codex/visualizations` 或其他工作区外路径。",
         document_revision_rule(document_path),
         phase_instruction,
         *prototype_instruction,
@@ -1027,7 +1031,7 @@ def build_task_testing_cases_prompt(
             f"当前阶段（仅供了解，不可改变）: {task.get('phase') or 'requirement'}/{task.get('status') or 'todo'}",
             f"任务需求文档: {document_path_of(task)}",
             f"已知动作执行产物: {'有' if task.get('actionOutput') else '无'}",
-            f"测试用例资产目录: doc/test/{item_key}/；必须写入测试用例.md，按需写入测试计划.md。",
+            f"测试用例资产目录: doc/test/{item_key}/；该目录支持多份文档，必须写入测试用例.md，按需写入测试计划.md 或其他补充文档。",
             "研发未完成的部分必须列为执行前置或待补输入，不得猜造结果。",
             *sibling_document_lines(requirement_document_catalog(context.get('items') or [], task, workspace)),
             "最终回复第一行必须是“测试用例已生成”，后面给出测试准备、用例表、执行顺序和待确认项。",
@@ -1049,6 +1053,8 @@ def build_conversation_prompt(
     dependencies = task.get("dependsOnItemKeys") or []
     phase = str(task.get("phase") or "requirement")
     document_path = document_path_of(task)
+    document_directory = Path(document_path).parent.as_posix()
+    design_directory = (Path(document_path).parent / "design").as_posix()
     return wrap_bridge_context(
         [
             "这是交付任务详情中发起的一条新 Codex 对话。请结合当前项目和任务上下文回应并执行用户的要求。",
@@ -1061,6 +1067,8 @@ def build_conversation_prompt(
             f"当前执行阶段: {phase}",
             f"当前阶段对应技能: {PHASE_SKILLS.get(phase, '按任务当前阶段处理')}",
             f"需求文档路径: {document_path}（本任务唯一的需求文档，默认加载）。开始前请先读取此文件；梳理需求阶段应在此基础上更新。",
+            f"任务需求文档目录: `{document_directory}/`，支持多份文档；`文档.md` 是主文档，独立任务说明使用独立文件名写在此目录。",
+            f"任务设计文档目录: `{design_directory}/`，支持多份文档；需要交付独立设计说明时写入此目录，不要写入 `.codex/visualizations` 或其他工作区外路径。",
             document_revision_rule(document_path),
             f"阶段: {task.get('stageKey') or '未指定'}",
             f"模块: {task.get('moduleKey') or '未指定'}",
@@ -1087,6 +1095,23 @@ def requirement_outline_rule_lines(outline_path: str) -> list[str]:
         "禁止只把本轮追加的那段需求写进文件，那等于把之前几轮的需求大纲整段丢掉。",
         "大纲用 Markdown 组织，至少包含：需求背景与目标、范围与不做的事、关键约束、勘察到的落点（真实模块/目录/接口）、任务拆解表（与预览一致）、验收标准、待确认问题。",
         "确认写入任务后，也要把大纲里任务表的最终状态同步成实际落库的那一版。",
+    ]
+
+
+def requirement_document_rule_lines(requirement_key: str) -> list[str]:
+    """Keep standalone requirement files in the requirement document directory."""
+    if not requirement_key:
+        return []
+    document_directory = requirement_document_directory_of(requirement_key).as_posix()
+    prototype_directory = requirement_prototype_directory_of(requirement_key).as_posix()
+    testing_directory = testing_asset_directory_of(requirement_key).as_posix()
+    return [
+        f"需求文档目录: `{document_directory}/`。这是一个支持多份文档的目录，`需求大纲.md` 是主文档；用户明确要求独立流程图、图表、HTML 或其他文件时，"
+        "不要把完整内容嵌进需求大纲，也不要只在对话里展示，必须使用独立文件名直接写入这个目录。",
+        f"需求原型目录: `{prototype_directory}/`，支持多个独立 `.html` / `.htm` 页面；需求测试资产目录: `{testing_directory}/`，支持 `测试用例.md`、`测试计划.md`、`测试报告.md` 及其他补充文档。",
+        "独立需求资产是项目交付文件，不是临时可视化：不得写入 `.codex/visualizations`、系统临时目录或其他工作区外路径。"
+        "不要把 visualize 工具的默认输出路径当成交付路径；如果工具先生成了临时预览，必须把最终文件复制到上述需求目录后再回复。生成后在最终回复中只列工作区相对路径，确保面板能登记和预览它。",
+        "未明确要求独立文件时不要创建额外文件；除当前需求文档目录外仍不得修改工作区其他文件。",
     ]
 
 
@@ -1154,7 +1179,7 @@ def build_planning_prompt(
         else [
             f"这是交付任务面板的需求梳理会话，请遵循 {PLANNING_SKILL} 技能。本轮只做梳理和预览，禁止写入任何任务面板数据。",
             "禁止调用 create_task_board_tasks、create_task_board_stage、create_task_board_module，也不要借 shell、HTTP 请求或手工改文件绕过任务面板写入限制；未确认前这些写入调用会被工具直接拒绝。",
-            "本轮的限制只针对任务面板数据：不要写任务面板数据，除下面给出的需求大纲文件外也不要修改工作区里的其他文件。已授予项目工作目录及需求指定关联目录的只读勘察权限；可使用终端的只读命令和当前会话可用的读取工具列目录、搜索并读取代码、配置、技能和文档。某个可选读取工具不可用时，改用其他可用的只读工具继续勘察，不要因此停止。",
+            "本轮的限制只针对任务面板数据：默认除下面给出的需求大纲文件外不修改工作区其他文件；如果用户明确要求生成或更新独立的流程图、图表、HTML 或其他需求资产，允许写入当前需求文档目录，但只能写该目录。已授予项目工作目录及需求指定关联目录的只读勘察权限；可使用终端的只读命令和当前会话可用的读取工具列目录、搜索并读取代码、配置、技能和文档。某个可选读取工具不可用时，改用其他可用的只读工具继续勘察，不要因此停止。",
             "拆解前必须先勘察下方给出的项目工作目录：加载该目录下项目自己的开发技能（如 backend-development、web-development），读相关目录和现有实现，据此判断需求真正的落点。get_task_board_context 只给出面板侧上下文，不包含工程现状，不能拿它替代看代码。",
             "任务要落到勘察出的真实模块、目录或接口上，不要只按业务名词泛化出通用分层；工作区里找不到需求所指的模块时，先向用户说明并确认工作目录或范围，不要硬拆。",
             "请与用户对话把需求问清楚，然后输出一份可评审的拆解预览：先用 Markdown 表格列出「序号 / 任务标题 / 收益标签 / 负责人 / 里程碑 / 模块 / 类型 / 前置依赖」，每项给 1-3 个简短收益或作用标签；负责人统一展示为该需求的第一位主负责人（未指定则标为未指派）；再在表格下方逐条补充目标、范围和验收标准。",
@@ -1231,6 +1256,7 @@ def build_planning_prompt(
     # 需求大纲是这条需求跨会话的唯一沉淀：每一轮都带上路径，新开的会话靠读它把上下文接回来。
     outline_path = requirement_outline_path_of(requirement_key).as_posix() if requirement_key else ""
     outline_lines = requirement_outline_rule_lines(outline_path)
+    document_lines = requirement_document_rule_lines(requirement_key)
     # 被 @ 的历史需求：只给大纲产物地址，读不读、读哪一段由执行器按需决定。
     references = requirement.get("references") or []
     reference_lines = (
@@ -1277,6 +1303,7 @@ def build_planning_prompt(
         *split_lines,
         *prototype_lines,
         *outline_lines,
+        *document_lines,
         *reference_lines,
         *item_reference_lines,
         *(mention_context or []),
@@ -1358,6 +1385,8 @@ def build_requirement_testing_prompt(
             f"需求名称: {requirement.get('name') or '未命名'}",
             "需求详情:", str(requirement.get("detail") or "（未填写）"),
             f"需求总体测试资产目录: doc/test/{requirement_key}/（测试计划、报告、脚本、夹具和证据必须归档到此处）",
+            f"需求文档目录: doc/requirements/{requirement_key}/（支持多份需求文档）；需求原型目录: doc/requirements/{requirement_key}/prototype/（支持多个 HTML）；需求测试目录: doc/test/{requirement_key}/（支持多份测试文档）。",
+            "需求大纲、原型和测试是三个独立栏目：不要把测试计划或报告写进需求大纲/原型目录，也不要把独立流程图写进测试资产目录。",
             "关联任务清单（先按需读对应文档、产物和代码；清单不是完整上下文）：",
             *(item_lines or ["- 该需求目前没有关联任务；先说明总体测试范围和受阻项，不要假装已覆盖任务链路。"]),
             final_instruction,
@@ -2609,6 +2638,14 @@ def requirement_outline_path_of(requirement_key: str) -> Path:
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value):
         raise BridgeFailure("需求标识无效")
     return Path("doc") / "requirements" / value / REQUIREMENT_OUTLINE_FILE_NAME
+
+
+def requirement_document_directory_of(requirement_key: str) -> Path:
+    """Return the requirement document directory for standalone deliverables."""
+    value = str(requirement_key or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value):
+        raise BridgeFailure("需求标识无效")
+    return Path("doc") / "requirements" / value
 
 
 def legacy_task_outline_path_of(requirement_key: str, item_key: str) -> Path:
@@ -4350,6 +4387,7 @@ class ExecutionBridge:
                             *requirement_outline_rule_lines(
                                 requirement_outline_path_of(requirement_key).as_posix() if requirement_key else ""
                             ),
+                            *requirement_document_rule_lines(requirement_key),
                             *mention_context,
                         ],
                     ),
