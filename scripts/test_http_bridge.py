@@ -24,6 +24,14 @@ SPEC.loader.exec_module(bridge)
 
 
 class HttpBridgeTest(unittest.TestCase):
+    def setUp(self) -> None:
+        # 桥接请求会顺手刷新凭证文件；测试绝不能写到本机真实凭证上。
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        patcher = patch.object(bridge.planner, "CREDENTIAL_PATH", Path(directory.name) / "credential.json")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     @staticmethod
     def runtime_config() -> dict[str, str]:
         return {

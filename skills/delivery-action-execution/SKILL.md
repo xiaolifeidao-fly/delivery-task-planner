@@ -18,7 +18,7 @@ description: 交付任务面板「动作执行」阶段（phase=development）�
 
 - 这一轮由任务面板的执行桥发起，任务已经被领取并绑定到当前会话。
 - 不要调用 `claim_next_task`、`bind_task_execution_session`、`finish_execution_task` 或任何任务状态流转工具；桥接器按本回合的最终状态自动同步面板，并把最终回复保存为该任务的「动作执行产物」。
-- 不要调用 `create_task_board_*` 创建任务；发现缺口写进最终回复的「后续建议」。
+- 不要执行 `create-task-board-*` 动作创建任务；发现缺口写进最终回复的「后续建议」。
 - 阶段推进（动作执行 → 成品测试）由用户在面板上操作，本轮不要顺手把测试报告写了。
 
 ## 1. 先读需求文档

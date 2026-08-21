@@ -5,13 +5,5 @@
   "author": {
     "name": "Universe Team"
   },
-  "skills": "./skills/",
-  "mcpServers": {
-    "delivery-task-planner": {
-      "command": "python3",
-      "args": [
-        "${CLAUDE_PLUGIN_ROOT}/server.py"
-      ]
-    }
-  }
+  "skills": "./skills/"
 }

@@ -8,7 +8,6 @@ import hashlib
 import json
 import os
 import re
-import sys
 import tempfile
 import time
 import urllib.error
@@ -16,7 +15,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
-from typing import Any, BinaryIO
+from typing import Any
 
 
 CONFIG_PATH = Path(
@@ -44,9 +43,8 @@ RUNTIME_TOKEN_HEADER_ENV = "DELIVERY_TASK_BOARD_TOKEN_HEADER"
 RUNTIME_USER_ID_ENV = "DELIVERY_TASK_BOARD_USER_ID"
 RUNTIME_API_URL_ENV = "DELIVERY_TASK_BOARD_API_URL"
 RUNTIME_WRITE_MODE_ENV = "DELIVERY_TASK_BOARD_WRITE_MODE"
-# The bridge must not infer its panel target from a browser-provided Origin.
-# A user can replace this default with set_task_board_api_url in the MCP plugin.
-DEFAULT_BRIDGE_API_URL = "http://47.110.3.214:8691/api"
+# 服务端地址是固定的：插件不从浏览器 Origin、也不从配置文件推断面板地址。
+TASK_BOARD_API_URL = "http://47.110.3.214:8691/api"
 
 
 class ToolFailure(Exception):
@@ -96,10 +94,9 @@ def program_value_of(arguments: dict[str, Any]) -> tuple[int, bool]:
 
 def load_config() -> dict[str, Any]:
     runtime_token = os.environ.get(RUNTIME_TOKEN_ENV, "").strip()
-    runtime_api_url = os.environ.get(RUNTIME_API_URL_ENV, "").strip()
-    if runtime_token and runtime_api_url:
+    if runtime_token:
         config = {
-            "api_url": normalize_api_url(runtime_api_url),
+            "api_url": TASK_BOARD_API_URL,
             "key": runtime_token,
             "key_header": os.environ.get(RUNTIME_TOKEN_HEADER_ENV, "token").strip() or "token",
             "user_id": os.environ.get(RUNTIME_USER_ID_ENV, "task-executor").strip() or "task-executor",
@@ -108,9 +105,6 @@ def load_config() -> dict[str, Any]:
         }
         return config
     settings = stored_settings()
-    api_url = str(settings.get("api_url") or "").strip()
-    if not api_url:
-        raise ToolFailure("尚未配置任务面板接口地址。请先初始化接口地址。")
     credential = load_credential()
     # 老版本把 token 写在配置文件里，升级后第一次心跳到达前仍然可用。
     key = credential.get("key") or str(settings.get("key") or "").strip()
@@ -121,7 +115,7 @@ def load_config() -> dict[str, Any]:
         )
     user_id = credential.get("user_id") or str(settings.get("user_id") or "").strip()
     return {
-        "api_url": api_url,
+        "api_url": TASK_BOARD_API_URL,
         "key": key,
         "key_header": str(settings.get("key_header") or "token").strip() or "token",
         "user_id": user_id or token_subject(key) or "task-executor",
@@ -187,21 +181,8 @@ def save_credential(token: str, user_id: str = "") -> bool:
 
 
 def bridge_api_url() -> str:
-    """Return the persisted bridge target, falling back to the fixed default.
-
-    The browser bridge intentionally reads only its dedicated override. Existing
-    planning-plugin configurations without that field must not silently keep an
-    old local development endpoint alive.
-    """
-    config_path = CONFIG_PATH if CONFIG_PATH.exists() else LEGACY_CONFIG_PATH
-    if not config_path.exists():
-        return DEFAULT_BRIDGE_API_URL
-    try:
-        config = json.loads(config_path.read_text(encoding="utf-8"))
-        override = str(config.get("bridge_api_url") or "").strip()
-        return normalize_api_url(override) if override else DEFAULT_BRIDGE_API_URL
-    except (OSError, json.JSONDecodeError, ToolFailure):
-        return DEFAULT_BRIDGE_API_URL
+    """固定的服务端地址：普通 MCP 会话和本地桥接共用，不可配置。"""
+    return TASK_BOARD_API_URL
 
 
 def normalize_api_url(value: str) -> str:
@@ -506,60 +487,29 @@ def topological_order(tasks: list[dict[str, Any]]) -> list[str]:
     return [ref for layer in dependency_layers(tasks) for ref in layer]
 
 
-def initialize(arguments: dict[str, Any]) -> dict[str, Any]:
-    # key 现在由控制台心跳送达，初始化只负责接口地址；显式传了就当作一次手工心跳。
-    key = str(arguments.get("key", "")).strip() or load_credential().get("key", "")
-    key_header = str(arguments.get("key_header") or "token").strip()
-    if not re.fullmatch(r"[A-Za-z0-9-]+", key_header):
-        raise ToolFailure("header 名只能包含字母、数字和连字符。")
+def store_credential(arguments: dict[str, Any]) -> dict[str, Any]:
+    """手工写入一次凭证的兜底入口。
+
+    正常情况下凭证由控制台心跳送达；只有控制台没跑或桥接没装时才需要它。
+    服务端地址是写死的，这里不接受也不保存任何地址。
+    """
+    key = str(arguments.get("key", "")).strip()
+    if not key:
+        raise ToolFailure("凭证不能为空。")
+    user_id = str(arguments.get("user_id") or "").strip() or token_subject(key) or "task-executor"
     config = {
-        "api_url": normalize_api_url(str(arguments.get("api_url", ""))),
-        "bridge_api_url": normalize_api_url(str(arguments.get("api_url", ""))),
+        "api_url": TASK_BOARD_API_URL,
         "key": key,
-        "key_header": key_header,
-        "user_id": str(arguments.get("user_id") or "").strip() or token_subject(key) or "task-executor",
+        "key_header": "token",
+        "user_id": user_id,
     }
-    verify = bool(arguments.get("verify_connection", True)) and bool(key)
+    verify = bool(arguments.get("verify_connection", True))
     programs = request_api(config, "GET", "/delivery/programs") or [] if verify else []
-    save_config(config)
-    if str(arguments.get("key", "")).strip():
-        save_credential(key, config["user_id"])
+    save_credential(key, user_id)
     return {
-        "configured": True,
-        "apiUrl": config["api_url"],
-        "keyHeader": config["key_header"],
-        "userId": config["user_id"],
-        "credentialReceived": bool(key),
-        "verified": verify,
-        "projectCount": len(programs),
-    }
-
-
-def update_api_url(arguments: dict[str, Any]) -> dict[str, Any]:
-    """Update the normal MCP and HTTP bridge panel targets together."""
-    if os.environ.get(RUNTIME_TOKEN_ENV, "").strip() and os.environ.get(RUNTIME_API_URL_ENV, "").strip():
-        raise ToolFailure("任务面板桥接运行态不能修改共享接口地址，请在普通 @delivery-task-planner 会话中执行此操作。")
-    api_url = normalize_api_url(str(arguments.get("api_url", "")))
-    settings = stored_settings()
-    updated = {**settings, "api_url": api_url, "bridge_api_url": api_url}
-    credential = load_credential()
-    # 地址可以在收到心跳凭证之前就先配好，那时没法真连一次。
-    verify = bool(arguments.get("verify_connection", True)) and bool(credential.get("key"))
-    if verify:
-        probe = {
-            "api_url": api_url,
-            "key": credential["key"],
-            "key_header": str(settings.get("key_header") or "token").strip() or "token",
-            "user_id": credential.get("user_id") or "task-executor",
-        }
-        programs = request_api(probe, "GET", "/delivery/programs") or []
-    else:
-        programs = []
-    save_config(updated)
-    return {
-        "configured": True,
-        "apiUrl": api_url,
-        "bridgeApiUrl": api_url,
+        "stored": True,
+        "apiUrl": TASK_BOARD_API_URL,
+        "userId": user_id,
         "verified": verify,
         "projectCount": len(programs),
     }
@@ -1604,53 +1554,33 @@ def finish_execution_task(arguments: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-TOOLS = [
+ACTIONS = [
     {
-        "name": "initialize_task_board",
-        "title": "初始化任务面板连接",
-        "description": "保存任务面板接口地址；token 与 user_id 由控制台心跳接口送达，无需在此提供。默认验证连接后再保存。",
+        "name": "store_task_board_credential",
+        "title": "手工写入任务面板凭证",
+        "description": "兜底入口：控制台心跳没跑时手工存一次 token；服务端地址写死在插件里，不接受地址参数。",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "api_url": {"type": "string", "description": "服务根地址或以 /api 结尾的 API 地址"},
-                "key": {"type": "string", "description": "可选；仅在没有控制台心跳时手工写入一次凭证"},
-                "key_header": {"type": "string", "default": "token"},
-                "user_id": {"type": "string", "default": "task-executor"},
+                "key": {"type": "string", "description": "控制台登录 token"},
+                "user_id": {"type": "string", "description": "可选；缺省时从 token 里读"},
                 "verify_connection": {"type": "boolean", "default": True},
             },
-            "required": ["api_url"],
+            "required": ["key"],
             "additionalProperties": False,
         },
-        "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True},
     },
     {
         "name": "get_task_board_configuration",
         "title": "检查任务面板配置",
         "description": "检查插件是否已初始化，只返回脱敏后的凭证信息。",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
-        "annotations": {"readOnlyHint": True},
-    },
-    {
-        "name": "set_task_board_api_url",
-        "title": "更新任务面板接口地址",
-        "description": "更新普通 MCP 规划和本地 HTTPS 桥接器共用的任务面板接口地址；默认验证连接后保存。",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "api_url": {"type": "string", "description": "服务根地址或以 /api 结尾的 API 地址"},
-                "verify_connection": {"type": "boolean", "default": True},
-            },
-            "required": ["api_url"],
-            "additionalProperties": False,
-        },
-        "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True},
     },
     {
         "name": "list_task_board_projects",
         "title": "列出任务面板项目",
         "description": "读取用户可以选择的交付项目。执行任务拆解前必须先选项目。",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
-        "annotations": {"readOnlyHint": True},
     },
     {
         "name": "create_task_board_project",
@@ -1668,7 +1598,6 @@ TOOLS = [
             "required": ["program_code", "name"],
             "additionalProperties": False,
         },
-        "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False},
     },
     {
         "name": "create_task_board_stage",
@@ -1688,7 +1617,6 @@ TOOLS = [
             "required": ["stage_key", "tag", "title"],
             "additionalProperties": False,
         },
-        "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False},
     },
     {
         "name": "create_task_board_module",
@@ -1707,7 +1635,6 @@ TOOLS = [
             "required": ["module_key", "name"],
             "additionalProperties": False,
         },
-        "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False},
     },
     {
         "name": "get_task_board_context",
@@ -1722,7 +1649,6 @@ TOOLS = [
             },
             "additionalProperties": False,
         },
-        "annotations": {"readOnlyHint": True},
     },
     {
         "name": "create_task_board_tasks",
@@ -1771,7 +1697,6 @@ TOOLS = [
             "required": ["tasks"],
             "additionalProperties": False,
         },
-        "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False},
     },
     {
         "name": "update_task_board_task",
@@ -1798,7 +1723,6 @@ TOOLS = [
             "required": ["item_key"],
             "additionalProperties": False,
         },
-        "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False},
     },
     {
         "name": "update_task_board_task_dependencies",
@@ -1818,7 +1742,6 @@ TOOLS = [
             "required": ["item_key", "depends_on_item_keys"],
             "additionalProperties": False,
         },
-        "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False},
     },
     {
         "name": "delete_task_board_task_dependencies",
@@ -1836,18 +1759,15 @@ TOOLS = [
             "required": ["item_key", "predecessor_item_keys"],
             "additionalProperties": False,
         },
-        "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False},
     },
 ]
 
 
-def call_tool(name: str, arguments: dict[str, Any]) -> Any:
-    if name == "initialize_task_board":
-        return initialize(arguments)
+def run_action(name: str, arguments: dict[str, Any]) -> Any:
+    if name == "store_task_board_credential":
+        return store_credential(arguments)
     if name == "get_task_board_configuration":
         return configuration()
-    if name == "set_task_board_api_url":
-        return update_api_url(arguments)
     if name == "list_task_board_projects":
         return list_projects()
     if name == "create_task_board_project":
@@ -1866,173 +1786,4 @@ def call_tool(name: str, arguments: dict[str, Any]) -> Any:
         return update_task_dependencies(arguments)
     if name == "delete_task_board_task_dependencies":
         return delete_task_dependencies(arguments)
-    raise ToolFailure(f"未知工具：{name}")
-
-
-def result(request_id: Any, value: Any) -> dict[str, Any]:
-    return {"jsonrpc": "2.0", "id": request_id, "result": value}
-
-
-def tool_result(request_id: Any, value: Any, is_error: bool = False) -> dict[str, Any]:
-    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, indent=2)
-    payload: dict[str, Any] = {"content": [{"type": "text", "text": text}]}
-    if not is_error and not isinstance(value, str):
-        payload["structuredContent"] = value
-    if is_error:
-        payload["isError"] = True
-    return result(request_id, payload)
-
-
-def handle(message: dict[str, Any]) -> dict[str, Any] | None:
-    request_id = message.get("id")
-    method = message.get("method")
-    if method == "initialize":
-        return result(
-            request_id,
-            {
-                "protocolVersion": "2025-03-26",
-                "capabilities": {"tools": {}},
-                "serverInfo": {"name": "delivery-task-planner", "version": "0.1.0"},
-            },
-        )
-    if method == "notifications/initialized":
-        return None
-    if method == "ping":
-        return result(request_id, {})
-    if method == "tools/list":
-        return result(request_id, {"tools": TOOLS})
-    if method == "tools/call":
-        params = message.get("params") or {}
-        try:
-            value = call_tool(str(params.get("name", "")), params.get("arguments") or {})
-            return tool_result(request_id, value)
-        except ToolFailure as exc:
-            return tool_result(request_id, str(exc), is_error=True)
-        except Exception as exc:  # Keep the stdio server alive on unexpected tool failures.
-            return tool_result(request_id, f"插件内部错误：{exc}", is_error=True)
-    if request_id is not None:
-        return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": "Method not found"}}
-    return None
-
-
-class MCPProtocolError(Exception):
-    """A malformed stdio message together with the response format to use."""
-
-    def __init__(self, message: str, framed: bool = False):
-        super().__init__(message)
-        self.framed = framed
-
-
-def _read_exact(stream: BinaryIO, size: int) -> bytes:
-    chunks: list[bytes] = []
-    remaining = size
-    while remaining:
-        chunk = stream.read(remaining)
-        if not chunk:
-            raise MCPProtocolError("Content-Length 帧不完整", framed=True)
-        chunks.append(chunk)
-        remaining -= len(chunk)
-    return b"".join(chunks)
-
-
-def read_mcp_message(stream: BinaryIO) -> tuple[dict[str, Any], bool] | None:
-    """Read one JSON-RPC message in either legacy line or Content-Length form.
-
-    Older plugin hosts send one JSON object per line. Other MCP stdio clients
-    use HTTP-like headers followed by an exact UTF-8 byte payload. The response
-    mirrors the request framing, so the boolean records the received form.
-    """
-    while True:
-        first_line = stream.readline()
-        if not first_line:
-            return None
-        stripped = first_line.strip()
-        if stripped:
-            break
-
-    framed = b":" in stripped and not stripped.startswith((b"{", b"["))
-    if not framed:
-        try:
-            message = json.loads(first_line.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise MCPProtocolError(f"无效的 JSON-RPC 消息：{exc}") from exc
-    else:
-        headers: dict[str, str] = {}
-        line = first_line
-        while True:
-            if not line:
-                raise MCPProtocolError("Content-Length 帧缺少报文头结束标记", framed=True)
-            header = line.strip()
-            if not header:
-                break
-            name, separator, value = header.partition(b":")
-            if not separator:
-                raise MCPProtocolError("Content-Length 帧报文头无效", framed=True)
-            try:
-                headers[name.decode("ascii").strip().lower()] = value.decode("ascii").strip()
-            except UnicodeDecodeError as exc:
-                raise MCPProtocolError("Content-Length 帧报文头必须是 ASCII", framed=True) from exc
-            line = stream.readline()
-        raw_length = headers.get("content-length")
-        if raw_length is None:
-            raise MCPProtocolError("Content-Length 帧缺少 Content-Length", framed=True)
-        try:
-            content_length = int(raw_length)
-        except ValueError as exc:
-            raise MCPProtocolError("Content-Length 必须是非负整数", framed=True) from exc
-        if content_length < 0:
-            raise MCPProtocolError("Content-Length 必须是非负整数", framed=True)
-        try:
-            message = json.loads(_read_exact(stream, content_length).decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise MCPProtocolError(f"无效的 Content-Length JSON-RPC 消息：{exc}", framed=True) from exc
-
-    if not isinstance(message, dict):
-        raise MCPProtocolError("JSON-RPC 消息必须是对象", framed=framed)
-    return message, framed
-
-
-def write_mcp_message(stream: BinaryIO, message: dict[str, Any], framed: bool) -> None:
-    """Write a JSON-RPC response using the same framing as the request."""
-    payload = json.dumps(message, ensure_ascii=False).encode("utf-8")
-    if framed:
-        stream.write(
-            b"Content-Length: " + str(len(payload)).encode("ascii")
-            + b"\r\nContent-Type: application/json; charset=utf-8\r\n\r\n" + payload
-        )
-    else:
-        stream.write(payload + b"\n")
-    stream.flush()
-
-
-def serve_stdio(input_stream: BinaryIO, output_stream: BinaryIO) -> None:
-    while True:
-        framed = False
-        try:
-            packet = read_mcp_message(input_stream)
-            if packet is None:
-                return
-            message, framed = packet
-            response = handle(message)
-            if response is not None:
-                write_mcp_message(output_stream, response, framed)
-        except MCPProtocolError as exc:
-            write_mcp_message(
-                output_stream,
-                {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": str(exc)}},
-                exc.framed,
-            )
-        except Exception as exc:
-            write_mcp_message(
-                output_stream,
-                {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": str(exc)}},
-                framed,
-            )
-
-
-def main() -> None:
-    serve_stdio(sys.stdin.buffer, sys.stdout.buffer)
-
-
-if __name__ == "__main__":
-    main()
+    raise ToolFailure(f"未知动作：{name}")

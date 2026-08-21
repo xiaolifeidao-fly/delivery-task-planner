@@ -17,9 +17,8 @@
       "Write"
     ],
     "defaultPrompt": [
-      "\u62c6\u89e3\u9700\u6c42\u5e76\u5199\u5165\u4efb\u52a1\u9762\u677f",
-      "\u521b\u5efa\u9879\u76ee\u3001\u9636\u6bb5\u6216\u6a21\u5757"
+      "拆解需求并写入任务面板",
+      "创建项目、阶段或模块"
     ]
-  },
-  "mcpServers": "./.mcp.json"
+  }
 }

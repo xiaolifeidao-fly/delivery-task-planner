@@ -18,44 +18,6 @@ SPEC.loader.exec_module(server)
 
 
 class DeliveryTaskPlannerTest(unittest.TestCase):
-    def test_mcp_content_length_frame_reads_utf8_and_writes_a_framed_response(self):
-        request = {"jsonrpc": "2.0", "id": 7, "method": "ping", "params": {"message": "中文"}}
-        payload = json.dumps(request, ensure_ascii=False).encode("utf-8")
-        source = io.BytesIO(b"Content-Length: " + str(len(payload)).encode("ascii") + b"\r\n\r\n" + payload)
-
-        message, framed = server.read_mcp_message(source) or ({}, False)
-        self.assertTrue(framed)
-        self.assertEqual(request, message)
-
-        target = io.BytesIO()
-        server.write_mcp_message(target, {"jsonrpc": "2.0", "id": 7, "result": {"text": "中文"}}, framed)
-        header, response_payload = target.getvalue().split(b"\r\n\r\n", 1)
-        self.assertIn(f"Content-Length: {len(response_payload)}".encode("ascii"), header)
-        self.assertEqual("中文", json.loads(response_payload.decode("utf-8"))["result"]["text"])
-
-    def test_mcp_legacy_json_line_stays_line_delimited(self):
-        source = io.BytesIO(b'{"jsonrpc":"2.0","id":1,"method":"ping"}\n')
-
-        message, framed = server.read_mcp_message(source) or ({}, True)
-        self.assertFalse(framed)
-        self.assertEqual("ping", message["method"])
-
-        target = io.BytesIO()
-        server.write_mcp_message(target, {"jsonrpc": "2.0", "id": 1, "result": {}}, framed)
-        self.assertEqual({"jsonrpc": "2.0", "id": 1, "result": {}}, json.loads(target.getvalue().decode("utf-8")))
-
-    def test_mcp_framed_request_keeps_framing_for_unexpected_errors(self):
-        payload = b'{"jsonrpc":"2.0","id":1,"method":"ping"}'
-        source = io.BytesIO(b"Content-Length: " + str(len(payload)).encode("ascii") + b"\r\n\r\n" + payload)
-        target = io.BytesIO()
-
-        with patch.object(server, "handle", side_effect=RuntimeError("broken")):
-            server.serve_stdio(source, target)
-
-        header, response_payload = target.getvalue().split(b"\r\n\r\n", 1)
-        self.assertTrue(header.startswith(b"Content-Length: "))
-        self.assertEqual("broken", json.loads(response_payload.decode("utf-8"))["error"]["message"])
-
     def test_api_request_does_not_forward_business_line_header(self):
         response = MagicMock()
         response.read.return_value = b'{"success": true, "data": []}'
@@ -73,55 +35,25 @@ class DeliveryTaskPlannerTest(unittest.TestCase):
         self.assertEqual("http://example.test/api/delivery/programs?programId=1", request.full_url)
         self.assertIsNone(request.get_header("X-biz-line"))
 
-    def test_initialize_does_not_store_business_line_configuration(self):
+    def test_storing_a_credential_never_touches_the_config_file(self):
         with (
-            patch.object(server, "request_api", return_value=[]),
+            patch.object(server, "request_api", return_value=[]) as request_api,
             patch.object(server, "save_config") as save_config,
+            patch.object(server, "save_credential") as save_credential,
         ):
-            with patch.object(server, "save_credential") as save_credential:
-                result = server.initialize({"api_url": "http://example.test", "key": "secret", "biz_line": "legacy"})
-        save_credential.assert_called_once_with("secret", "task-executor")
+            result = server.store_credential({"key": "secret", "user_id": "4"})
 
-        config = save_config.call_args.args[0]
-        self.assertNotIn("biz_line", config)
-        self.assertNotIn("bizLine", result)
-        self.assertEqual("http://example.test/api", config["bridge_api_url"])
+        save_config.assert_not_called()
+        save_credential.assert_called_once_with("secret", "4")
+        self.assertEqual(server.TASK_BOARD_API_URL, request_api.call_args.args[0]["api_url"])
+        self.assertEqual(server.TASK_BOARD_API_URL, result["apiUrl"])
 
     def test_bridge_api_url_defaults_to_the_fixed_remote_service(self):
         with tempfile.TemporaryDirectory() as directory:
             missing = Path(directory) / "missing.json"
             with patch.object(server, "CONFIG_PATH", missing), patch.object(server, "LEGACY_CONFIG_PATH", missing):
                 self.assertEqual("http://47.110.3.214:8691/api", server.bridge_api_url())
-
-    def test_update_api_url_updates_the_bridge_target_without_requiring_the_key_again(self):
-        settings = {"api_url": "http://old.test/api", "key_header": "token"}
-        with (
-            patch.object(server, "stored_settings", return_value=settings),
-            patch.object(server, "load_credential", return_value={"key": "secret", "user_id": "4"}),
-            patch.object(server, "request_api", return_value=[{"programId": 4}]) as request_api,
-            patch.object(server, "save_config") as save_config,
-        ):
-            result = server.update_api_url({"api_url": "https://board.example.test"})
-
-        saved = save_config.call_args.args[0]
-        self.assertEqual("https://board.example.test/api", saved["api_url"])
-        self.assertEqual("https://board.example.test/api", saved["bridge_api_url"])
-        self.assertNotIn("key", saved)
-        self.assertEqual("https://board.example.test/api", request_api.call_args.args[0]["api_url"])
-        self.assertEqual("secret", request_api.call_args.args[0]["key"])
-        self.assertEqual("https://board.example.test/api", result["bridgeApiUrl"])
-
-    def test_update_api_url_skips_verification_before_the_first_heartbeat(self):
-        with (
-            patch.object(server, "stored_settings", return_value={}),
-            patch.object(server, "load_credential", return_value={}),
-            patch.object(server, "request_api") as request_api,
-            patch.object(server, "save_config"),
-        ):
-            result = server.update_api_url({"api_url": "https://board.example.test"})
-
-        request_api.assert_not_called()
-        self.assertFalse(result["verified"])
+        self.assertEqual("http://47.110.3.214:8691/api", server.TASK_BOARD_API_URL)
 
     def test_preview_mode_blocks_task_board_writes(self):
         with patch.dict(os.environ, {server.RUNTIME_WRITE_MODE_ENV: "preview"}):
@@ -179,7 +111,8 @@ class DeliveryTaskPlannerTest(unittest.TestCase):
             clear=False,
         ):
             config = server.load_config()
-        self.assertEqual("http://board.test/api", config["api_url"])
+        # 地址写死在插件里，面板注入的地址不再被采信。
+        self.assertEqual(server.TASK_BOARD_API_URL, config["api_url"])
         self.assertEqual("current-user-token", config["key"])
         self.assertEqual("user-1", config["user_id"])
         self.assertNotIn("_biz_line", config)
@@ -735,8 +668,8 @@ class DeliveryTaskPlannerTest(unittest.TestCase):
                     "predecessor_item_keys": ["task-b"],
                 })
 
-    def test_only_planning_and_structure_tools_are_registered(self):
-        names = {tool["name"] for tool in server.TOOLS}
+    def test_only_planning_and_structure_actions_are_registered(self):
+        names = {action["name"] for action in server.ACTIONS}
         self.assertTrue({
             "create_task_board_project",
             "create_task_board_stage",
@@ -754,6 +687,8 @@ class DeliveryTaskPlannerTest(unittest.TestCase):
             "claim_next_task",
             "finish_execution_task",
         }.isdisjoint(names))
+        # 地址写死之后，改地址的动作不该再存在。
+        self.assertNotIn("set_task_board_api_url", names)
 
     def test_create_project_refuses_existing_code(self):
         with (
