@@ -1621,6 +1621,8 @@ def ensure_github_ssh_key(home: Path | None = None) -> dict[str, Any]:
 GIT_BRANCH_NAME_RE = re.compile(r"[A-Za-z0-9._/-]{1,255}")
 GIT_REMOTE_PREFIX = "remotes/"
 GIT_REMOTE_NAME_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
+# 关联远端仓库时只接受这几种常见写法，挡掉以 - 开头会被 git 当成选项的输入。
+GIT_REPOSITORY_URL_RE = re.compile(r"(?:[A-Za-z0-9._-]+@[A-Za-z0-9._-]+:[A-Za-z0-9._~/-]+|(?:ssh|git|https|http)://[A-Za-z0-9._~@:/-]+)")
 
 
 def valid_git_branch_name(value: str) -> bool:
@@ -1654,17 +1656,27 @@ def run_git(workspace: Path, args: list[str], timeout: int = 20) -> subprocess.C
         raise BridgeFailure(f"执行 Git 命令失败：{exc}") from exc
 
 
-def git_output(workspace: Path, args: list[str], failure: str) -> str:
-    completed = run_git(workspace, args)
+def git_output(workspace: Path, args: list[str], failure: str, timeout: int = 20) -> str:
+    completed = run_git(workspace, args, timeout=timeout)
     if completed.returncode != 0:
         raise BridgeFailure(f"{failure}：{(completed.stdout or '').strip() or 'git 退出异常'}")
     return (completed.stdout or "").strip()
 
 
-def require_git_workspace(workspace: Path) -> None:
+def git_workspace_probe(workspace: Path) -> tuple[bool, str]:
+    """判断目录是否落在某个 Git 工作树里，同时把 git 原文带回去用于报错。"""
     completed = run_git(workspace, ["rev-parse", "--is-inside-work-tree"])
-    if completed.returncode != 0 or (completed.stdout or "").strip() != "true":
-        raise BridgeFailure(f"项目工作目录不是 Git 仓库：{workspace}")
+    output = (completed.stdout or "").strip()
+    # run_git 把 stderr 并进了 stdout，git 的 warning/hint 会混在结果前面，判定只认最后一行。
+    verdict = output.splitlines()[-1].strip() if output else ""
+    return (completed.returncode == 0 and verdict == "true"), (output or "git 退出异常")
+
+
+def require_git_workspace(workspace: Path) -> None:
+    inside, detail = git_workspace_probe(workspace)
+    if not inside:
+        # 带上 git 原文，否则「不是仓库」和「仓库归属存疑」「HOME 不可读」在前端长得一模一样。
+        raise BridgeFailure(f"项目工作目录不是 Git 仓库：{workspace}（git: {detail}）")
 
 
 def git_current_branch(workspace: Path) -> str:
@@ -2089,6 +2101,161 @@ def git_create_branch(workspace: Path, base_branch: str, branch: str) -> dict[st
     if completed.returncode != 0:
         raise BridgeFailure(f"创建需求分支失败：{(completed.stdout or '').strip() or 'git 退出异常'}")
     return {"created": True, "baseBranch": base_branch, "branch": branch}
+
+
+def git_repository_url_of(value: Any) -> str:
+    """关联远端只接受完整的仓库地址；带空白、换行或以 - 开头的输入直接拒绝。"""
+    url = str(value or "").strip()
+    if not url:
+        raise BridgeFailure("请先填写 Git 仓库地址")
+    if len(url) > 512 or any(char.isspace() for char in url) or url.startswith("-"):
+        raise BridgeFailure(f"Git 仓库地址不合法：{url}")
+    if not GIT_REPOSITORY_URL_RE.fullmatch(url):
+        raise BridgeFailure(f"Git 仓库地址不合法：{url}")
+    return url
+
+
+def git_initializable_workspace_of(value: Any) -> Path:
+    """关联前目录可以还不存在：父目录必须已存在，缺的那一层由这里补上。"""
+    raw = str(value or "").strip()
+    if not raw:
+        raise BridgeFailure("未提供 Codex 工作目录，请先在项目管理中确认当前项目的工作目录")
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        raise BridgeFailure("Codex 工作目录必须是绝对路径")
+    if candidate.exists():
+        return workspace_path_of(candidate)
+    parent = candidate.parent
+    if not parent.is_dir():
+        raise BridgeFailure(f"上级目录不存在：{parent}")
+    try:
+        candidate.mkdir()
+    except OSError as exc:
+        raise BridgeFailure(f"创建项目工作目录失败：{exc}") from exc
+    return workspace_path_of(candidate)
+
+
+def git_workspace_check(value: Any) -> dict[str, Any]:
+    """给「项目偏好设置」判断这个目录要不要初始化 Git，本身不写任何东西。"""
+    raw = str(value or "").strip()
+    if not raw:
+        raise BridgeFailure("未提供 Codex 工作目录，请先在项目管理中确认当前项目的工作目录")
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        raise BridgeFailure("Codex 工作目录必须是绝对路径")
+    resolved = candidate.resolve()
+    if not resolved.is_dir():
+        return {
+            "workspace": str(resolved),
+            "exists": False,
+            "isGitRepository": False,
+            "repositoryRoot": "",
+            "remoteName": "origin",
+            "remoteConfigured": False,
+            "empty": False,
+        }
+    inside, _ = git_workspace_probe(resolved)
+    if not inside:
+        return {
+            "workspace": str(resolved),
+            "exists": True,
+            "isGitRepository": False,
+            "repositoryRoot": "",
+            "remoteName": "origin",
+            "remoteConfigured": False,
+            "empty": not any(resolved.iterdir()),
+        }
+    root = run_git(resolved, ["rev-parse", "--show-toplevel"])
+    return {
+        "workspace": str(resolved),
+        "exists": True,
+        "isGitRepository": True,
+        "repositoryRoot": (root.stdout or "").strip().splitlines()[-1].strip() if root.returncode == 0 else "",
+        "remoteName": "origin",
+        # 远端地址可能带内嵌凭据，只回传是否已配置。
+        "remoteConfigured": bool(git_remote_url(resolved, "origin")),
+        "empty": False,
+    }
+
+
+def git_adopt_remote_branch(workspace: Path, branch: str, remote: str) -> None:
+    """目录里已有文件、检出会被拒时的退路。
+
+    索引对齐远端提交，本地已有的同名文件原样留成未提交改动；
+    本地缺的那些文件再从索引检出来，这样远端内容仍然完整落到磁盘上，且不覆盖任何本地文件。
+    """
+    git_output(workspace, ["branch", "--force", branch, f"{remote}/{branch}"], "创建本地分支失败")
+    git_output(workspace, ["symbolic-ref", "HEAD", f"refs/heads/{branch}"], "切换本地分支失败")
+    git_output(workspace, ["reset", "--mixed"], "对齐远端提交失败", timeout=120)
+    run_git(workspace, ["branch", "--set-upstream-to", f"{remote}/{branch}", branch])
+    missing = [
+        line for line in git_output(workspace, ["ls-files", "-z", "--deleted"], "读取缺失文件失败", timeout=120).split("\0")
+        if line
+    ]
+    # 一次全塞进命令行可能超出系统参数上限，按批检出。
+    for start in range(0, len(missing), 200):
+        git_output(workspace, ["checkout", "--", *missing[start:start + 200]], "检出远端文件失败", timeout=300)
+
+
+def git_initialize_workspace(
+    workspace: Path,
+    repository_url: str,
+    remote: str = "origin",
+    base_branch: str = "",
+) -> dict[str, Any]:
+    """把还不是 Git 仓库的项目目录关联到远端：init + remote + fetch + 检出默认分支。
+
+    目录里已有文件时不覆盖：改成把索引对齐到远端提交，本地文件留作未提交改动，
+    由用户自己决定提交还是丢弃。中途失败会把这一步刚建出来的 .git 删掉，方便改地址重试。
+    """
+    url = git_repository_url_of(repository_url)
+    if not valid_git_remote_name(remote):
+        raise BridgeFailure("Git 远端名称不合法")
+    if base_branch and not valid_git_branch_name(base_branch):
+        raise BridgeFailure("基准分支名不合法")
+    inside, _ = git_workspace_probe(workspace)
+    if inside:
+        raise BridgeFailure(f"项目工作目录已经是 Git 仓库：{workspace}")
+    git_directory = workspace / ".git"
+    created_git_directory = False
+    try:
+        git_output(workspace, ["init"], "初始化 Git 仓库失败")
+        created_git_directory = git_directory.exists()
+        git_output(workspace, ["remote", "add", remote, url], "关联 Git 远端失败")
+        # 首次关联要把整个仓库拉下来，网络耗时远超普通 Git 命令。
+        git_output(workspace, ["fetch", "--prune", remote], "拉取远端仓库失败", timeout=900)
+        run_git(workspace, ["remote", "set-head", remote, "-a"], timeout=60)
+        branch = base_branch.strip()
+        if branch and run_git(workspace, ["rev-parse", "--verify", "--quiet", f"{remote}/{branch}^{{commit}}"]).returncode != 0:
+            raise BridgeFailure(f"远端仓库没有基准分支：{branch}")
+        if not branch:
+            head = run_git(workspace, ["symbolic-ref", "--quiet", "--short", f"refs/remotes/{remote}/HEAD"])
+            candidate = (head.stdout or "").strip() if head.returncode == 0 else ""
+            prefix = f"{remote}/"
+            branch = candidate[len(prefix):] if candidate.startswith(prefix) else ""
+        if not branch:
+            for candidate in ("main", "master", "develop"):
+                if run_git(workspace, ["rev-parse", "--verify", "--quiet", f"{remote}/{candidate}^{{commit}}"]).returncode == 0:
+                    branch = candidate
+                    break
+        if not branch:
+            raise BridgeFailure("远端仓库没有可检出的分支，请确认仓库地址是否正确")
+        adopted = run_git(workspace, ["checkout", "-b", branch, "--track", f"{remote}/{branch}"], timeout=300).returncode != 0
+        if adopted:
+            git_adopt_remote_branch(workspace, branch, remote)
+    except BaseException:
+        # 只删这一步自己建出来的 .git，工作目录里原有的文件一个都不动。
+        if created_git_directory and git_directory.is_dir():
+            shutil.rmtree(git_directory, ignore_errors=True)
+        raise
+    return {
+        "workspace": str(workspace),
+        "initialized": True,
+        "branch": branch,
+        "remoteName": remote,
+        "adopted": adopted,
+        "status": git_workspace_status(workspace, url, remote),
+    }
 
 VERSION_RE = re.compile(r"(?<!\d)(\d+(?:\.\d+)+)")
 
@@ -7992,6 +8159,24 @@ class BridgeHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self.json_response(500, {"error": f"读取 Codex 工作目录失败：{exc}"})
             return
+        if parsed.path == "/v1/codex/git/workspace-check":
+            if not self.allowed_origin():
+                self.json_response(403, {"error": "origin not allowed"})
+                return
+            query = parse_qs(parsed.query)
+            program_id = program_id_of((query.get("programId") or [""])[0])
+            try:
+                self.bridge.request_config(
+                    {"programId": program_id},
+                    self.allowed_origin() or "",
+                    self.headers.get("token", "").strip(),
+                )
+                self.json_response(200, git_workspace_check((query.get("workspace") or [""])[0]))
+            except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
+                self.json_response(400, {"error": str(exc)})
+            except Exception as exc:
+                self.json_response(500, {"error": f"检查工作目录 Git 状态失败：{exc}"})
+            return
         if parsed.path in {"/v1/codex/git/branches", "/v1/codex/git/status"}:
             if not self.allowed_origin():
                 self.json_response(403, {"error": "origin not allowed"})
@@ -8382,6 +8567,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
             "/v1/codex/attachments",
             "/v1/codex/prototype-directory/open",
             "/v1/codex/git/branch",
+            "/v1/codex/git/init",
             "/v1/codex/git/prepare",
             "/v1/codex/git/push",
             "/v1/codex/requirement-document",
@@ -8417,6 +8603,20 @@ class BridgeHandler(BaseHTTPRequestHandler):
             payload = json.loads(self.rfile.read(length))
             if not isinstance(payload, dict):
                 raise BridgeFailure("请求体必须是 JSON 对象")
+            if path == "/v1/codex/git/init":
+                # 初始化时目录还不是仓库、甚至可能还没建出来，不能先走 for_workspace 的存在性校验。
+                self.bridge.request_config(
+                    payload,
+                    self.allowed_origin() or "",
+                    self.headers.get("token", "").strip(),
+                )
+                self.json_response(200, git_initialize_workspace(
+                    git_initializable_workspace_of(payload.get("workspace")),
+                    str(payload.get("repositoryUrl") or ""),
+                    str(payload.get("remoteName") or "origin").strip() or "origin",
+                    str(payload.get("baseBranch") or "").strip(),
+                ))
+                return
             if path in {"/v1/codex/environment-setup", "/v1/codex/environment-setup/stop"}:
                 config = self.bridge.global_environment_config(payload, self.headers.get("token", "").strip())
                 selected_bridge = self.bridge
