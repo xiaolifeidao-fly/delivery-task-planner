@@ -35,6 +35,25 @@ class HttpBridgeTest(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+        # 批次本身现在由服务端持久化；队列算法单测不需要真的访问 HTTP 服务。
+        self.execution_batches: list[dict[str, object]] = []
+
+        def create_execution_batch(_config, _program_id, item_keys, mode, provider):
+            batch_id = f"batch-test-{len(self.execution_batches) + 1}"
+            batch = {"batchId": batch_id, "itemKeys": list(item_keys), "mode": mode, "provider": provider}
+            self.execution_batches.append(batch)
+            return batch
+
+        batch_create_patcher = patch.object(bridge.ExecutionBridge, "_create_execution_batch", side_effect=create_execution_batch)
+        batch_item_patcher = patch.object(bridge.ExecutionBridge, "_update_execution_batch_item", return_value=None)
+        batch_finalize_patcher = patch.object(bridge.ExecutionBridge, "_finalize_execution_batch", return_value=None)
+        batch_create_patcher.start()
+        batch_item_patcher.start()
+        batch_finalize_patcher.start()
+        self.addCleanup(batch_create_patcher.stop)
+        self.addCleanup(batch_item_patcher.stop)
+        self.addCleanup(batch_finalize_patcher.stop)
+
     @staticmethod
     def runtime_config() -> dict[str, str]:
         return {

@@ -5316,6 +5316,79 @@ class ExecutionBridge:
             raise BridgeFailure(f"任务面板未确认任务已进入进行中，已取消启动 {provider_label(provider)} 会话")
         return {**task, **updated}
 
+    @staticmethod
+    def _create_execution_batch(
+        config: dict[str, Any],
+        program_id: int,
+        item_keys: list[str],
+        mode: str,
+        provider: str,
+    ) -> dict[str, Any]:
+        """Create the authoritative server-side record before the local queue starts."""
+        batch = planner.request_api(
+            config,
+            "POST",
+            "/delivery/execution-batch/create",
+            body={
+                "programId": program_id,
+                "itemKeys": item_keys,
+                "mode": mode,
+                "executorType": provider,
+                "actorName": f"{provider}-http-bridge",
+            },
+        )
+        if not isinstance(batch, dict) or not str(batch.get("batchId") or "").strip():
+            raise BridgeFailure("任务面板没有返回有效的执行批次标识")
+        return batch
+
+    @staticmethod
+    def _update_execution_batch_item(
+        config: dict[str, Any],
+        program_id: int,
+        batch_id: str,
+        item_key: str,
+        status: str,
+        message: str = "",
+        provider: str = "codex",
+    ) -> None:
+        if not batch_id:
+            return
+        ExecutionBridge._request_with_retry(
+            config,
+            "/delivery/execution-batch/item/status",
+            {
+                "programId": program_id,
+                "batchId": batch_id,
+                "itemKey": item_key,
+                "status": status,
+                "message": message,
+                "actorName": f"{provider}-http-bridge",
+            },
+        )
+
+    @staticmethod
+    def _finalize_execution_batch(
+        config: dict[str, Any],
+        program_id: int,
+        batch_id: str,
+        status: str,
+        summary: str,
+        provider: str = "codex",
+    ) -> None:
+        if not batch_id:
+            return
+        ExecutionBridge._request_with_retry(
+            config,
+            "/delivery/execution-batch/finalize",
+            {
+                "programId": program_id,
+                "batchId": batch_id,
+                "status": status,
+                "summary": summary,
+                "actorName": f"{provider}-http-bridge",
+            },
+        )
+
     def _release_failed_claim(self, config: dict[str, Any], program_id: int, task: dict[str, Any], provider: str = "codex") -> None:
         try:
             self._request_with_retry(
@@ -5926,6 +5999,7 @@ class ExecutionBridge:
         if int(task.get("version") or 0) != int(requested_task["version"]):
             raise BridgeFailure("任务版本已变化，请刷新任务面板")
         phase = str(task.get("phase") or "requirement")
+        execution_batch_id = str(payload.get("executionBatchId") or "").strip()
         if task.get("status") == "done":
             raise BridgeFailure("已完成任务不能再次执行")
         by_key = {str(item.get("itemKey")): item for item in context["items"]}
@@ -5976,6 +6050,14 @@ class ExecutionBridge:
         )
         try:
             updated_task = self._claim_task(config, program_id, task, f"{label} 已领取任务，正在创建本地执行会话。", provider)
+            self._update_execution_batch_item(
+                config,
+                program_id,
+                execution_batch_id,
+                item_key,
+                "running",
+                provider=provider,
+            )
         except Exception:
             client.close()
             with self.lock:
@@ -6153,7 +6235,6 @@ class ExecutionBridge:
             ]
             if incomplete_external:
                 raise BridgeFailure(f"任务 {key} 的前置任务尚未完成：" + ", ".join(incomplete_external))
-        sequence_id = secrets.token_urlsafe(12)
         with self.lock:
             reserved = {task_identity(biz_line, program_id, key) for key in ordered}
             sequence_conflicts = sorted(key for _, _, key in reserved if task_identity(biz_line, program_id, key) in self.sequence_tasks)
@@ -6165,8 +6246,16 @@ class ExecutionBridge:
                 raise BridgeFailure("任务正在等待批量启动：" + ", ".join(batch_conflicts))
             if active_conflicts:
                 raise BridgeFailure("任务已经在本地执行中：" + ", ".join(active_conflicts))
-            self.active_sequences.add(sequence_id)
             self.sequence_tasks.update(reserved)
+        try:
+            persisted_batch = self._create_execution_batch(config, program_id, ordered, "sequence", provider)
+            sequence_id = str(persisted_batch["batchId"])
+        except Exception:
+            with self.lock:
+                self.sequence_tasks.difference_update(reserved)
+            raise
+        with self.lock:
+            self.active_sequences.add(sequence_id)
             self.sequence_satisfied[sequence_id] = set()
         threading.Thread(
             target=self._run_sequence,
@@ -6176,6 +6265,7 @@ class ExecutionBridge:
         return {
             "accepted": True,
             "sequenceId": sequence_id,
+            "batchId": sequence_id,
             "bizLine": biz_line,
             "programId": program_id,
             "itemKeys": ordered,
@@ -6196,13 +6286,21 @@ class ExecutionBridge:
         fast_mode: bool = False,
     ) -> None:
         biz_line = config_biz_line(config)
+        terminal_status = "completed"
+        terminal_summary = "批次内全部任务已完成。"
+        attempted_item = ""
         with self.lock:
             self.sequence_satisfied.setdefault(sequence_id, set())
         try:
             for item_key in item_keys:
+                attempted_item = item_key
                 task = self._task_detail(config, program_id, item_key)
                 status = str(task.get("status") or "")
                 if status == "done":
+                    self._update_execution_batch_item(
+                        config, program_id, sequence_id, item_key, "completed", "执行开始前任务已完成。", provider,
+                    )
+                    attempted_item = ""
                     continue
                 self.execute(
                     {
@@ -6212,6 +6310,7 @@ class ExecutionBridge:
                         "model": model,
                         "provider": provider,
                         "sequenceId": sequence_id,
+                        "executionBatchId": sequence_id,
                         "batchMode": True,
                         **({"executionConstraints": execution_constraints} if execution_constraints else {}),
                         **({"reasoningEffort": reasoning_effort} if reasoning_effort else {}),
@@ -6229,6 +6328,9 @@ class ExecutionBridge:
                 completed_task = self._task_detail(config, program_id, item_key)
                 outcome, reason = batch_task_outcome(completed_task)
                 if outcome == "ignorable":
+                    self._update_execution_batch_item(config, program_id, sequence_id, item_key, "blocked", reason, provider)
+                    terminal_status = "blocked"
+                    terminal_summary = f"任务 {item_key} 未完全完成：{reason}"
                     with self.lock:
                         self.sequence_satisfied.setdefault(sequence_id, set()).add(item_key)
                     self.progress.publish(
@@ -6238,17 +6340,37 @@ class ExecutionBridge:
                         reason,
                         "success",
                     )
+                    attempted_item = ""
                     continue
                 if outcome != "completed":
+                    self._update_execution_batch_item(config, program_id, sequence_id, item_key, "blocked", reason, provider)
+                    attempted_item = ""
                     self.progress.publish(identity, "error", "串行队列已暂停", reason, "failed")
                     raise BridgeFailure(
                         f"任务 {item_key} 未成功完成，队列已停止：{reason}"
                     )
                 with self.lock:
                     self.sequence_satisfied.setdefault(sequence_id, set()).add(item_key)
+                self._update_execution_batch_item(config, program_id, sequence_id, item_key, "completed", reason, provider)
+                attempted_item = ""
         except Exception as exc:
+            terminal_status = "blocked"
+            terminal_summary = str(exc)
+            if attempted_item:
+                try:
+                    self._update_execution_batch_item(
+                        config, program_id, sequence_id, attempted_item, "blocked", terminal_summary, provider,
+                    )
+                except Exception as sync_error:
+                    print(f"同步串行批次任务失败 {program_id}/{sequence_id}/{attempted_item}: {sync_error}", file=sys.stderr, flush=True)
             print(f"串行执行失败 {program_id}/{sequence_id}: {exc}", file=sys.stderr, flush=True)
         finally:
+            try:
+                self._finalize_execution_batch(
+                    config, program_id, sequence_id, terminal_status, terminal_summary, provider,
+                )
+            except Exception as sync_error:
+                print(f"同步串行执行批次结果失败 {program_id}/{sequence_id}: {sync_error}", file=sys.stderr, flush=True)
             with self.lock:
                 self.active_sequences.discard(sequence_id)
                 self.sequence_tasks.difference_update(task_identity(biz_line, program_id, key) for key in item_keys)
@@ -6306,7 +6428,6 @@ class ExecutionBridge:
                 raise BridgeFailure("任务依赖关系存在环，无法批量执行")
             remaining.difference_update(ready)
 
-        batch_id = secrets.token_urlsafe(12)
         with self.lock:
             reserved = {task_identity(biz_line, program_id, key) for key in requested_keys}
             active = sorted(key for _, _, key in reserved if task_identity(biz_line, program_id, key) in self.active)
@@ -6319,6 +6440,14 @@ class ExecutionBridge:
             if waiting:
                 raise BridgeFailure("任务正在等待批量启动：" + ", ".join(waiting))
             self.batch_tasks.update(reserved)
+        try:
+            persisted_batch = self._create_execution_batch(config, program_id, requested_keys, "parallel", provider)
+            batch_id = str(persisted_batch["batchId"])
+        except Exception:
+            with self.lock:
+                self.batch_tasks.difference_update(reserved)
+            raise
+        with self.lock:
             self.batch_satisfied[batch_id] = set()
         threading.Thread(
             target=self._run_batch,
@@ -6348,6 +6477,9 @@ class ExecutionBridge:
         fast_mode: bool = False,
     ) -> None:
         biz_line = config_biz_line(config)
+        terminal_status = "completed"
+        terminal_summary = "批次内全部任务已完成。"
+        attempted_item = ""
         with self.lock:
             self.batch_satisfied.setdefault(batch_id, set())
         try:
@@ -6360,9 +6492,16 @@ class ExecutionBridge:
                 if missing:
                     raise BridgeFailure("任务不存在：" + ", ".join(missing))
 
-                remaining.difference_update(
+                completed_before_start = {
                     key for key in remaining if str(by_key[key].get("status") or "") == "done"
-                )
+                }
+                for item_key in completed_before_start:
+                    self._update_execution_batch_item(
+                        config, program_id, batch_id, item_key, "completed", "执行开始前任务已完成。", provider,
+                    )
+                    with self.lock:
+                        self.batch_satisfied.setdefault(batch_id, set()).add(item_key)
+                remaining.difference_update(completed_before_start)
                 if not remaining:
                     return
 
@@ -6387,6 +6526,7 @@ class ExecutionBridge:
                     raise BridgeFailure("批量队列没有可执行任务，仍在等待前置任务：" + "、".join(waiting))
 
                 for item_key in ready:
+                    attempted_item = item_key
                     task = self._task_detail(config, program_id, item_key)
                     self.execute(
                         {
@@ -6396,6 +6536,7 @@ class ExecutionBridge:
                             "model": model,
                             "provider": provider,
                             "batchId": batch_id,
+                            "executionBatchId": batch_id,
                             "batchMode": True,
                             **({"executionConstraints": execution_constraints} if execution_constraints else {}),
                             **({"reasoningEffort": reasoning_effort} if reasoning_effort else {}),
@@ -6404,6 +6545,7 @@ class ExecutionBridge:
                         batch_claim=True,
                         config=config,
                     )
+                    attempted_item = ""
 
                 launched_identities = {task_identity(biz_line, program_id, item_key) for item_key in ready}
                 while True:
@@ -6419,10 +6561,14 @@ class ExecutionBridge:
                     outcome, reason = batch_task_outcome(reviewed_task)
                     identity = task_identity(biz_line, program_id, item_key)
                     if outcome == "completed":
+                        self._update_execution_batch_item(config, program_id, batch_id, item_key, "completed", reason, provider)
                         with self.lock:
                             self.batch_satisfied.setdefault(batch_id, set()).add(item_key)
                         continue
                     if outcome == "ignorable":
+                        self._update_execution_batch_item(config, program_id, batch_id, item_key, "blocked", reason, provider)
+                        terminal_status = "blocked"
+                        terminal_summary = f"任务 {item_key} 未完全完成：{reason}"
                         with self.lock:
                             self.batch_satisfied.setdefault(batch_id, set()).add(item_key)
                         self.progress.publish(
@@ -6433,14 +6579,30 @@ class ExecutionBridge:
                             "success",
                         )
                         continue
+                    self._update_execution_batch_item(config, program_id, batch_id, item_key, "blocked", reason, provider)
                     failed.append(f"{item_key}（{reason}）")
                     self.progress.publish(identity, "error", "批量队列已暂停", reason, "failed")
                 if failed:
                     raise BridgeFailure("批量队列已停止，当前并行任务存在需要处理的问题：" + "、".join(failed))
                 remaining.difference_update(ready)
         except Exception as exc:
+            terminal_status = "blocked"
+            terminal_summary = str(exc)
+            if attempted_item:
+                try:
+                    self._update_execution_batch_item(
+                        config, program_id, batch_id, attempted_item, "blocked", terminal_summary, provider,
+                    )
+                except Exception as sync_error:
+                    print(f"同步批次任务失败 {program_id}/{batch_id}/{attempted_item}: {sync_error}", file=sys.stderr, flush=True)
             print(f"批量执行失败 {program_id}/{batch_id}: {exc}", file=sys.stderr, flush=True)
         finally:
+            try:
+                self._finalize_execution_batch(
+                    config, program_id, batch_id, terminal_status, terminal_summary, provider,
+                )
+            except Exception as sync_error:
+                print(f"同步批量执行结果失败 {program_id}/{batch_id}: {sync_error}", file=sys.stderr, flush=True)
             with self.lock:
                 self.batch_tasks.difference_update(task_identity(biz_line, program_id, key) for key in item_keys)
                 self.batch_satisfied.pop(batch_id, None)
