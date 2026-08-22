@@ -160,6 +160,14 @@ class PluginUpdateManager:
         except ValueError as exc:
             raise UpdateFailure(str(exc)) from exc
 
+    def installed_updated_at(self) -> str:
+        manifest = self.plugin_root / ".codex-plugin" / "plugin.json"
+        try:
+            updated_at = datetime.fromtimestamp(manifest.stat().st_mtime, timezone.utc)
+        except OSError:
+            return ""
+        return updated_at.isoformat().replace("+00:00", "Z")
+
     def _resolve_remote(self, force: bool = False) -> dict[str, str]:
         now = time.monotonic()
         with self.lock:
@@ -200,17 +208,16 @@ class PluginUpdateManager:
         return dict(result)
 
     def status(self, force: bool = False) -> dict[str, Any]:
-        checked_at = int(time.time())
         try:
             local_version = self.installed_version()
         except UpdateFailure as exc:
-            return self._status_payload("", {}, False, checked_at, str(exc))
+            return self._status_payload("", {}, False, int(time.time()), str(exc))
         try:
             remote = self._resolve_remote(force=force)
             update_available = compare_versions(remote["version"], local_version) > 0
         except (UpdateFailure, ValueError) as exc:
-            return self._status_payload(local_version, {}, False, checked_at, str(exc))
-        return self._status_payload(local_version, remote, update_available, checked_at, "")
+            return self._status_payload(local_version, {}, False, int(time.time()), str(exc))
+        return self._status_payload(local_version, remote, update_available, int(time.time()), "")
 
     def _status_payload(
         self,
@@ -226,6 +233,7 @@ class PluginUpdateManager:
                 job["logs"] = list(job["logs"])
         return {
             "localVersion": local_version,
+            "localUpdatedAt": self.installed_updated_at(),
             "remoteVersion": remote.get("version", ""),
             "remoteCommit": remote.get("commit", ""),
             "updateAvailable": update_available,
@@ -319,9 +327,32 @@ class PluginUpdateManager:
                 "status": "restarting",
                 "progress": 98,
                 "message": "正在重启桥接服务。",
+                "activeRuns": 0,
                 "restartRequestedAt": utc_now(),
             })
             self._log("安装结果已落盘，开始重启桥接服务。")
+            return self.get_job(job_id)
+
+    def mark_waiting_for_runs(self, job_id: str, active_runs: int) -> dict[str, Any]:
+        with self.lock:
+            if not self.job or self.job.get("jobId") != job_id:
+                raise UpdateFailure("未找到插件更新记录")
+            if self.job.get("status") != "restart_required":
+                raise UpdateFailure("当前更新不需要等待重启桥接服务")
+            count = max(0, int(active_runs))
+            if self.job.get("activeRuns") != count:
+                self.job.update({
+                    "activeRuns": count,
+                    "message": f"插件已安装，正在等待 {count} 个执行会话完成后自动重启。",
+                })
+                logs = self.job.setdefault("logs", [])
+                logs.append({
+                    "at": utc_now(),
+                    "level": "info",
+                    "message": f"检测到 {count} 个执行会话仍在运行，暂缓重启桥接服务。",
+                })
+                self.job["logs"] = logs[-400:]
+                self._save_job()
             return self.get_job(job_id)
 
     def _install(self, job_id: str, expected_version: str) -> None:
@@ -367,11 +398,11 @@ class PluginUpdateManager:
                 components.append("claude")
 
             # Every successful package replacement gets a fresh bridge process.
-            # A manifest-only release must not leave the old in-memory Python
-            # process running, and the detached helper owns the forced restart.
+            # The HTTP bridge waits for its managed runs to drain before handing
+            # restart ownership to the detached helper.
             restart_required = True
             final_status = "restart_required"
-            final_message = "插件与双端缓存已更新，正在强制重启桥接服务。"
+            final_message = "插件与双端缓存已更新，等待执行会话完成后自动重启桥接服务。"
             self._patch_job(
                 status=final_status,
                 progress=96,
@@ -461,6 +492,8 @@ class PluginUpdateManager:
             root / "server.py",
             root / "taskboard.py",
             root / "delivery_bridge" / "update_manager.py",
+            root / "delivery_bridge" / "restart_helper.py",
+            root / "delivery_bridge" / "windows_supervisor.py",
         ]
         if any(not path.exists() for path in required):
             raise UpdateFailure("发布包缺少插件清单、Skills 或桥接核心代码")

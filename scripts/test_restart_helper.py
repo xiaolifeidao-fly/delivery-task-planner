@@ -51,7 +51,7 @@ class RestartHelperTest(unittest.TestCase):
         self.assertEqual(["launchctl", "kickstart", "-k"], command[:3])
         self.assertIn(restart_helper.LAUNCH_AGENT_LABEL, command[-1])
 
-    def test_windows_restart_terminates_and_detaches_the_bridge(self):
+    def test_windows_restart_reinstalls_supervised_task_and_waits_for_health(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory) / "home"
             plugin_root = Path(directory) / "plugin"
@@ -63,9 +63,10 @@ class RestartHelperTest(unittest.TestCase):
                 patch.object(restart_helper.Path, "home", return_value=home),
                 patch.object(restart_helper.time, "sleep"),
                 patch.object(restart_helper, "restart_log"),
-                patch.object(restart_helper.os, "kill") as kill,
-                patch.object(restart_helper, "process_exists", return_value=False),
-                patch.object(restart_helper.subprocess, "Popen") as popen,
+                patch.object(restart_helper, "terminate_bridge") as terminate,
+                patch.object(restart_helper, "reinstall_windows_scheduled_task", return_value=True) as reinstall,
+                patch.object(restart_helper, "wait_for_bridge_ready", return_value=True) as ready,
+                patch.object(restart_helper, "start_windows_supervisor") as fallback,
             ):
                 restart_helper.main([
                     "--pid", "123",
@@ -73,10 +74,52 @@ class RestartHelperTest(unittest.TestCase):
                     "--allow-origin", "*",
                 ])
 
-        kill.assert_called_once_with(123, restart_helper.signal.SIGTERM)
-        command = popen.call_args.args[0]
-        self.assertEqual([sys.executable, str(plugin_root.resolve() / "http_bridge.py"), "--allow-origin", "*"], command)
-        self.assertTrue(popen.call_args.kwargs["close_fds"])
+        terminate.assert_called_once_with(123)
+        reinstall.assert_called_once_with(plugin_root.resolve(), ["--allow-origin", "*"])
+        ready.assert_called_once_with(["--allow-origin", "*"])
+        fallback.assert_not_called()
+
+    def test_windows_restart_starts_supervisor_when_task_reinstall_fails(self):
+        plugin_root = Path("/tmp/plugin").resolve()
+        bridge_args = ["--port", "9876"]
+        with (
+            patch.object(restart_helper, "terminate_bridge") as terminate,
+            patch.object(restart_helper, "reinstall_windows_scheduled_task", return_value=False),
+            patch.object(restart_helper, "start_windows_supervisor") as start_supervisor,
+            patch.object(restart_helper, "wait_for_bridge_ready", return_value=True) as ready,
+        ):
+            restart_helper.restart_windows_bridge(456, plugin_root, bridge_args)
+
+        terminate.assert_called_once_with(456)
+        start_supervisor.assert_called_once_with(plugin_root, bridge_args)
+        ready.assert_called_once_with(bridge_args)
+
+    def test_windows_restart_does_not_start_duplicate_supervisor_when_registered_task_is_unhealthy(self):
+        with (
+            patch.object(restart_helper, "terminate_bridge"),
+            patch.object(restart_helper, "reinstall_windows_scheduled_task", return_value=True),
+            patch.object(restart_helper, "wait_for_bridge_ready", return_value=False),
+            patch.object(restart_helper, "start_windows_supervisor") as fallback,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "did not become healthy"):
+                restart_helper.restart_windows_bridge(789, Path("/tmp/plugin"), [])
+
+        fallback.assert_not_called()
+
+    def test_bridge_health_url_preserves_custom_host_and_port(self):
+        self.assertEqual(
+            "http://[::1]:9876/healthz",
+            restart_helper.bridge_health_url(["--host", "::1", "--port=9876"]),
+        )
+
+    def test_windows_service_arguments_preserve_workspace_and_origin(self):
+        self.assertEqual(
+            ("C:\\work tree", "https://console.example"),
+            restart_helper.windows_service_arguments([
+                "--workspace", "C:\\work tree",
+                "--allow-origin=https://console.example",
+            ]),
+        )
 
 
 if __name__ == "__main__":

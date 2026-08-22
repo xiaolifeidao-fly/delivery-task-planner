@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -31,6 +32,7 @@ def make_package(root: Path, version: str = "0.3.0") -> Path:
         (root / name).write_text(f"# {version}\n", encoding="utf-8")
     (root / "delivery_bridge" / "update_manager.py").write_text(f"# {version}\n", encoding="utf-8")
     (root / "delivery_bridge" / "restart_helper.py").write_text(f"# {version}\n", encoding="utf-8")
+    (root / "delivery_bridge" / "windows_supervisor.py").write_text(f"# {version}\n", encoding="utf-8")
     return root
 
 
@@ -38,6 +40,24 @@ class PluginUpdateTest(unittest.TestCase):
     def test_version_comparison_ignores_client_cachebusters(self):
         self.assertEqual(0, compare_versions("0.3.0+codex.a", "0.3.0+codex.b"))
         self.assertGreater(compare_versions("0.4.0", "0.3.9"), 0)
+
+    def test_status_reports_local_manifest_update_time_and_check_time(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plugin_root = make_package(Path(directory) / "installed", "0.4.4")
+            manifest = plugin_root / ".codex-plugin" / "plugin.json"
+            os.utime(manifest, (1_700_000_000, 1_700_000_000))
+            manager = PluginUpdateManager(
+                plugin_root,
+                Path(directory) / "runtime",
+                "https://example.test/plugin.git",
+                "https://example.test/plugin",
+            )
+
+            with patch.object(manager, "_resolve_remote", return_value={"version": "0.4.4", "commit": "a" * 40}):
+                status = manager.status()
+
+            self.assertEqual("2023-11-14T22:13:20Z", status["localUpdatedAt"])
+            self.assertGreater(status["checkedAt"], 0)
 
     def test_package_validation_requires_matching_dual_client_release(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -125,7 +145,7 @@ class PluginUpdateTest(unittest.TestCase):
             self.assertIn("重新尝试", job["message"])
             self.assertEqual("warning", job["logs"][-1]["level"])
 
-    def test_successful_install_always_requires_a_forced_bridge_restart(self):
+    def test_successful_install_always_requires_a_safe_bridge_restart(self):
         with tempfile.TemporaryDirectory() as directory:
             temporary = Path(directory)
             plugin_root = make_package(temporary / "installed", "0.2.0")
@@ -159,6 +179,32 @@ class PluginUpdateTest(unittest.TestCase):
             self.assertTrue(job["restartRequired"])
             self.assertEqual(96, job["progress"])
             self.assertEqual("", job["finishedAt"])
+
+    def test_waiting_for_runs_is_persisted_without_leaving_restart_required(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = PluginUpdateManager(
+                make_package(Path(directory) / "installed", "0.4.4"),
+                Path(directory) / "runtime",
+                "https://example.test/plugin.git",
+                "https://example.test/plugin",
+                home_dir=Path(directory) / "home",
+            )
+            manager.job = {
+                "jobId": "job-1",
+                "status": "restart_required",
+                "progress": 96,
+                "restartRequired": True,
+                "logs": [],
+            }
+
+            job = manager.mark_waiting_for_runs("job-1", 2)
+
+            self.assertEqual("restart_required", job["status"])
+            self.assertEqual(2, job["activeRuns"])
+            self.assertIn("等待 2 个执行会话", job["message"])
+            self.assertIn("暂缓重启", job["logs"][-1]["message"])
+            persisted = json.loads(manager.state_path.read_text(encoding="utf-8"))
+            self.assertEqual(2, persisted["activeRuns"])
 
 
 if __name__ == "__main__":

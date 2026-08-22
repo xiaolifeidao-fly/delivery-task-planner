@@ -8,8 +8,12 @@ param(
 $ErrorActionPreference = "Stop"
 $taskName = "Universe Delivery Task Planner Bridge"
 $bridgeScript = Join-Path $PluginRoot "http_bridge.py"
+$supervisorScript = Join-Path $PluginRoot "delivery_bridge\windows_supervisor.py"
 if (-not (Test-Path -LiteralPath $bridgeScript)) {
   throw "Bridge script not found: $bridgeScript"
+}
+if (-not (Test-Path -LiteralPath $supervisorScript)) {
+  throw "Windows supervisor script not found: $supervisorScript"
 }
 
 $pythonCommand = Get-Command python -ErrorAction SilentlyContinue
@@ -24,7 +28,9 @@ if (-not $pythonCommand) {
 
 $arguments = @()
 $arguments += $pythonArguments
-$arguments += '"' + $bridgeScript + '"'
+$arguments += '"' + $supervisorScript + '"'
+$arguments += "--plugin-root"
+$arguments += '"' + $PluginRoot + '"'
 if ($Workspace) {
   $arguments += "--workspace"
   $arguments += '"' + $Workspace + '"'
@@ -36,7 +42,12 @@ $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 $principal = New-ScheduledTaskPrincipal -UserId $currentUser -LogonType InteractiveToken -RunLevel Limited
 $action = New-ScheduledTaskAction -Execute $pythonCommand.Source -Argument ($arguments -join " ")
 $trigger = New-ScheduledTaskTrigger -AtLogOn
-$settings = New-ScheduledTaskSettingsSet -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+$settings = New-ScheduledTaskSettingsSet `
+  -RestartCount 10 `
+  -RestartInterval (New-TimeSpan -Minutes 1) `
+  -MultipleInstances IgnoreNew `
+  -ExecutionTimeLimit ([TimeSpan]::Zero) `
+  -StartWhenAvailable
 Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
 Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description "Local HTTP bridge for the Universe delivery task board." -Force | Out-Null
 Start-ScheduledTask -TaskName $taskName

@@ -273,6 +273,15 @@ class BridgeFailure(Exception):
     pass
 
 
+# Capture the manifest version exactly once for the lifetime of this Python
+# process. Package replacement changes the file on disk, but this value only
+# changes after the bridge has genuinely restarted and imported the new code.
+try:
+    PLUGIN_RUNTIME_VERSION = installed_plugin_version()
+except BridgeFailure:
+    PLUGIN_RUNTIME_VERSION = ""
+
+
 def content_disposition_of(name: str, inline: bool = False) -> str:
     """Build a browser-safe Content-Disposition header for arbitrary file names."""
     cleaned = re.sub(r"[\r\n\"]", "", str(name)).strip() or "attachment"
@@ -324,7 +333,7 @@ def schedule_bridge_restart() -> None:
 
 
 def complete_plugin_update_in_background(job_id: str, bridge: Any) -> None:
-    """Force the detached restart helper after a completed package replacement."""
+    """Restart after replacement once every bridge-managed run has finished."""
     def monitor() -> None:
         while True:
             try:
@@ -335,6 +344,14 @@ def complete_plugin_update_in_background(job_id: str, bridge: Any) -> None:
             if status in {"completed", "failed", "restarting"}:
                 return
             if status == "restart_required":
+                active_runs = bridge.active_run_count()
+                if active_runs > 0:
+                    try:
+                        PLUGIN_UPDATES.mark_waiting_for_runs(job_id, active_runs)
+                    except UpdateFailure:
+                        return
+                    time.sleep(PLUGIN_UPDATE_RESTART_POLL_SECONDS)
+                    continue
                 try:
                     PLUGIN_UPDATES.mark_restarting(job_id)
                 except UpdateFailure:
@@ -8197,8 +8214,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/v1/plugin/info":
             self.json_response(200, {
-                "installed": True,
-                "version": installed_plugin_version(),
+                "installed": bool(PLUGIN_RUNTIME_VERSION),
+                "version": PLUGIN_RUNTIME_VERSION,
             })
             return
         if parsed.path == "/v1/plugin/runtime-test":

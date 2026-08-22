@@ -56,4 +56,4 @@ rsync -a --delete \
 "${codex_command}" plugin add delivery-task-planner@personal
 # 不给桥接进程指定工作目录：每个项目的目录由任务面板在项目管理里绑定，随请求下发。
 # 曾经这里传的是插件仓库自身的路径，结果那个仓库成了所有未绑定项目的隐形默认值。
-"${install_root}/scripts/start_http.sh"
+bash "${install_root}/scripts/start_http.sh"
