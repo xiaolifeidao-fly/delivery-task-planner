@@ -268,6 +268,176 @@ class HttpBridgeTest(unittest.TestCase):
         self.assertIn("不得写入 `.codex/visualizations`", prompt)
         self.assertIn("除当前需求文档目录外仍不得修改工作区其他文件", prompt)
 
+    def test_planning_prompt_only_lists_tasks_of_the_current_requirement(self):
+        context = {
+            "program": {"name": "Universe"},
+            "items": [
+                {"itemKey": "task-a", "title": "本需求任务", "requirementKey": "req-a"},
+                {"itemKey": "task-z", "title": "别的需求任务", "requirementKey": "req-z"},
+            ],
+        }
+
+        prompt = bridge.build_planning_prompt(
+            1, context, "拆一下", requirement={"requirementKey": "req-a"},
+        )
+
+        self.assertIn("task-a", prompt)
+        self.assertNotIn("task-z", prompt)
+        self.assertNotIn("项目全部任务", prompt)
+        self.assertIn("去重、复用和依赖判断都只在本需求范围内进行", prompt)
+
+    def test_planning_follow_up_prompt_keeps_only_the_context_that_changes_or_matters(self):
+        context = {
+            "program": {"name": "Universe"},
+            "stages": [{"stageKey": "m1", "tag": "里程碑一"}],
+            "modules": [{"moduleKey": "web", "name": "控制台"}],
+            "items": [
+                {"itemKey": "task-a", "title": "本需求任务", "requirementKey": "req-a"},
+                {"itemKey": "task-z", "title": "别的需求任务", "requirementKey": "req-z"},
+            ],
+        }
+        requirement = {"requirementKey": "req-a", "name": "需求一", "detail": "正文"}
+
+        follow_up = bridge.build_planning_follow_up_prompt(
+            1, context, "再加一条", "m1", "web", "", requirement,
+        )
+
+        self.assertIn("task-a", follow_up)
+        self.assertNotIn("task-z", follow_up)
+        self.assertIn("doc/requirements/req-a/需求大纲.md", follow_up)
+        self.assertIn("读全文 → 合并本轮增量 → 整篇覆盖", follow_up)
+        self.assertIn("现有里程碑键（取值只能从中选）: m1", follow_up)
+        self.assertIn("禁止执行 create-task-board-tasks", follow_up)
+        self.assertIn("再加一条", follow_up)
+        # 首轮讲过的角色说明、勘察纪律和现有选项明细不再逐轮重发。
+        self.assertNotIn("这是交付任务面板的需求梳理会话", follow_up)
+        self.assertNotIn("拆解前必须先勘察", follow_up)
+        self.assertLess(
+            len(follow_up),
+            len(bridge.build_planning_prompt(1, context, "再加一条", "m1", "web", "", requirement)),
+        )
+
+    def test_planning_follow_up_prompt_resends_the_detail_only_after_it_changes(self):
+        requirement = {"requirementKey": "req-a", "detail": "改过的正文"}
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            outline = workspace / "doc" / "requirements" / "req-a" / "需求大纲.md"
+            outline.parent.mkdir(parents=True, exist_ok=True)
+            outline.write_text("# 已沉淀的大纲\n", encoding="utf-8")
+
+            unchanged = bridge.build_planning_follow_up_prompt(
+                1, {"program": {}}, "继续", requirement=requirement, workspace=workspace,
+            )
+            changed = bridge.build_planning_follow_up_prompt(
+                1, {"program": {}}, "继续", requirement=requirement, workspace=workspace,
+                include_detail=True,
+            )
+
+        self.assertNotIn("改过的正文", unchanged)
+        self.assertIn("需求详细信息与本会话首轮给出的一致", unchanged)
+        self.assertIn("改过的正文", changed)
+        self.assertNotEqual(
+            bridge.planning_detail_digest(requirement),
+            bridge.planning_detail_digest({"detail": "另一版正文"}),
+        )
+
+    def test_planning_follow_up_prompt_repeats_the_detail_until_the_outline_lands(self):
+        """大纲没落盘前，需求正文只活在首轮那条消息里，压缩掉就没了。"""
+        requirement = {"requirementKey": "req-a", "detail": "还没沉淀的正文"}
+        with tempfile.TemporaryDirectory() as temporary:
+            follow_up = bridge.build_planning_follow_up_prompt(
+                1, {"program": {}}, "继续", requirement=requirement, workspace=Path(temporary),
+            )
+
+        self.assertIn("还没沉淀的正文", follow_up)
+        self.assertIn("需求大纲尚未落盘", follow_up)
+
+    def test_requirement_testing_follow_up_prompt_drops_the_boilerplate_but_refreshes_the_inventory(self):
+        context = {
+            "items": [
+                {"itemKey": "task-a", "title": "接口", "requirementKey": "req-a", "status": "done", "actionOutput": "x"},
+            ],
+        }
+        requirement = {"requirementKey": "req-a", "name": "需求一", "detail": "很长的需求正文"}
+
+        follow_up = bridge.build_requirement_testing_prompt(
+            1, context, requirement, "继续测", follow_up=True,
+        )
+        first = bridge.build_requirement_testing_prompt(1, context, requirement, "继续测")
+
+        self.assertIn("task-a", follow_up)
+        self.assertIn("doc/test/req-a/", follow_up)
+        self.assertIn("验收判定：通过 / 不通过 / 受阻", follow_up)
+        self.assertNotIn("很长的需求正文", follow_up)
+        self.assertIn("本会话如果被压缩过", follow_up)
+        self.assertLess(len(follow_up), len(first))
+
+    def test_requirement_testing_follow_up_prompt_keeps_the_design_only_red_line(self):
+        follow_up = bridge.build_requirement_testing_prompt(
+            1, {}, {"requirementKey": "req-a"}, "再补几条", test_case_only=True, follow_up=True,
+        )
+
+        self.assertIn("绝不调用接口、UI、脚本或构建命令执行真实测试", follow_up)
+        self.assertIn("测试用例已生成", follow_up)
+
+    def test_requirement_testing_follow_up_prompt_resends_a_changed_detail(self):
+        requirement = {"requirementKey": "req-a", "detail": "改过的正文"}
+
+        follow_up = bridge.build_requirement_testing_prompt(
+            1, {}, requirement, "继续测", follow_up=True, include_detail=True,
+        )
+
+        self.assertIn("改过的正文", follow_up)
+
+    def test_task_testing_cases_follow_up_prompt_drops_the_sibling_catalog(self):
+        task = {"itemKey": "task-a", "title": "接口", "requirementKey": "req-a", "moduleKey": "web", "phase": "testing"}
+        context = {"items": [{"itemKey": "task-b", "title": "兄弟任务", "requirementKey": "req-a", "moduleKey": "web"}]}
+
+        follow_up = bridge.build_task_testing_cases_prompt(1, task, context, "再补一条", follow_up=True)
+
+        self.assertIn("task-a", follow_up)
+        self.assertIn("doc/test/task-a/", follow_up)
+        self.assertIn("绝不调用接口、UI、脚本或构建命令执行真实测试", follow_up)
+        self.assertIn("测试用例已生成", follow_up)
+        self.assertNotIn("本需求下其他任务已写好的需求文档", follow_up)
+
+    def test_requirement_prototype_follow_up_prompt_keeps_the_write_scope_red_line(self):
+        requirement = {"requirementKey": "req-a", "name": "需求一", "detail": "很长的需求正文"}
+
+        follow_up = bridge.build_requirement_prototype_prompt(
+            1, requirement, "把按钮改成蓝色", Path("/tmp"), editing=True, follow_up=True,
+        )
+
+        self.assertIn("doc/requirements/req-a/prototype/", follow_up)
+        self.assertIn("不得修改业务代码、配置、依赖或该目录以外的文件", follow_up)
+        self.assertIn("保留未被本轮要求修改的内容", follow_up)
+        self.assertNotIn("很长的需求正文", follow_up)
+
+    def test_requirement_prototype_follow_up_prompt_resends_a_changed_detail(self):
+        requirement = {"requirementKey": "req-a", "detail": "改过的正文"}
+
+        follow_up = bridge.build_requirement_prototype_prompt(
+            1, requirement, "再改", Path("/tmp"), editing=True, follow_up=True, include_detail=True,
+        )
+
+        self.assertIn("改过的正文", follow_up)
+
+    def test_prototype_session_detail_digest_defaults_to_resending_the_detail(self):
+        rows = [{"threadId": "t1", "metadata": {"detailDigest": "abc"}}]
+
+        self.assertEqual("abc", bridge.prototype_session_detail_digest(rows, "t1"))
+        self.assertEqual("", bridge.prototype_session_detail_digest(rows, "t2"))
+        self.assertEqual("", bridge.prototype_session_detail_digest([], "t1"))
+
+    def test_planning_follow_up_prompt_tells_a_compacted_session_to_reload_the_outline(self):
+        follow_up = bridge.build_planning_follow_up_prompt(
+            1, {"program": {}}, "继续", requirement={"requirementKey": "req-a", "generatePrototype": True},
+        )
+
+        self.assertIn("本会话如果被压缩过", follow_up)
+        self.assertIn("doc/requirements/req-a/需求大纲.md", follow_up)
+        self.assertIn("生成需求原型图", follow_up)
+
     def test_planning_prompt_always_carries_the_requirement_outline_path(self):
         prompt = bridge.build_planning_prompt(
             1, {"program": {"name": "Universe"}}, "拆一下", requirement={"requirementKey": "req-a"},
@@ -1080,6 +1250,23 @@ class HttpBridgeTest(unittest.TestCase):
 
         self.assertEqual(("message", "Codex 进度", "正在检查数据同步实现。", "success"), event)
 
+    def test_progress_event_forwards_reasoning_summary_delta_but_not_raw_reasoning_delta(self):
+        summary_event = bridge.progress_event_of(
+            {
+                "method": "item/reasoning/summaryTextDelta",
+                "params": {"delta": "先检查桥接器的事件映射。"},
+            }
+        )
+        raw_event = bridge.progress_event_of(
+            {
+                "method": "item/reasoning/textDelta",
+                "params": {"delta": "不应显示的原始内容"},
+            }
+        )
+
+        self.assertEqual(("reasoning", "Codex 推理摘要", "先检查桥接器的事件映射。", "running"), summary_event)
+        self.assertIsNone(raw_event)
+
     def test_completed_command_does_not_look_like_terminal_turn(self):
         event = bridge.progress_event_of(
             {
@@ -1208,6 +1395,7 @@ class HttpBridgeTest(unittest.TestCase):
         self.assertEqual("gpt-5.6-sol", requests[2][2]["model"])
         self.assertNotIn("effort", requests[0][2])
         self.assertEqual("high", requests[2][2]["effort"])
+        self.assertEqual("auto", requests[2][2]["summary"])
 
     def test_app_server_can_resume_start_steer_and_interrupt_a_thread(self):
         client = bridge.AppServerClient.__new__(bridge.AppServerClient)
@@ -1231,6 +1419,7 @@ class HttpBridgeTest(unittest.TestCase):
         self.assertEqual("turn-2", requests[3][2]["turnId"])
         self.assertEqual("dangerFullAccess", requests[1][2]["sandboxPolicy"]["type"])
         self.assertEqual("xhigh", requests[1][2]["effort"])
+        self.assertEqual("auto", requests[1][2]["summary"])
 
     def test_app_server_sends_images_as_local_image_inputs(self):
         client = bridge.AppServerClient.__new__(bridge.AppServerClient)
@@ -1258,6 +1447,7 @@ class HttpBridgeTest(unittest.TestCase):
                 "items": [
                     {"id": "u1", "type": "userMessage", "content": [{"type": "text", "text": "Implement it"}]},
                     {"id": "a1", "type": "agentMessage", "text": "Implemented and verified."},
+                    {"id": "r1", "type": "reasoning", "content": ["raw reasoning"], "summary": ["Checked the interface contract."]},
                     {"id": "c1", "type": "commandExecution", "command": ["go test ./..."], "exitCode": 0},
                     {"id": "f1", "type": "fileChange", "changes": [{"path": "service/item.go", "kind": "modify"}]},
                 ],
@@ -1266,8 +1456,227 @@ class HttpBridgeTest(unittest.TestCase):
 
         self.assertEqual("Implement it", turns[0]["items"][0]["text"])
         self.assertEqual("agentMessage", turns[0]["items"][1]["type"])
-        self.assertEqual("go test ./...", turns[0]["items"][2]["text"])
-        self.assertEqual("service/item.go", turns[0]["items"][3]["text"])
+        self.assertEqual("reasoning", turns[0]["items"][2]["type"])
+        self.assertEqual("Checked the interface contract.", turns[0]["items"][2]["text"])
+        self.assertEqual("go test ./...", turns[0]["items"][3]["text"])
+        self.assertEqual("service/item.go", turns[0]["items"][4]["text"])
+
+    def test_chat_archive_writes_a_project_local_visible_conversation_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            relative = bridge.archive_chat_snapshot(
+                workspace,
+                resource_kind="requirement",
+                resource_key="req-api",
+                resource_name="实现 / API: 接口",
+                conversation_title="需求拆解 · 实现 API 接口",
+                thread_id="thread/one",
+                provider="codex",
+                phase="planning",
+                terminal_status="completed",
+                turns=[{
+                    "id": "turn-1",
+                    "status": "completed",
+                    "items": [
+                        {"type": "userMessage", "content": [{"type": "text", "text": "请实现接口"}]},
+                        {"type": "reasoning", "content": ["不应写入归档的原始内容"], "summary": ["先检查现有桥接逻辑。"]},
+                        {"type": "commandExecution", "command": "export TOKEN=secret"},
+                        {"type": "agentMessage", "text": "接口已实现。"},
+                    ],
+                }],
+            )
+
+            archive = workspace / relative
+            content = archive.read_text(encoding="utf-8")
+            mode = archive.stat().st_mode & 0o777
+
+        self.assertTrue(relative.as_posix().startswith("Chat/需求/req-api--实现 - API- 接口/"))
+        self.assertIn('threadId: "thread/one"', content)
+        self.assertIn("### 用户\n\n请实现接口", content)
+        self.assertIn("### 推理摘要\n\n先检查现有桥接逻辑。", content)
+        self.assertIn("### 助手\n\n接口已实现。", content)
+        self.assertNotIn("不应写入归档的原始内容", content)
+        self.assertNotIn("TOKEN=secret", content)
+        self.assertIn("<!-- delivery-task-planner-chat-data", content)
+        self.assertEqual(0o600, mode)
+
+    def test_terminal_chat_archive_reads_the_full_thread_and_replaces_the_same_file(self):
+        class Client:
+            def __init__(self):
+                self.request_id = 0
+                self.turns = [{"id": "turn-1", "items": [{"type": "userMessage", "content": "第一轮"}]}]
+
+            def next_request_id(self):
+                self.request_id += 1
+                return self.request_id
+
+            def read_thread(self, thread_id, request_id):
+                self.last_thread_id = thread_id
+                self.last_request_id = request_id
+                return {"turns": self.turns}
+
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            executor = bridge.ExecutionBridge(workspace)
+            client = Client()
+            kwargs = {
+                "config": self.runtime_config(), "program_id": 1,
+                "resource_kind": "task", "resource_key": "task-api", "resource_name": "实现 API",
+                "conversation_title": "实现 API", "thread_id": "thread-1", "provider": "claude",
+                "phase": "development", "terminal_status": "completed",
+            }
+            with patch.object(executor, "_project_content_sync_settings", return_value={"gitEnabled": True}):
+                executor._archive_terminal_chat(client, **kwargs)
+                client.turns.append({"id": "turn-2", "items": [{"type": "agentMessage", "text": "第二轮完成"}]})
+                executor._archive_terminal_chat(client, **kwargs)
+            archives = list((workspace / "Chat").rglob("*.md"))
+            content = archives[0].read_text(encoding="utf-8")
+
+        self.assertEqual("thread-1", client.last_thread_id)
+        self.assertEqual(1, len(archives))
+        self.assertIn("第一轮", content)
+        self.assertIn("第二轮完成", content)
+
+    def test_workspace_chat_archive_restores_a_thread_when_the_executor_is_unavailable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            bridge.archive_chat_snapshot(
+                workspace,
+                resource_kind="task", resource_key="task-api", resource_name="实现 API",
+                conversation_title="实现 API", thread_id="thread-remote", provider="codex",
+                phase="development", terminal_status="completed",
+                turns=[{"id": "turn-1", "status": "completed", "items": [
+                    {"type": "userMessage", "content": "实现接口"},
+                    {"type": "agentMessage", "text": "实现完成。", "phase": "final_answer"},
+                ]}],
+            )
+
+            class Client:
+                def next_request_id(self):
+                    return 1
+
+                def read_thread(self, _thread_id, request_id=None):
+                    raise bridge.BridgeFailure("thread not found")
+
+            executor = bridge.ExecutionBridge(workspace)
+            with patch.object(executor, "_project_chat_archive_enabled", return_value=True):
+                restored = executor._read_thread_with_workspace_archive(
+                    Client(), "thread-remote", "task", "task-api", self.runtime_config(), 1,
+                )
+
+        self.assertEqual("workspaceArchive", restored["source"])
+        self.assertEqual("实现接口", bridge.serialize_turns(restored["turns"])[0]["items"][0]["text"])
+        self.assertEqual("实现完成。", bridge.serialize_turns(restored["turns"])[0]["items"][1]["text"])
+
+    def test_workspace_archive_does_not_override_available_local_executor_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            bridge.archive_chat_snapshot(
+                workspace,
+                resource_kind="requirement", resource_key="req-a", resource_name="旧需求",
+                conversation_title="旧会话", thread_id="thread-1", provider="claude",
+                phase="planning", terminal_status="completed",
+                turns=[{"items": [{"type": "agentMessage", "text": "归档内容"}]}],
+            )
+
+            class Client:
+                def next_request_id(self):
+                    return 1
+
+                def read_thread(self, _thread_id, request_id=None):
+                    return {"turns": [{"items": [{"type": "agentMessage", "text": "本机内容"}]}]}
+
+            result = bridge.ExecutionBridge(workspace)._read_thread_with_workspace_archive(
+                Client(), "thread-1", "requirement", "req-a", self.runtime_config(), 1,
+            )
+
+        self.assertNotIn("source", result)
+        self.assertEqual("本机内容", result["turns"][0]["items"][0]["text"])
+
+    def test_project_git_switch_disables_workspace_chat_archive_and_fallback(self):
+        class Client:
+            def __init__(self):
+                self.read_count = 0
+
+            def next_request_id(self):
+                return 1
+
+            def read_thread(self, _thread_id, request_id=None):
+                self.read_count += 1
+                raise bridge.BridgeFailure("thread not found")
+
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            bridge.archive_chat_snapshot(
+                workspace,
+                resource_kind="task", resource_key="task-api", resource_name="实现 API",
+                conversation_title="实现 API", thread_id="thread-remote", provider="codex",
+                phase="development", terminal_status="completed",
+                turns=[{"items": [{"type": "agentMessage", "text": "本地归档内容"}]}],
+            )
+            executor = bridge.ExecutionBridge(workspace)
+            client = Client()
+            with patch.object(bridge.planner, "request_api", return_value={"gitEnabled": False}):
+                restored = executor._read_thread_with_workspace_archive(
+                    client, "thread-remote", "task", "task-api", self.runtime_config(), 1,
+                )
+
+            self.assertEqual(1, client.read_count)
+            self.assertEqual([], restored.get("turns", []))
+
+            with patch.object(bridge.planner, "request_api", return_value={"gitEnabled": False}):
+                executor._archive_terminal_chat(
+                    client,
+                    config=self.runtime_config(), program_id=1,
+                    resource_kind="task", resource_key="new-task", resource_name="新任务",
+                    conversation_title="新任务", thread_id="thread-new", provider="codex",
+                    phase="development", terminal_status="completed",
+                )
+            self.assertFalse((workspace / "Chat" / "任务" / "new-task--新任务").exists())
+
+    def test_cloud_sync_categories_only_include_selected_project_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            (workspace / "Chat" / "任务").mkdir(parents=True)
+            (workspace / "Chat" / "任务" / "聊天.md").write_text("chat", encoding="utf-8")
+            (workspace / "doc" / "core" / "task-a").mkdir(parents=True)
+            (workspace / "doc" / "core" / "task-a" / "文档.md").write_text("requirement", encoding="utf-8")
+            (workspace / "doc" / "core" / "task-a" / "prototype").mkdir()
+            (workspace / "doc" / "core" / "task-a" / "prototype" / "index.html").write_text("<main/>", encoding="utf-8")
+            entries, skipped = bridge.cloud_sync_workspace_entries(workspace, {"chat", "design"})
+
+        self.assertEqual(0, skipped)
+        self.assertEqual(
+            [("chat", "Chat/任务/聊天.md"), ("design", "doc/core/task-a/prototype/index.html")],
+            [(category, relative) for category, relative, _source, _content_type in entries],
+        )
+
+    def test_cloud_chat_sync_does_not_require_git_or_create_a_workspace_archive(self):
+        class Client:
+            def next_request_id(self):
+                return 1
+
+            def read_thread(self, _thread_id, request_id=None):
+                return {"turns": [{"items": [{"type": "agentMessage", "text": "已完成"}]}]}
+
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            executor = bridge.ExecutionBridge(workspace)
+            uploaded = []
+            with (
+                patch.object(executor, "_project_content_sync_settings", return_value={"gitEnabled": False, "cloudSyncEnabled": True, "cloudSyncScopes": ["chat"]}),
+                patch.object(executor, "_upload_cloud_sync_file", side_effect=lambda *_args: uploaded.append(_args[3])),
+            ):
+                executor._archive_terminal_chat(
+                    Client(), config=self.runtime_config(), program_id=1,
+                    resource_kind="task", resource_key="task-a", resource_name="实现 API",
+                    conversation_title="实现 API", thread_id="thread-1", provider="codex",
+                    phase="development", terminal_status="completed",
+                )
+
+            self.assertEqual(1, len(uploaded))
+            self.assertTrue(uploaded[0].startswith("Chat/任务/task-a--实现 API/"))
+            self.assertFalse((workspace / "Chat").exists())
 
     def test_attachment_store_scopes_uploads_to_the_owning_task(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2196,6 +2605,8 @@ class HttpBridgeTest(unittest.TestCase):
                 return task
             if path == "/delivery/item/execution-session" and method == "GET":
                 return [binding]
+            if path == "/delivery/program" and method == "GET":
+                return {"gitEnabled": False}
             self.fail(f"unexpected request: {method} {path}")
 
         with (
@@ -2876,13 +3287,17 @@ class HttpBridgeTest(unittest.TestCase):
         client.close.side_effect = lambda: order.append("close")
         executor.progress.publish = unittest.mock.MagicMock(side_effect=lambda *_args: order.append("publish"))
 
-        with patch.object(executor, "_sync_result", side_effect=lambda *_args: order.append("sync")):
+        with (
+            patch.object(executor, "_sync_result", side_effect=lambda *_args: order.append("sync")),
+            patch.object(executor, "_archive_terminal_chat") as archive,
+        ):
             executor._follow(
                 ("whatsapp", 1, "a"), client, {}, 1, "a",
                 {"phase": "development"}, {"version": 2}, "turn-1",
             )
 
         self.assertEqual(["sync", "close", "publish", "close"], order)
+        archive.assert_called_once()
 
     def test_reconcile_does_not_scan_projects_without_a_current_user_token(self):
         executor = bridge.ExecutionBridge(Path.cwd())

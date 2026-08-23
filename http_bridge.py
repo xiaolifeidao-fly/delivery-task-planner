@@ -162,6 +162,18 @@ MAX_REQUIREMENT_DOCUMENT_BYTES = 2 * 1024 * 1024
 MAX_REQUIREMENT_PROTOTYPE_FILES = 30
 MAX_REQUIREMENT_PROTOTYPE_FILE_BYTES = 2 * 1024 * 1024
 MAX_REQUIREMENT_PROTOTYPE_TOTAL_BYTES = 8 * 1024 * 1024
+# 每一轮结束后，把面板可见的聊天正文备份到当前项目工作目录。它是可随项目
+# 共享的人工可读副本，不替代 Codex / Claude 保留的原始执行器会话。
+CHAT_ARCHIVE_DIRECTORY_NAME = "Chat"
+CHAT_ARCHIVE_MAX_NAME_BYTES = 96
+CHAT_ARCHIVE_MAX_THREAD_ID_BYTES = 72
+CHAT_ARCHIVE_MAX_FILES_TO_SCAN = 500
+CHAT_ARCHIVE_MAX_FILE_BYTES = 5 * 1024 * 1024
+# 云端同步与 Git 本地归档相互独立：Git 决定 Chat/ 是否落到工作目录，云端开关决定
+# 是否将用户明确选择的内容传给服务端。服务端也会复核这组类别，桥接不能绕过项目设置。
+CLOUD_SYNC_SCOPES = {"chat", "requirement", "design"}
+MAX_CLOUD_SYNC_FILE_BYTES = 8 * 1024 * 1024
+MAX_CLOUD_SYNC_FILES_PER_RUN = 500
 # 需求拆解沉淀下来的需求大纲：每条需求一份，落在该需求的文档目录里。
 REQUIREMENT_OUTLINE_FILE_NAME = "需求大纲.md"
 MAX_REQUIREMENT_OUTLINE_BYTES = 2 * 1024 * 1024
@@ -239,6 +251,13 @@ PHASE_SKILLS = {
     "testing": "delivery-testing-report",
 }
 MAX_PLANNING_CONVERSATIONS = 12
+# 拆解上下文只给当前需求：项目里其他需求的任务清单不再逐轮塞进提示词，
+# 既省上下文，也避免执行器拿无关需求的任务去做去重和依赖判断。
+REQUIREMENT_SCOPE_RULE = (
+    "上面只列出当前需求下的任务。项目里其他需求的任务不在本轮上下文中，"
+    "去重、复用和依赖判断都只在本需求范围内进行；需要参考其他需求或任务时，"
+    "只能用用户在需求详情或聊天里 @ 引用并单独给出的那些，不要自行假设项目里还存在哪些任务。"
+)
 ATTACHMENT_DIRECTORY_NAME = "delivery-task-attachments"
 ARTIFACT_DIRECTORY_NAME = "delivery-task-artifacts"
 ATTACHMENT_MARKER_RE = re.compile(r"<!-- delivery-task-attachments:([A-Za-z0-9_-]+(?:,[A-Za-z0-9_-]+)*) -->")
@@ -775,6 +794,25 @@ class GitEnvironmentSessionStore:
 ENVIRONMENT_SETUP_SESSIONS = GitEnvironmentSessionStore(ENVIRONMENT_SETUP_SESSIONS_PATH)
 
 
+def reasoning_summary_text(item: Any) -> str:
+    """Return only the safe, user-visible summary from a Codex reasoning item.
+
+    The app-server can emit a separate ``reasoning/textDelta`` stream, but that is
+    not the display summary and must never be copied into the task board or its
+    project-local chat archive. ``summary`` is the protocol field intended for
+    explaining the model's reasoning to people.
+    """
+    if not isinstance(item, dict):
+        return ""
+    summary = item.get("summary")
+    if isinstance(summary, str):
+        return summary.strip()
+    if not isinstance(summary, list):
+        return ""
+    parts = [part.strip() for part in summary if isinstance(part, str) and part.strip()]
+    return "\n\n".join(parts)
+
+
 def progress_event_of(message: dict[str, Any]) -> tuple[str, str, str, str] | None:
     method = str(message.get("method") or "")
     params = message.get("params") or {}
@@ -783,6 +821,14 @@ def progress_event_of(message: dict[str, Any]) -> tuple[str, str, str, str] | No
     if method == "turn/completed":
         status = str((params.get("turn") or {}).get("status") or "completed")
         return "status", "正在同步执行结果", f"Codex 回合状态：{status}", "running"
+    # Stream the app-server's display-safe reasoning summary. Deliberately do
+    # not handle item/reasoning/textDelta: that is not the summary API and is
+    # not eligible for task-board storage.
+    if method == "item/reasoning/summaryTextDelta":
+        delta = str(params.get("delta") or "").strip()
+        return ("reasoning", "Codex 推理摘要", delta, "running") if delta else None
+    if method == "item/reasoning/summaryPartAdded":
+        return "reasoning", "Codex 正在生成推理摘要", "", "running"
     if method not in {"item/started", "item/completed"}:
         return None
     item = params.get("item") or {}
@@ -792,6 +838,11 @@ def progress_event_of(message: dict[str, Any]) -> tuple[str, str, str, str] | No
     if item_type == "agentMessage" and completed:
         text = str(item.get("text") or item.get("content") or "").strip()
         return ("message", "Codex 进度", text, status) if text else None
+    if item_type == "reasoning":
+        summary = reasoning_summary_text(item)
+        if summary and completed:
+            return "reasoning", "Codex 推理摘要", summary, status
+        return "reasoning", "Codex 正在生成推理摘要", "", status
     if item_type == "commandExecution":
         command = item.get("command") or item.get("commands") or ""
         if isinstance(command, list):
@@ -1043,11 +1094,33 @@ def build_task_prompt(payload: dict[str, Any], workspace: Path | None = None) ->
 
 def build_task_testing_cases_prompt(
     program_id: int, task: dict[str, Any], context: dict[str, Any], message: str, workspace: Path | None = None,
+    follow_up: bool = False,
 ) -> str:
     """Build a design-only prompt that remains safe while development is in progress."""
     item_key = str(task.get("itemKey") or "").strip()
     if not item_key:
         raise BridgeFailure("任务测试用例缺少任务标识")
+    if follow_up:
+        # 追加回合不重发技能说明和同需求文档清单，只留红线、会变的任务状态和输出格式。
+        return wrap_bridge_context(
+            [
+                "这是同一条任务测试用例会话的追加回合，模式没变：只设计用例，"
+                "绝不调用接口、UI、脚本或构建命令执行真实测试，不得输出验收判定、不得创建测试报告、不得修改业务实现或任务状态。",
+                "首轮已交代过技能、同需求文档清单和输出要求，这里不再重复，按本会话已确认的约定继续。",
+                workspace_instruction(workspace),
+                f"项目 program_id: {program_id}",
+                f"任务键 item_key: {item_key}",
+                f"当前阶段（仅供了解，不可改变）: {task.get('phase') or 'requirement'}/{task.get('status') or 'todo'}",
+                f"任务需求文档: {document_path_of(task)}",
+                f"已知动作执行产物: {'有' if task.get('actionOutput') else '无'}",
+                f"测试用例资产目录: doc/test/{item_key}/；必须写入测试用例.md，按需写入测试计划.md 或其他补充文档。",
+                "研发未完成的部分仍然列为执行前置或待补输入，不得猜造结果。",
+                "最终回复第一行必须是“测试用例已生成”，后面给出测试准备、用例表、执行顺序和待确认项。",
+                "本会话如果被压缩过，先读上面给出的任务需求文档和已生成的测试用例把上下文接回来，不要凭印象往下接。",
+                "本上下文标记闭合之后的内容，是用户额外补充的测试范围、环境、账号来源或数据要求。",
+            ],
+            message or "请继续完善本任务的测试用例。",
+        )
     return wrap_bridge_context(
         [
             "这是交付任务面板的「预先生成测试用例」回合。遵循 delivery-testing-report 技能的测试用例设计模式。",
@@ -1172,10 +1245,6 @@ def build_planning_prompt(
         f"- {item.get('moduleKey')}: {item.get('name') or item.get('moduleKey')}"
         for item in context.get("modules") or []
     ]
-    existing_lines = [
-        f"- {item.get('itemKey')}: {item.get('title') or item.get('itemKey')}"
-        for item in (context.get("items") or [])[:100]
-    ]
     requirement = requirement or {}
     requirement_key = str(requirement.get("requirementKey") or "")
     # 同一条需求可能被反复追问，已经拆出来的任务要显式列出来：
@@ -1198,13 +1267,14 @@ def build_planning_prompt(
             "可用动作：get-task-board-context、create-task-board-stage、create-task-board-module、create-task-board-tasks；"
             f"`{taskboard_command('actions')}` 可以打印全部动作和参数，拿不准时先看它。"
             "当前项目已确定，所有动作的 --program-id 一律传下面给出的项目表数值主键，不要传项目名称或项目编码。",
-            "任务描述应包含目标、范围和验收标准；依赖仅表达真正的前置关系。",
+            "任务描述应包含目标、范围和验收标准；依赖仅表达真正的前置关系，"
+            "depends_on 只能引用本轮新建的任务或下方「本需求已建任务」里的任务键，不要跨需求建立依赖。",
             "每个任务必须传 benefit_tags：用 1-3 个不超过 32 字的简短标签描述该任务完成后带来的收益或作用，不能留空，也不要把任务标题重复写成标签。",
             "任务负责人由写入命令从下面这条需求的主负责人自动继承：任务模型只能保存一位负责人，因此会使用需求的第一位主负责人；不要在任务数组中自行改写负责人。",
             "执行 create-task-board-tasks 时必须原样传入下面给出的 requirement_key 和 phase，让新任务挂回本需求并落在指定的起始阶段。",
             "用户已选择里程碑或模块时，将相同的 stage_key/module_key 传给 create-task-board-tasks 并不要自行改写；未选择时根据当前项目已有选项为每项任务分配归属。",
             "本需求已有任务列表在下方给出：只补齐缺少的部分，不要重建已经存在的任务；若本轮无需新建任务，直接说明原因。",
-            "不重复创建与已有任务语义相同的任务。完成后用简洁中文总结实际创建的里程碑、模块和任务。",
+            "不重复创建与本需求已有任务语义相同的任务。完成后用简洁中文总结实际创建的里程碑、模块和任务。",
         ]
         if write_allowed
         else [
@@ -1214,7 +1284,7 @@ def build_planning_prompt(
             "拆解前必须先勘察下方给出的项目工作目录：加载该目录下项目自己的开发技能（如 backend-development、web-development），读相关目录和现有实现，据此判断需求真正的落点。get-task-board-context 只给出面板侧上下文，不包含工程现状，不能拿它替代看代码。",
             "任务要落到勘察出的真实模块、目录或接口上，不要只按业务名词泛化出通用分层；工作区里找不到需求所指的模块时，先向用户说明并确认工作目录或范围，不要硬拆。",
             "请与用户对话把需求问清楚，然后输出一份可评审的拆解预览：先用 Markdown 表格列出「序号 / 任务标题 / 收益标签 / 负责人 / 里程碑 / 模块 / 类型 / 前置依赖」，每项给 1-3 个简短收益或作用标签；负责人统一展示为该需求的第一位主负责人（未指定则标为未指派）；再在表格下方逐条补充目标、范围和验收标准。",
-            "里程碑、模块、类型的取值只能来自下方给出的现有选项；预览里也要说明哪些是新建、哪些复用已有任务。",
+            "里程碑、模块、类型的取值只能来自下方给出的现有选项；预览里也要说明哪些是新建、哪些复用本需求已有任务。",
             "本需求已有任务列表在下方给出：预览里只列本轮打算新增的任务，不要重复已经存在的任务。",
             "回复结尾提示用户：确认无误后点击输入框旁的「确认并写入」按钮，需要调整就直接回复修改意见，本轮继续讨论不会写入任何数据。",
         ]
@@ -1361,11 +1431,117 @@ def build_planning_prompt(
         "现有里程碑:", *(stage_lines or ["- 无"]),
         "现有模块:", *(module_lines or ["- 无"]),
         "本需求已建任务:", *(requirement_item_lines or ["- 无"]),
-        "项目全部任务（用于去重与依赖）:", *(existing_lines or ["- 无"]),
+        REQUIREMENT_SCOPE_RULE,
         "",
         "本上下文标记闭合之后的内容，是用户本轮输入的原文。",
     ]
     return wrap_bridge_context(instruction, message)
+
+
+def planning_detail_digest(requirement: dict[str, Any] | None) -> str:
+    """需求正文的指纹。续聊回合靠它判断用户是不是在面板上改过需求详情。"""
+    detail = str((requirement or {}).get("detail") or "")
+    return hashlib.sha256(detail.encode("utf-8")).hexdigest()
+
+
+def build_planning_follow_up_prompt(
+    program_id: int,
+    context: dict[str, Any],
+    message: str,
+    selected_stage: str = "",
+    selected_module: str = "",
+    selected_kind: str = "",
+    requirement: dict[str, Any] | None = None,
+    workspace: Path | None = None,
+    mention_context: list[str] | None = None,
+    include_detail: bool = False,
+) -> str:
+    """同一条需求拆解会话的追加回合，只带会变的和丢不起的那几项。
+
+    首轮的角色说明、勘察纪律、文档目录纪律和现有里程碑/模块明细不再逐轮重发；这里保留三类：
+    随轮次变化的（已选里程碑/模块、改动过的需求正文、本轮 @ 的实体）、
+    被会话压缩掉就会出事的（本需求已建任务清单、需求大纲读写纪律），
+    以及取值必须合法的现有里程碑/模块键。确认写入那一轮仍走 build_planning_prompt 全量。
+    """
+    requirement = requirement or {}
+    requirement_key = str(requirement.get("requirementKey") or "")
+    requirement_item_lines = [
+        f"- {item.get('itemKey')}: {item.get('title') or item.get('itemKey')}"
+        f"（{item.get('phase') or '-'}/{item.get('status') or '-'}；收益：{'、'.join(item.get('benefitTags') or []) or '未标注'}）"
+        for item in context.get("items") or []
+        if requirement_key and str(item.get("requirementKey") or "") == requirement_key
+    ][:100]
+    stage_keys = [str(item.get("stageKey") or "") for item in context.get("stages") or [] if item.get("stageKey")]
+    module_keys = [str(item.get("moduleKey") or "") for item in context.get("modules") or [] if item.get("moduleKey")]
+    split_tasks = bool(requirement.get("splitTasks", True))
+    outline_path = requirement_outline_path_of(requirement_key).as_posix() if requirement_key else ""
+    document_directory = requirement_document_directory_of(requirement_key).as_posix() if requirement_key else ""
+    # 大纲还没落盘时，需求正文在本会话里只存在于首轮那条消息，会话一被压缩就彻底没了；
+    # 这种情况下每轮都重发正文，直到大纲写出来接管这份沉淀。
+    outline_written = readable_document(workspace, outline_path)
+    detail_lines = (
+        [
+            "需求详细信息（用户已在面板上改过，以这一版为准）:"
+            if include_detail
+            else "需求详细信息（需求大纲尚未落盘，这里重发一份，避免会话压缩后丢失）:",
+            str(requirement.get("detail") or "（未填写）"),
+        ]
+        if include_detail or not outline_written
+        else [
+            "需求详细信息与本会话首轮给出的一致，没有变化；"
+            f"若上下文里已经找不到，就去读 `{outline_path}` 里已确认的需求背景与范围。",
+        ]
+    )
+    prototype_lines = (
+        [
+            "本需求已启用“拆解后生成原型图”：预览的任务表最后必须固定列出一条“生成需求原型图”任务，"
+            "并说明它依赖本轮其余任务。",
+        ]
+        if bool(requirement.get("generatePrototype")) else []
+    )
+    document_lines = (
+        [
+            f"需求文档目录: `{document_directory}/`（`需求大纲.md` 是主文档）。用户要独立流程图、图表、HTML 等资产时，"
+            "写成该目录下的独立文件，不要写进 `.codex/visualizations`、临时目录或工作区外路径；除该目录外不修改工作区其他文件。",
+        ]
+        if document_directory else []
+    )
+    lines = [
+        "这是同一条需求拆解会话的追加回合：需求和梳理模式都没有变化，本轮仍然只做梳理和预览，"
+        "禁止执行 create-task-board-tasks、create-task-board-stage、create-task-board-module，也不要绕过任务面板写入限制。",
+        "首轮已经交代过角色、技能、勘察纪律和输出格式，这里不再重复，按本会话已确认的约定继续；"
+        "拆解结论仍然要落在工作目录里的真实模块、目录或接口上。",
+        workspace_instruction(workspace),
+        f"项目 program_id: {program_id}",
+        f"需求键 requirement_key: {requirement_key or '未指定'}",
+        f"需求名称: {requirement.get('name') or '未命名'}",
+        f"拆解成多条任务: {'是' if split_tasks else '否（预览里只输出一条覆盖整条需求的任务，不要拆分也不要串依赖）'}",
+        *detail_lines,
+        f"已选里程碑: {selected_stage or '未选择'}",
+        f"已选模块: {selected_module or '未选择'}",
+        f"任务类型偏好: {selected_kind or '由你判断'}",
+        f"现有里程碑键（取值只能从中选）: {'、'.join(stage_keys) or '无'}",
+        f"现有模块键（取值只能从中选）: {'、'.join(module_keys) or '无'}",
+        *requirement_outline_rule_lines(outline_path),
+        *document_lines,
+        *prototype_lines,
+        *(mention_context or []),
+        "本需求已建任务:",
+        *(requirement_item_lines or ["- 无"]),
+        REQUIREMENT_SCOPE_RULE,
+        "预览里只列本轮打算新增的任务，不要重复上面已经存在的任务；"
+        "输出格式沿用首轮：先用 Markdown 表格列出「序号 / 任务标题 / 收益标签 / 负责人 / 里程碑 / 模块 / 类型 / 前置依赖」，"
+        "再在表格下方逐条补充目标、范围和验收标准；"
+        "回复结尾照旧提示用户：确认无误后点「确认并写入」，要调整就直接回复修改意见。",
+        (
+            f"本会话如果被压缩过，上面提到的需求背景和既往结论你在上下文里可能已经找不到："
+            f"先读 `{outline_path}` 把上下文接回来再动手，不要凭印象往下接。"
+            if outline_path
+            else "本会话如果被压缩过，先向用户确认需求背景和既往结论，不要凭印象往下接。"
+        ),
+        "本上下文标记闭合之后的内容，是用户本轮输入的原文。",
+    ]
+    return wrap_bridge_context(lines, message)
 
 
 def build_requirement_testing_prompt(
@@ -1375,6 +1551,8 @@ def build_requirement_testing_prompt(
     message: str,
     workspace: Path | None = None,
     test_case_only: bool = False,
+    follow_up: bool = False,
+    include_detail: bool = False,
 ) -> str:
     """Give the requirement-level testing skill one requirement and its real task inventory."""
     requirement_key = str(requirement.get("requirementKey") or "").strip()
@@ -1407,6 +1585,35 @@ def build_requirement_testing_prompt(
         if test_case_only else
         "最终必须把完整报告写入 doc/test/<需求键>/测试报告.md，并且最终回复第一行给出“验收判定：通过 / 不通过 / 受阻”。"
     )
+    if follow_up:
+        # 关联任务清单每轮都要刷新：任务状态、产物和报告在测试过程中会变，那是这类会话真正的工作数据。
+        # 重复的技能说明、目录划分和需求正文才是该省的。
+        return wrap_bridge_context(
+            [
+                "这是同一条需求测试会话的追加回合，模式没变："
+                + (
+                    "仍然只设计用例，绝不调用接口、UI、脚本或构建命令执行真实测试，不得输出验收判定或覆盖测试报告。"
+                    if test_case_only
+                    else "按已有用例真实验证，没有明确执行和证据不得写通过。"
+                ),
+                "首轮已交代过技能、目录划分和输出要求，这里不再重复，按本会话已确认的约定继续。",
+                workspace_instruction(workspace),
+                f"项目 program_id: {program_id}",
+                f"需求键 requirement_key: {requirement_key}",
+                *(
+                    ["需求详情（用户已在面板上改过，以这一版为准）:", str(requirement.get("detail") or "（未填写）")]
+                    if include_detail
+                    else ["需求详情与本会话首轮一致，没有变化；若上下文里已经找不到，读本需求的大纲和任务文档接回来。"]
+                ),
+                f"需求总体测试资产目录: doc/test/{requirement_key}/（计划、报告、脚本、夹具和证据都归档到这里）。",
+                "关联任务清单（状态每轮刷新；按需读对应文档、产物和代码，清单不是完整上下文）：",
+                *(item_lines or ["- 该需求目前没有关联任务；先说明总体测试范围和受阻项，不要假装已覆盖任务链路。"]),
+                final_instruction,
+                "本会话如果被压缩过，先读上面的测试资产目录和任务文档把上下文接回来，不要凭印象往下接。",
+                "本上下文标记闭合之后的内容，是用户本轮补充的测试要求、环境或数据说明。",
+            ],
+            message,
+        )
     return wrap_bridge_context(
         [
             *mode_lines,
@@ -2899,15 +3106,45 @@ def requirement_prototype_files(workspace: Path, requirement_key: str) -> tuple[
     return relative_directory.as_posix(), files
 
 
+def prototype_session_detail_digest(rows: list[dict[str, Any]], thread_id: str) -> str:
+    """取出这条原型会话上次发过的需求正文指纹；取不到就当正文变过，重发一份更安全。"""
+    row = next((item for item in rows if str(item.get("threadId") or "") == thread_id), None)
+    metadata = row.get("metadata") if isinstance(row, dict) and isinstance(row.get("metadata"), dict) else {}
+    return str(metadata.get("detailDigest") or "")
+
+
 def build_requirement_prototype_prompt(
     program_id: int,
     requirement: dict[str, Any],
     message: str,
     workspace: Path,
     editing: bool = False,
+    follow_up: bool = False,
+    include_detail: bool = False,
 ) -> str:
     requirement_key = str(requirement.get("requirementKey") or "").strip()
     prototype_path = requirement_prototype_directory_of(requirement_key).as_posix()
+    if follow_up:
+        # 续聊只保留写入范围这条红线和会变的需求正文；页面本身就在目录里，模型自己读得到。
+        return wrap_bridge_context(
+            [
+                "这是同一条需求原型会话的追加回合：继续在当前工作区调整这套 HTML 原型，"
+                "保留未被本轮要求修改的内容，不要推倒重来。",
+                workspace_instruction(workspace),
+                f"项目 program_id: {program_id}",
+                f"需求键: {requirement_key}",
+                *(
+                    ["需求详情（用户已在面板上改过，以这一版为准）:", str(requirement.get("detail") or "（未填写）")]
+                    if include_detail
+                    else ["需求详情与本会话首轮一致，没有变化；若上下文里已经找不到，直接读原型目录下现有页面接回来。"]
+                ),
+                f"原型目录（唯一允许写入的目录）: `{prototype_path}/`。只能创建或修改该目录下的 UTF-8 `.html` / `.htm` 文件，"
+                "不得修改业务代码、配置、依赖或该目录以外的文件。",
+                "页面仍需可独立在浏览器打开，使用内联 CSS/JS 或本地无依赖资源，不引用远程资源。",
+                "完成后在最终回复列出改动过的相对路径和改动摘要。",
+            ],
+            message or "请按上述要求调整现有 HTML 原型。",
+        )
     context_lines = [
         "这是交付任务面板的需求 HTML 原型任务。直接在当前工作区完成，不要只给建议。",
         workspace_instruction(workspace),
@@ -3391,6 +3628,10 @@ class AppServerClient:
             turn_params["model"] = model
         if reasoning_effort:
             turn_params["effort"] = reasoning_effort
+        # ``auto`` asks Codex for the most detailed supported *summary*, never
+        # for raw reasoning. The resulting summary is streamed and retained
+        # below as part of the task-board conversation.
+        turn_params["summary"] = "auto"
         self.send(
             "turn/start",
             3,
@@ -3427,6 +3668,7 @@ class AppServerClient:
             params["model"] = model
         if reasoning_effort:
             params["effort"] = reasoning_effort
+        params["summary"] = "auto"
         self.send(
             "turn/start",
             request_id,
@@ -4173,6 +4415,181 @@ class ExecutionBridge:
         catalog = session.get("catalog") or []
         return [dict(entry) for entry in catalog if isinstance(entry, dict) and entry.get("threadId")]
 
+    def _project_content_sync_settings(self, config: dict[str, Any], program_id: int) -> dict[str, Any]:
+        """Read the authoritative project-level switches; failures deliberately fail closed."""
+        if program_id <= 0:
+            return {}
+        try:
+            program = planner.request_api(
+                config,
+                "GET",
+                "/delivery/program",
+                query={"programId": program_id},
+            )
+        except planner.ToolFailure as exc:
+            print(f"读取项目内容同步配置失败，跳过本地/云端归档：{program_id}: {exc}", file=sys.stderr, flush=True)
+            return {}
+        return program if isinstance(program, dict) else {}
+
+    def _project_chat_archive_enabled(self, config: dict[str, Any], program_id: int) -> bool:
+        """The project-level Git switch is the explicit opt-in for workspace Chat/ archives."""
+        return bool(self._project_content_sync_settings(config, program_id).get("gitEnabled"))
+
+    @staticmethod
+    def _project_cloud_sync_scopes(program: dict[str, Any]) -> set[str]:
+        if not bool(program.get("cloudSyncEnabled")):
+            return set()
+        raw_scopes = program.get("cloudSyncScopes")
+        if not isinstance(raw_scopes, list):
+            return set()
+        return {str(scope).strip() for scope in raw_scopes if str(scope).strip() in CLOUD_SYNC_SCOPES}
+
+    @staticmethod
+    def _upload_cloud_sync_file(
+        config: dict[str, Any],
+        program_id: int,
+        category: str,
+        relative_path: str,
+        content_type: str,
+        content: bytes,
+    ) -> None:
+        if category not in CLOUD_SYNC_SCOPES:
+            raise BridgeFailure("云端同步类别无效")
+        if len(content) > MAX_CLOUD_SYNC_FILE_BYTES:
+            raise BridgeFailure(f"云端同步文件不能超过 8MB：{relative_path}")
+        planner.request_api(
+            config,
+            "POST",
+            "/delivery/cloud-sync/file",
+            body={
+                "programId": program_id,
+                "category": category,
+                "relativePath": relative_path,
+                "contentType": content_type,
+                "contentBase64": base64.b64encode(content).decode("ascii"),
+                "actorName": "delivery-http-bridge",
+            },
+        )
+
+    def _sync_workspace_cloud_files(
+        self,
+        config: dict[str, Any],
+        program_id: int,
+        scopes: set[str],
+    ) -> dict[str, Any]:
+        entries, skipped = cloud_sync_workspace_entries(self.workspace, scopes)
+        uploaded: list[str] = []
+        for category, relative, source, content_type in entries:
+            self._upload_cloud_sync_file(
+                config, program_id, category, relative, content_type, source.read_bytes(),
+            )
+            uploaded.append(relative)
+        return {
+            "enabled": bool(scopes), "scopes": sorted(scopes),
+            "uploaded": len(uploaded), "skipped": skipped, "files": uploaded,
+        }
+
+    def sync_cloud_workspace(self, program_id: int, config: dict[str, Any]) -> dict[str, Any]:
+        """Manually sync the currently selected project workspace without exposing its absolute path."""
+        assert_runtime_project(config, program_id)
+        program = self._project_content_sync_settings(config, program_id)
+        scopes = self._project_cloud_sync_scopes(program)
+        if not scopes:
+            return {"enabled": False, "scopes": [], "uploaded": 0, "skipped": 0, "files": []}
+        return self._sync_workspace_cloud_files(config, program_id, scopes)
+
+    def _archive_terminal_chat(
+        self,
+        client: Any,
+        *,
+        config: dict[str, Any],
+        program_id: int,
+        resource_kind: str,
+        resource_key: str,
+        resource_name: str,
+        conversation_title: str,
+        thread_id: str,
+        provider: str,
+        phase: str,
+        terminal_status: str,
+    ) -> None:
+        """Best-effort workspace archive; failures must not hide the task result."""
+        program = self._project_content_sync_settings(config, program_id)
+        archive_to_workspace = bool(program.get("gitEnabled"))
+        cloud_scopes = self._project_cloud_sync_scopes(program)
+        if not archive_to_workspace and not cloud_scopes:
+            return
+        try:
+            if thread_id and (archive_to_workspace or "chat" in cloud_scopes):
+                thread = client.read_thread(thread_id, request_id=client.next_request_id())
+                turns = thread.get("turns") if isinstance(thread, dict) else []
+                relative = chat_archive_relative_path(resource_kind, resource_key, resource_name, thread_id, phase)
+                if archive_to_workspace:
+                    relative = archive_chat_snapshot(
+                        self.workspace,
+                        resource_kind=resource_kind,
+                        resource_key=resource_key,
+                        resource_name=resource_name,
+                        conversation_title=conversation_title,
+                        thread_id=thread_id,
+                        provider=provider,
+                        phase=phase,
+                        terminal_status=terminal_status,
+                        turns=turns,
+                    )
+                    print(f"聊天记录已归档：{relative.as_posix()}", file=sys.stderr, flush=True)
+                if "chat" in cloud_scopes:
+                    self._upload_cloud_sync_file(
+                        config,
+                        program_id,
+                        "chat",
+                        relative.as_posix(),
+                        "text/markdown; charset=utf-8",
+                        archived_chat_text(
+                            resource_kind=resource_kind,
+                            resource_key=resource_key,
+                            resource_name=resource_name,
+                            conversation_title=conversation_title,
+                            thread_id=thread_id,
+                            provider=provider,
+                            phase=phase,
+                            terminal_status=terminal_status,
+                            turns=turns,
+                        ).encode("utf-8"),
+                    )
+            document_scopes = cloud_scopes - {"chat"}
+            if document_scopes:
+                self._sync_workspace_cloud_files(config, program_id, document_scopes)
+        except Exception as exc:
+            print(f"归档或云端同步失败：{resource_kind}/{resource_key}/{thread_id}: {exc}", file=sys.stderr, flush=True)
+
+    def _read_thread_with_workspace_archive(
+        self,
+        client: Any,
+        thread_id: str,
+        resource_kind: str,
+        resource_key: str,
+        config: dict[str, Any],
+        program_id: int,
+    ) -> dict[str, Any]:
+        """Prefer the executor's local history, then fall back to this workspace's Chat archive."""
+        thread = read_thread_or_empty(client, thread_id)
+        turns = thread.get("turns") if isinstance(thread, dict) else None
+        if isinstance(turns, list) and turns:
+            return thread
+        if not self._project_chat_archive_enabled(config, program_id):
+            return thread
+        archived = read_workspace_chat_archive(self.workspace, resource_kind, resource_key, thread_id)
+        archived_turns = archived.get("turns") if isinstance(archived, dict) else None
+        if isinstance(archived_turns, list) and archived_turns:
+            print(
+                f"本机执行器未返回会话正文，已从项目聊天归档读取：{resource_kind}/{resource_key}/{thread_id}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return archived
+        return thread
+
     def _planning_result(self, config: dict[str, Any], program_id: int, baseline: dict[str, set[str]]) -> dict[str, Any]:
         assert_runtime_project(config, program_id)
         context = planner.project_context(config, program_id)
@@ -4233,6 +4650,7 @@ class ExecutionBridge:
             "stageKey": str(metadata.get("stageKey") or ""),
             "moduleKey": str(metadata.get("moduleKey") or ""),
             "kind": str(metadata.get("kind") or ""),
+            "detailDigest": str(metadata.get("detailDigest") or ""),
             "requirementKey": requirement_key,
             "baseline": {name: set(baseline.get(name) or []) for name in ("items", "stages", "modules")},
             "result": metadata.get("result") if isinstance(metadata.get("result"), dict) else {},
@@ -4261,6 +4679,7 @@ class ExecutionBridge:
             "stageKey": str(session.get("stageKey") or ""),
             "moduleKey": str(session.get("moduleKey") or ""),
             "kind": str(session.get("kind") or ""),
+            "detailDigest": str(session.get("detailDigest") or ""),
             "baseline": {name: sorted(values) for name, values in (session.get("baseline") or {}).items()},
             "result": result,
         }
@@ -4344,7 +4763,9 @@ class ExecutionBridge:
         )
         close_after = active is None or active.get("threadId") != thread_id
         try:
-            thread = read_thread_or_empty(client, thread_id)
+            thread = self._read_thread_with_workspace_archive(
+                client, thread_id, "requirement", requirement_key, config, program_id,
+            )
             planning_item_key = self._planning_item_key(requirement_key)
             for entry in catalog:
                 entry["active"] = bool(active is not None and entry.get("threadId") == active.get("threadId"))
@@ -4476,12 +4897,14 @@ class ExecutionBridge:
                 "moduleKey": selected_module,
                 "kind": selected_kind,
                 "requirementKey": requirement_key,
+                "detailDigest": planning_detail_digest(requirement),
                 "baseline": baseline,
                 "result": {"items": [], "stages": [], "modules": [], "itemKeys": [], "stageKeys": [], "moduleKeys": [], "updatedAt": ""},
                 "catalog": [*catalog, {"threadId": thread_id, "title": title, "createdAt": utc_now(), "updatedAt": utc_now(), "status": "running", "active": True}],
             }
         else:
             thread_id = requested_thread_id or str(session.get("threadId") or "")
+            detail_digest = planning_detail_digest(requirement)
             client = create_ai_client(
                 provider,
                 self.workspace,
@@ -4490,14 +4913,21 @@ class ExecutionBridge:
             )
             try:
                 client.resume_thread(thread_id)
-                # 续聊也要重新带上需求上下文和该需求已建任务：会话可能已经被压缩，
-                # 而「不要重复建任务」这条约束正是靠这份清单成立的。
+                # 追加回合不重发首轮那整段拆解纪律，只带会变的和丢不起的：本需求已建任务清单
+                # （「不要重复建任务」这条约束正是靠它成立，会话被压缩后必须还在）、大纲读写纪律、
+                # 本轮的选择与 @ 引用。确认写入是另一套指令（写入契约、命令行动作），仍然走全量。
+                follow_up_prompt = (
+                    build_planning_prompt(program_id, context, message, selected_stage, selected_module, selected_kind, requirement, True, self.workspace, mention_context)
+                    if confirm_write
+                    else build_planning_follow_up_prompt(
+                        program_id, context, message, selected_stage, selected_module, selected_kind, requirement,
+                        self.workspace, mention_context,
+                        include_detail=detail_digest != str(session.get("detailDigest") or ""),
+                    )
+                )
                 turn_id = client.start_turn(
                     thread_id,
-                    message_with_attachments(
-                        build_planning_prompt(program_id, context, message, selected_stage, selected_module, selected_kind, requirement, confirm_write, self.workspace, mention_context),
-                        attachments,
-                    ),
+                    message_with_attachments(follow_up_prompt, attachments),
                     attachments,
                     request_id=client.next_request_id(),
                     model=model,
@@ -4507,7 +4937,7 @@ class ExecutionBridge:
             except Exception:
                 client.close()
                 raise
-            session.update({"threadId": thread_id, "turnId": turn_id, "stageKey": selected_stage or session.get("stageKey") or "", "moduleKey": selected_module or session.get("moduleKey") or "", "kind": selected_kind or session.get("kind") or ""})
+            session.update({"threadId": thread_id, "turnId": turn_id, "detailDigest": detail_digest, "stageKey": selected_stage or session.get("stageKey") or "", "moduleKey": selected_module or session.get("moduleKey") or "", "kind": selected_kind or session.get("kind") or ""})
             for entry in session.get("catalog") or []:
                 if entry.get("threadId") == thread_id:
                     entry["status"] = "running"
@@ -4569,6 +4999,24 @@ class ExecutionBridge:
         status = "failed"
         try:
             status = client.wait_turn(turn_id)
+            entry = next(
+                (item for item in session.get("catalog") or [] if str(item.get("threadId") or "") == thread_id),
+                {},
+            )
+            title = str(entry.get("title") or "需求拆解")
+            self._archive_terminal_chat(
+                client,
+                config=config,
+                program_id=program_id,
+                resource_kind="requirement",
+                resource_key=requirement_key,
+                resource_name=title,
+                conversation_title=title,
+                thread_id=thread_id,
+                provider=provider,
+                phase="planning",
+                terminal_status=status,
+            )
             session["result"] = self._planning_result(config, program_id, session["baseline"])
             session["turnId"] = turn_id
             for entry in session.get("catalog") or []:
@@ -4888,6 +5336,7 @@ class ExecutionBridge:
         metadata = current.get("metadata") if isinstance(current.get("metadata"), dict) else {}
         return {
             "threadId": str(current.get("threadId") or ""), "turnId": str(metadata.get("turnId") or ""),
+            "detailDigest": str(metadata.get("detailDigest") or ""),
             "requirementKey": requirement_key, "catalog": catalog,
         }
 
@@ -4907,6 +5356,7 @@ class ExecutionBridge:
                     "status": str(entry.get("status") or "running"),
                     "metadata": {
                         "turnId": str(session.get("turnId") or ""), "kind": "requirement-testing",
+                        "detailDigest": str(session.get("detailDigest") or ""),
                         "workspace": self.workspace.name,
                     },
                     "actorName": f"{provider}-http-bridge",
@@ -4987,7 +5437,9 @@ class ExecutionBridge:
         )
         close_after = active is None or active.get("threadId") != selected_thread_id
         try:
-            thread = read_thread_or_empty(client, selected_thread_id)
+            thread = self._read_thread_with_workspace_archive(
+                client, selected_thread_id, "requirement", requirement_key, config, program_id,
+            )
             item_key = self._requirement_testing_item_key(requirement_key)
             for entry in catalog:
                 entry["active"] = bool(active is not None and entry.get("threadId") == active.get("threadId"))
@@ -5060,10 +5512,12 @@ class ExecutionBridge:
                 raise
             session = {
                 "threadId": thread_id, "turnId": turn_id, "requirementKey": requirement_key,
+                "detailDigest": planning_detail_digest(requirement),
                 "catalog": [*catalog, {"threadId": thread_id, "title": title, "createdAt": utc_now(), "updatedAt": utc_now(), "status": "running", "active": True}],
             }
         else:
             thread_id = requested_thread_id or str(session.get("threadId") or "")
+            detail_digest = planning_detail_digest(requirement)
             client = create_ai_client(
                 provider, self.workspace, lambda event: self._publish_app_server_event(identity, event),
                 codex_environment(config, program_id, write_allowed=True),
@@ -5071,13 +5525,16 @@ class ExecutionBridge:
             try:
                 client.resume_thread(thread_id)
                 turn_id = client.start_turn(
-                    thread_id, message_with_attachments(build_requirement_testing_prompt(program_id, context, requirement, message, self.workspace, test_case_only), attachments), attachments,
+                    thread_id, message_with_attachments(build_requirement_testing_prompt(
+                        program_id, context, requirement, message, self.workspace, test_case_only,
+                        follow_up=True, include_detail=detail_digest != str(session.get("detailDigest") or ""),
+                    ), attachments), attachments,
                     request_id=client.next_request_id(), model=model, reasoning_effort=reasoning_effort, fast_mode=fast_mode,
                 )
             except Exception:
                 client.close()
                 raise
-            session.update({"threadId": thread_id, "turnId": turn_id})
+            session.update({"threadId": thread_id, "turnId": turn_id, "detailDigest": detail_digest})
             for entry in session.get("catalog") or []:
                 if entry.get("threadId") == thread_id:
                     entry.update({"status": "running", "active": True, "updatedAt": utc_now()})
@@ -5124,6 +5581,24 @@ class ExecutionBridge:
     ) -> None:
         try:
             turn_status = client.wait_turn(turn_id)
+            entry = next(
+                (item for item in session.get("catalog") or [] if str(item.get("threadId") or "") == thread_id),
+                {},
+            )
+            title = str(entry.get("title") or ("需求测试用例" if test_case_only else "需求总体测试"))
+            self._archive_terminal_chat(
+                client,
+                config=config,
+                program_id=program_id,
+                resource_kind="requirement",
+                resource_key=requirement_key,
+                resource_name=title,
+                conversation_title=title,
+                thread_id=thread_id,
+                provider=provider,
+                phase="testing-cases" if test_case_only else "testing",
+                terminal_status=turn_status,
+            )
             turn = client.read_turn(thread_id, turn_id, request_id=client.next_request_id())
             report = final_agent_text_from_output(execution_output(turn_status, turn))
             verdict = testing_verdict_from_output(report)
@@ -5593,7 +6068,9 @@ class ExecutionBridge:
             )
             close_after = True
         try:
-            thread = read_thread_or_empty(client, thread_id)
+            thread = self._read_thread_with_workspace_archive(
+                client, thread_id, "task", item_key, config, program_id,
+            )
             for entry in catalog:
                 entry["active"] = bool(active_for_thread is not None and entry.get("threadId") == thread_id)
                 if not entry["active"] and entry.get("status") == "running":
@@ -5719,7 +6196,9 @@ class ExecutionBridge:
                 title = ""
                 client.resume_thread(thread_id)
                 turn_id = client.start_turn(
-                    thread_id, build_task_testing_cases_prompt(program_id, task, context, message, self.workspace),
+                    thread_id, build_task_testing_cases_prompt(
+                        program_id, task, context, message, self.workspace, follow_up=True,
+                    ),
                     request_id=client.next_request_id(), model=model, reasoning_effort=reasoning_effort, fast_mode=fast_mode,
                 )
             refreshed_binding = self._bind_task_testing_cases_session(
@@ -5789,6 +6268,20 @@ class ExecutionBridge:
     ) -> None:
         try:
             turn_status = client.wait_turn(turn_id)
+            task_name = str((task or {}).get("title") or item_key)
+            self._archive_terminal_chat(
+                client,
+                config=config,
+                program_id=program_id,
+                resource_kind="task",
+                resource_key=item_key,
+                resource_name=task_name,
+                conversation_title=f"{task_name} · 测试用例",
+                thread_id=thread_id,
+                provider=provider,
+                phase="testing-cases",
+                terminal_status=turn_status,
+            )
             turn = client.read_turn(thread_id, turn_id, request_id=client.next_request_id())
             cases = final_agent_text_from_output(execution_output(turn_status, turn))
             status = "ready" if turn_status == "completed" and cases.strip() else "blocked"
@@ -6666,7 +7159,9 @@ class ExecutionBridge:
             client = create_ai_client(provider, self.workspace, environment=codex_environment(config, program_id))
             close_after = True
         try:
-            thread = read_thread_or_empty(client, thread_id)
+            thread = self._read_thread_with_workspace_archive(
+                client, thread_id, "task", item_key, config, program_id,
+            )
             self.attachments.recover_generated_images(config_biz_line(config), program_id, item_key, thread_id)
             turns = ensure_terminal_result(
                 serialize_turns(
@@ -6939,6 +7434,7 @@ class ExecutionBridge:
         turn_id: str,
         title: str,
         status: str,
+        detail_digest: str = "",
     ) -> None:
         planner.request_api(
             config,
@@ -6951,7 +7447,12 @@ class ExecutionBridge:
                 "threadId": thread_id,
                 "title": title[:120],
                 "status": status,
-                "metadata": {"turnId": turn_id, "kind": "requirement-prototype", "workspace": self.workspace.name},
+                "metadata": {
+                    "turnId": turn_id,
+                    "kind": "requirement-prototype",
+                    "detailDigest": detail_digest,
+                    "workspace": self.workspace.name,
+                },
                 "actorName": f"{provider}-http-bridge",
             },
         )
@@ -7035,8 +7536,10 @@ class ExecutionBridge:
         message: str = "",
         editing: bool = False,
         thread_id: str = "",
+        previous_detail_digest: str = "",
     ) -> dict[str, Any]:
         identity = self._requirement_prototype_identity(program_id, requirement_key)
+        detail_digest = planning_detail_digest(requirement)
         title = f"需求原型 · {str(requirement.get('name') or requirement_key).strip()}"[:120]
         client = create_ai_client(
             provider,
@@ -7045,7 +7548,11 @@ class ExecutionBridge:
             codex_environment(config, program_id),
         )
         try:
-            prompt = build_requirement_prototype_prompt(program_id, requirement, message, self.workspace, editing=editing)
+            prompt = build_requirement_prototype_prompt(
+                program_id, requirement, message, self.workspace, editing=editing,
+                follow_up=bool(thread_id),
+                include_detail=detail_digest != previous_detail_digest,
+            )
             if thread_id:
                 client.resume_thread(thread_id)
                 turn_id = client.start_turn(
@@ -7065,7 +7572,7 @@ class ExecutionBridge:
                     fast_mode=fast_mode,
                 )
             self._save_prototype_session(
-                config, program_id, requirement_key, provider, thread_id, turn_id, title, "running",
+                config, program_id, requirement_key, provider, thread_id, turn_id, title, "running", detail_digest,
             )
         except Exception:
             client.close()
@@ -7085,7 +7592,7 @@ class ExecutionBridge:
         self.progress.publish(identity, "status", "正在生成需求 HTML 原型" if not editing else "正在修改需求 HTML 原型", title, "running")
         threading.Thread(
             target=self._follow_requirement_prototype,
-            args=(identity, client, config, program_id, requirement_key, provider, thread_id, turn_id, title),
+            args=(identity, client, config, program_id, requirement_key, provider, thread_id, turn_id, title, detail_digest),
             daemon=True,
         ).start()
         return {
@@ -7146,7 +7653,9 @@ class ExecutionBridge:
         )
         close_after = active is None or active.get("threadId") != selected_thread_id
         try:
-            thread = read_thread_or_empty(client, selected_thread_id)
+            thread = self._read_thread_with_workspace_archive(
+                client, selected_thread_id, "requirement", requirement_key, config, program_id,
+            )
             item_key = requirement_prototype_item_key(requirement_key)
             return {
                 "programId": program_id,
@@ -7181,6 +7690,7 @@ class ExecutionBridge:
         known_thread_ids = {str(row.get("threadId") or "") for row in rows}
         if requested_thread_id and requested_thread_id not in known_thread_ids:
             raise BridgeFailure("所选原型编辑会话不存在")
+        selected_thread_id = requested_thread_id or str((rows[-1] if rows else {}).get("threadId") or "")
         return self._start_requirement_prototype(
             config,
             program_id,
@@ -7192,7 +7702,8 @@ class ExecutionBridge:
             fast_mode_of(raw, provider),
             message=message,
             editing=True,
-            thread_id=requested_thread_id or str((rows[-1] if rows else {}).get("threadId") or ""),
+            thread_id=selected_thread_id,
+            previous_detail_digest=prototype_session_detail_digest(rows, selected_thread_id),
         )
 
     def _follow_requirement_prototype(
@@ -7206,10 +7717,24 @@ class ExecutionBridge:
         thread_id: str,
         turn_id: str,
         title: str,
+        detail_digest: str = "",
     ) -> None:
         status = "failed"
         try:
             status = client.wait_turn(turn_id)
+            self._archive_terminal_chat(
+                client,
+                config=config,
+                program_id=program_id,
+                resource_kind="requirement",
+                resource_key=requirement_key,
+                resource_name=title,
+                conversation_title=title,
+                thread_id=thread_id,
+                provider=provider,
+                phase="prototype",
+                terminal_status=status,
+            )
             if status == "completed":
                 path, files = requirement_prototype_files(self.workspace, requirement_key)
                 if not files:
@@ -7220,7 +7745,7 @@ class ExecutionBridge:
                     "/delivery/requirement/prototype/save",
                     body={"programId": program_id, "requirementKey": requirement_key, "path": path, "actorName": f"{provider}-http-bridge"},
                 )
-            self._save_prototype_session(config, program_id, requirement_key, provider, thread_id, turn_id, title, status)
+            self._save_prototype_session(config, program_id, requirement_key, provider, thread_id, turn_id, title, status, detail_digest)
             self.progress.publish(
                 identity,
                 "status",
@@ -7231,7 +7756,7 @@ class ExecutionBridge:
         except Exception as exc:
             status = "failed"
             try:
-                self._save_prototype_session(config, program_id, requirement_key, provider, thread_id, turn_id, title, status)
+                self._save_prototype_session(config, program_id, requirement_key, provider, thread_id, turn_id, title, status, detail_digest)
             except Exception:
                 pass
             self.progress.publish(identity, "error", "同步需求 HTML 原型失败", str(exc), status)
@@ -7833,6 +8358,21 @@ class ExecutionBridge:
         try:
             turn_status = client.wait_turn(turn_id)
             turn = client.read_turn(client.thread_id, turn_id, request_id=client.next_request_id())
+            task_name = str(task.get("title") or item_key)
+            phase = str(task.get("phase") or "requirement")
+            self._archive_terminal_chat(
+                client,
+                config=config,
+                program_id=program_id,
+                resource_kind="task",
+                resource_key=item_key,
+                resource_name=task_name,
+                conversation_title=task_name,
+                thread_id=str(client.thread_id or binding.get("externalSessionId") or ""),
+                provider=provider,
+                phase=phase,
+                terminal_status=turn_status,
+            )
             with self.lock:
                 current = self.active_runs.get(identity)
                 has_newer_turn = current is not None and str(current.get("turnId") or "") != turn_id
@@ -8183,6 +8723,349 @@ def file_changes_of(item: dict[str, Any]) -> list[dict[str, str]]:
     return normalized
 
 
+def chat_archive_component(value: Any, fallback: str, max_bytes: int) -> str:
+    """Return one human-readable, cross-platform-safe filename component."""
+    text = re.sub(r"[\x00-\x1f\x7f/\\:*?\"<>|]+", "-", str(value or ""))
+    text = re.sub(r"\s+", " ", text).strip(" .-")
+    if not text:
+        text = fallback
+    while len(text.encode("utf-8")) > max_bytes:
+        text = text[:-1]
+    return text.rstrip(" .-") or fallback
+
+
+def chat_archive_relative_path(
+    resource_kind: str,
+    resource_key: str,
+    resource_name: str,
+    thread_id: str,
+    phase: str = "",
+) -> Path:
+    """Build a stable, readable workspace-relative path for one conversation."""
+    if resource_kind not in {"requirement", "task"}:
+        raise BridgeFailure("聊天归档类型无效")
+    key = chat_archive_component(resource_key, resource_kind, 64)
+    name = chat_archive_component(resource_name, key, CHAT_ARCHIVE_MAX_NAME_BYTES)
+    thread = chat_archive_component(thread_id, "thread", CHAT_ARCHIVE_MAX_THREAD_ID_BYTES)
+    # A truncated safe filename alone could collide. The digest keeps a one-to-one mapping
+    # to the complete executor thread id, which is still recorded in the Markdown header.
+    digest = hashlib.sha256(thread_id.encode("utf-8")).hexdigest()[:12]
+    section = "需求" if resource_kind == "requirement" else "任务"
+    directory = Path(CHAT_ARCHIVE_DIRECTORY_NAME) / section / f"{key}--{name}"
+    phase_prefix = f"{chat_archive_component(phase, '阶段', 32)}--" if resource_kind == "task" and phase else ""
+    return directory / f"{phase_prefix}聊天--{thread}--{digest}.md"
+
+
+def visible_chat_archive_turns(turns: Any) -> list[dict[str, Any]]:
+    """Keep visible dialogue and display-safe reasoning summaries for restoration."""
+    if not isinstance(turns, list):
+        return []
+    visible: list[dict[str, Any]] = []
+    for turn in turns:
+        if not isinstance(turn, dict):
+            continue
+        items: list[dict[str, Any]] = []
+        for item in turn.get("items") or []:
+            if not isinstance(item, dict):
+                continue
+            item_type = str(item.get("type") or "")
+            if item_type == "userMessage":
+                text = text_without_attachment_context(text_from_user_item(item)).strip()
+                if text:
+                    items.append({"type": "userMessage", "content": [{"type": "text", "text": text}]})
+            elif item_type == "agentMessage":
+                text = str(item.get("text") or item.get("content") or "").strip()
+                if text:
+                    items.append({
+                        "type": "agentMessage", "text": text,
+                        "status": str(item.get("status") or ""),
+                        "phase": str(item.get("phase") or ""),
+                    })
+            elif item_type == "reasoning":
+                summary = reasoning_summary_text(item)
+                if summary:
+                    items.append({
+                        "type": "reasoning", "summary": summary.split("\n\n"),
+                        "status": str(item.get("status") or ""),
+                    })
+        visible.append({
+            "id": str(turn.get("id") or ""),
+            "status": str(turn.get("status") or ""),
+            "createdAt": turn.get("createdAt") or turn.get("startedAt") or "",
+            "completedAt": turn.get("completedAt") or "",
+            "items": items,
+        })
+    return visible
+
+
+def archived_chat_text(
+    *,
+    resource_kind: str,
+    resource_key: str,
+    resource_name: str,
+    conversation_title: str,
+    thread_id: str,
+    provider: str,
+    phase: str,
+    terminal_status: str,
+    turns: Any,
+) -> str:
+    """Render visible dialogue and reasoning summaries, never raw tool output."""
+    kind_label = "需求" if resource_kind == "requirement" else "任务"
+    metadata = {
+        "format": "delivery-task-planner-chat/v1",
+        "resourceType": resource_kind,
+        "resourceKey": resource_key,
+        "resourceName": resource_name,
+        "conversationTitle": conversation_title,
+        "threadId": thread_id,
+        "provider": provider,
+        "phase": phase,
+        "lastTurnStatus": terminal_status,
+        "archivedAt": utc_now(),
+    }
+    lines = ["---"]
+    lines.extend(f"{key}: {json.dumps(value, ensure_ascii=False)}" for key, value in metadata.items())
+    lines.extend(["---", "", f"# {kind_label}聊天 · {conversation_title or resource_name or resource_key}", ""])
+
+    visible_turns = visible_chat_archive_turns(turns)
+    for index, turn in enumerate(visible_turns, start=1):
+        if not isinstance(turn, dict):
+            continue
+        status = str(turn.get("status") or "")
+        turn_id = str(turn.get("id") or "")
+        suffix = f" · {status}" if status else ""
+        if turn_id:
+            suffix += f" · {turn_id}"
+        lines.extend([f"## 第 {index} 轮{suffix}", ""])
+        message_count = 0
+        for item in turn.get("items") or []:
+            if not isinstance(item, dict):
+                continue
+            item_type = str(item.get("type") or "")
+            if item_type == "userMessage":
+                text = text_without_attachment_context(text_from_user_item(item)).strip()
+                label = "用户"
+            elif item_type == "agentMessage":
+                text = str(item.get("text") or item.get("content") or "").strip()
+                label = "助手"
+            elif item_type == "reasoning":
+                text = reasoning_summary_text(item)
+                label = "推理摘要"
+            else:
+                # Raw tool/command payloads can expose hidden context or secrets.
+                # Reasoning is included only through the summary-only branch above.
+                continue
+            if not text:
+                continue
+            lines.extend([f"### {label}", "", text, ""])
+            message_count += 1
+        if message_count == 0:
+            lines.extend(["_本轮没有可归档的用户或助手消息。_", ""])
+
+    if not visible_turns:
+        lines.extend(["_会话未返回可归档的回合记录。_", ""])
+    # The visible Markdown above is for people. This data block is a compact, lossless
+    # representation of the same safe messages so a different machine can restore the
+    # project-local backup without trying to parse arbitrary Markdown written by an AI.
+    payload = json.dumps({"turns": visible_turns}, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    lines.extend(["<!-- delivery-task-planner-chat-data", base64.b64encode(payload).decode("ascii"), "-->", ""])
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def archive_chat_snapshot(
+    workspace: Path,
+    *,
+    resource_kind: str,
+    resource_key: str,
+    resource_name: str,
+    conversation_title: str,
+    thread_id: str,
+    provider: str,
+    phase: str,
+    terminal_status: str,
+    turns: Any,
+) -> Path:
+    """Atomically replace one thread's project-local Markdown snapshot."""
+    if not thread_id.strip():
+        raise BridgeFailure("聊天归档缺少会话标识")
+    relative = chat_archive_relative_path(resource_kind, resource_key, resource_name, thread_id, phase)
+    root = workspace.resolve()
+    destination = (root / relative).resolve()
+    try:
+        destination.relative_to(root)
+    except ValueError as exc:
+        raise BridgeFailure("聊天归档路径超出当前项目") from exc
+    content = archived_chat_text(
+        resource_kind=resource_kind,
+        resource_key=resource_key,
+        resource_name=resource_name,
+        conversation_title=conversation_title,
+        thread_id=thread_id,
+        provider=provider,
+        phase=phase,
+        terminal_status=terminal_status,
+        turns=turns,
+    )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.{secrets.token_hex(6)}.tmp")
+    try:
+        temporary.write_text(content, encoding="utf-8")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, destination)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return relative
+
+
+def chat_archive_metadata(content: str) -> dict[str, Any]:
+    """Read the small JSON-valued front matter written by `archived_chat_text`."""
+    if not content.startswith("---\n"):
+        return {}
+    end = content.find("\n---\n", 4)
+    if end < 0:
+        return {}
+    metadata: dict[str, Any] = {}
+    for line in content[4:end].splitlines():
+        key, separator, raw = line.partition(": ")
+        if not key or not separator:
+            continue
+        try:
+            metadata[key] = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+    return metadata
+
+
+def archived_chat_turns(content: str) -> list[dict[str, Any]]:
+    marker = "<!-- delivery-task-planner-chat-data\n"
+    start = content.rfind(marker)
+    if start < 0:
+        return []
+    end = content.find("\n-->", start + len(marker))
+    if end < 0:
+        return []
+    encoded = "".join(content[start + len(marker):end].split())
+    try:
+        payload = json.loads(base64.b64decode(encoded, validate=True).decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return []
+    turns = payload.get("turns") if isinstance(payload, dict) else None
+    return [turn for turn in turns or [] if isinstance(turn, dict)]
+
+
+def read_workspace_chat_archive(
+    workspace: Path,
+    resource_kind: str,
+    resource_key: str,
+    thread_id: str,
+) -> dict[str, Any]:
+    """Find a thread snapshot by its immutable metadata, not by a mutable display name."""
+    if resource_kind not in {"requirement", "task"} or not resource_key or not thread_id:
+        return {}
+    section = "需求" if resource_kind == "requirement" else "任务"
+    root = (workspace.resolve() / CHAT_ARCHIVE_DIRECTORY_NAME / section).resolve()
+    workspace_root = workspace.resolve()
+    try:
+        root.relative_to(workspace_root)
+    except ValueError:
+        return {}
+    if not root.is_dir():
+        return {}
+    try:
+        candidates = root.rglob("*.md")
+        for count, candidate in enumerate(candidates, start=1):
+            if count > CHAT_ARCHIVE_MAX_FILES_TO_SCAN:
+                break
+            try:
+                resolved = candidate.resolve()
+                resolved.relative_to(root)
+                if not resolved.is_file() or resolved.stat().st_size > CHAT_ARCHIVE_MAX_FILE_BYTES:
+                    continue
+                content = resolved.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError, ValueError):
+                continue
+            metadata = chat_archive_metadata(content)
+            if (
+                metadata.get("resourceType") != resource_kind
+                or metadata.get("resourceKey") != resource_key
+                or metadata.get("threadId") != thread_id
+            ):
+                continue
+            turns = archived_chat_turns(content)
+            if turns:
+                return {"id": thread_id, "turns": turns, "source": "workspaceArchive"}
+    except OSError:
+        return {}
+    return {}
+
+
+def cloud_sync_workspace_entries(workspace: Path, scopes: set[str]) -> tuple[list[tuple[str, str, Path, str]], int]:
+    """Return only configured, workspace-contained files for a project cloud sync.
+
+    `Chat/` is isolated from regular project files. Requirement documents are readable
+    document formats under `doc/` excluding prototype directories; design documents are
+    all regular files under a `prototype/` directory, including referenced images.
+    """
+    wanted = scopes & CLOUD_SYNC_SCOPES
+    if not wanted:
+        return [], 0
+    root = workspace.resolve()
+    entries: dict[str, tuple[str, str, Path, str]] = {}
+    skipped = 0
+
+    def offer(category: str, source: Path) -> None:
+        nonlocal skipped
+        if len(entries) >= MAX_CLOUD_SYNC_FILES_PER_RUN:
+            skipped += 1
+            return
+        try:
+            resolved = source.resolve()
+            relative = resolved.relative_to(root).as_posix()
+            if not resolved.is_file() or resolved.stat().st_size > MAX_CLOUD_SYNC_FILE_BYTES:
+                skipped += 1
+                return
+        except (OSError, ValueError):
+            skipped += 1
+            return
+        content_type = mimetypes.guess_type(relative)[0] or "application/octet-stream"
+        entries[relative] = (category, relative, resolved, content_type)
+
+    if "chat" in wanted:
+        chat_root = root / CHAT_ARCHIVE_DIRECTORY_NAME
+        if chat_root.is_dir():
+            try:
+                for source in chat_root.rglob("*.md"):
+                    offer("chat", source)
+            except OSError:
+                skipped += 1
+
+    document_root = root / "doc"
+    if document_root.is_dir() and ("requirement" in wanted or "design" in wanted):
+        try:
+            for source in document_root.rglob("*"):
+                if not source.is_file():
+                    continue
+                try:
+                    relative_to_document = source.resolve().relative_to(document_root.resolve())
+                except (OSError, ValueError):
+                    skipped += 1
+                    continue
+                in_prototype = "prototype" in relative_to_document.parts
+                if in_prototype:
+                    if "design" in wanted:
+                        offer("design", source)
+                elif "requirement" in wanted and source.suffix.lower() in DOCUMENT_SET_SUFFIXES:
+                    offer("requirement", source)
+        except OSError:
+            skipped += 1
+
+    return [entries[key] for key in sorted(entries)], skipped
+
+
 def serialize_turns(
     turns: Any,
     attachment_resolver: Any = None,
@@ -8215,11 +9098,16 @@ def serialize_turns(
                     except BridgeFailure:
                         attachments = []
                 text = text_without_attachment_context(text)
-            elif item_type in {"agentMessage", "plan", "reasoning"}:
+            elif item_type in {"agentMessage", "plan"}:
                 text = str(item.get("text") or item.get("content") or item.get("summary") or "").strip()
                 if artifact_resolver and item_type == "agentMessage" and str(item.get("phase") or "") == "final_answer":
                     linked_paths = [match.strip().split("#", 1)[0] for match in MARKDOWN_ARTIFACT_RE.findall(text)]
                     attachments = artifact_resolver(linked_paths[:20])
+            elif item_type == "reasoning":
+                # Do not fall back to `content`: it can contain a non-display
+                # reasoning payload. The protocol's `summary` is intentional
+                # user-facing content and is safe for the browser projection.
+                text = reasoning_summary_text(item)
             elif item_type == "commandExecution":
                 command = item.get("command") or item.get("commands") or ""
                 text = "\n".join(str(part) for part in command) if isinstance(command, list) else str(command)
@@ -8871,6 +9759,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
             "/v1/codex/git/init",
             "/v1/codex/git/prepare",
             "/v1/codex/git/push",
+            "/v1/codex/cloud-sync",
             "/v1/codex/requirement-document",
             "/v1/codex/requirement-outline",
             "/v1/codex/document-file",
@@ -8984,6 +9873,10 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     str(payload.get("path") or "").strip(),
                     payload.get("content"),
                     config=config,
+                ))
+            elif path == "/v1/codex/cloud-sync":
+                self.json_response(200, selected_bridge.sync_cloud_workspace(
+                    program_id_of(payload.get("programId")), config,
                 ))
             elif path == "/v1/codex/git/push":
                 self.json_response(200, selected_bridge.push_requirement_branch(payload, config))
