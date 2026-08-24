@@ -291,6 +291,15 @@ BRIDGE_CONTEXT_RE = re.compile(
 )
 IMAGE_SUFFIXES = {".gif", ".jpeg", ".jpg", ".png", ".webp"}
 HTML_SUFFIXES = {".html", ".htm"}
+# HTML 文档和原型页经常把样式、脚本拆成同目录的独立文件，但预览是把正文塞进 blob 地址的 iframe，
+# 相对路径在那里解析不出来。读 HTML 时顺带把它引用到的同目录 css/js 一起带上，前端预览时内联进去。
+HTML_ASSET_SUFFIXES = {".css", ".js", ".mjs"}
+MAX_HTML_ASSET_FILES = 40
+MAX_HTML_ASSET_TOTAL_BYTES = 4 * 1024 * 1024
+HTML_ASSET_REFERENCE_RE = re.compile(
+    r"""(?:<link\b[^>]*?\bhref|<script\b[^>]*?\bsrc)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))""",
+    re.IGNORECASE,
+)
 MARKDOWN_ARTIFACT_RE = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
 EXCLUDED_ARTIFACT_PARTS = {".codex", ".git"}
 EXCLUDED_ARTIFACT_NAMES = {".env", ".env.local", ".env.production", "credentials.json", "secrets.json"}
@@ -3456,11 +3465,66 @@ def document_in_set(workspace: Path, relative_directory: Path, raw_path: str) ->
     return path
 
 
-def document_payload(workspace: Path, path: Path) -> dict[str, Any]:
+def html_asset_payloads(workspace: Path, boundary: Path, html_path: Path, html: str) -> list[dict[str, str]]:
+    """Read the sibling stylesheets and scripts one HTML file references by relative path.
+
+    只认相对路径、只认 css/js、只读边界目录里的文件：外链地址交给 iframe 自己去取，
+    绝对路径和越界路径一律跳过，避免预览成为读工作区任意文件的口子。
+    返回的 name 就是 HTML 里原样写的引用串，前端据此把对应的 link / script 标签换成内联正文。
+    """
+    root = workspace.resolve()
+    base = (boundary if boundary.is_absolute() else workspace / boundary).resolve()
+    try:
+        base.relative_to(root)
+    except ValueError:
+        return []
+    directory = html_path.resolve().parent
+    assets: list[dict[str, str]] = []
+    seen: set[str] = set()
+    total_bytes = 0
+    for match in HTML_ASSET_REFERENCE_RE.finditer(html):
+        reference = next((group for group in match.groups() if group), "")
+        value = reference.strip()
+        if not value or value in seen:
+            continue
+        # 协议地址、协议相对地址、站点绝对路径和内联数据都不是同目录文件。
+        if "://" in value or value.startswith(("//", "/", "#", "data:", "javascript:")):
+            continue
+        target = value.split("#", 1)[0].split("?", 1)[0]
+        if not target:
+            continue
+        candidate = Path(target)
+        if candidate.is_absolute() or candidate.suffix.lower() not in HTML_ASSET_SUFFIXES:
+            continue
+        seen.add(value)
+        resolved = (directory / candidate).resolve()
+        try:
+            resolved.relative_to(base)
+        except ValueError:
+            continue
+        if not resolved.is_file():
+            continue
+        size = resolved.stat().st_size
+        if total_bytes + size > MAX_HTML_ASSET_TOTAL_BYTES:
+            break
+        try:
+            content = resolved.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        if "\x00" in content:
+            continue
+        total_bytes += size
+        assets.append({"name": value, "content": content})
+        if len(assets) >= MAX_HTML_ASSET_FILES:
+            break
+    return assets
+
+
+def document_payload(workspace: Path, path: Path, asset_boundary: Path | None = None) -> dict[str, Any]:
     """Read one column document as UTF-8 text, or report that it has not been written yet."""
     relative = path.relative_to(workspace.resolve()).as_posix()
     if not path.exists():
-        return {"path": relative, "exists": False, "content": "", "size": 0, "modifiedAt": ""}
+        return {"path": relative, "exists": False, "content": "", "size": 0, "modifiedAt": "", "assets": []}
     if not path.is_file():
         raise BridgeFailure("文档路径不是文件")
     size = path.stat().st_size
@@ -3472,12 +3536,19 @@ def document_payload(workspace: Path, path: Path) -> dict[str, Any]:
         raise BridgeFailure("文档不是 UTF-8 文本文件") from exc
     if "\x00" in content:
         raise BridgeFailure("文档不是可预览的文本文件")
+    # HTML 文档的样式和脚本可能拆在同目录的独立文件里，一并带上，否则预览只剩裸结构。
+    assets = (
+        html_asset_payloads(workspace, asset_boundary, path, content)
+        if asset_boundary is not None and path.suffix.lower() in HTML_SUFFIXES
+        else []
+    )
     return {
         "path": relative,
         "exists": True,
         "content": content,
         "size": size,
         "modifiedAt": datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat().replace("+00:00", "Z"),
+        "assets": assets,
     }
 
 
@@ -3549,7 +3620,8 @@ def requirement_prototype_files(workspace: Path, requirement_key: str) -> tuple[
             raise BridgeFailure(f"需求原型不是 UTF-8 HTML：{display_name}") from exc
         if "\x00" in html:
             raise BridgeFailure(f"需求原型不是可预览的 HTML：{display_name}")
-        files.append({"path": relative.as_posix(), "name": display_name, "html": html})
+        assets = html_asset_payloads(workspace, directory, resolved, html)
+        files.append({"path": relative.as_posix(), "name": display_name, "html": html, "assets": assets})
         if len(files) >= MAX_REQUIREMENT_PROTOTYPE_FILES:
             break
     return relative_directory.as_posix(), files
@@ -8549,7 +8621,9 @@ class ExecutionBridge:
         """Read one document the picker selected."""
         config = request_scoped_config(config, biz_line, program_id)
         directory, _, _ = self._document_set_layout(config, program_id, scope, key)
-        return document_payload(self.workspace, document_in_set(self.workspace, directory, path))
+        return document_payload(
+            self.workspace, document_in_set(self.workspace, directory, path), asset_boundary=directory,
+        )
 
     def save_document_file(
         self,
@@ -8578,7 +8652,7 @@ class ExecutionBridge:
             raise BridgeFailure("文档不存在，请先由会话生成后再编辑")
         text = content if content.endswith("\n") or not content.strip() else content + "\n"
         target.write_text(text, encoding="utf-8")
-        return document_payload(self.workspace, target)
+        return document_payload(self.workspace, target, asset_boundary=directory)
 
     @staticmethod
     def _requirement_prototype_identity(program_id: int, requirement_key: str) -> tuple[str, int, str]:
