@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 *.pyo
 .pytest_cache/
+.temp/
 
 # Local environment and operating system artifacts
 .env

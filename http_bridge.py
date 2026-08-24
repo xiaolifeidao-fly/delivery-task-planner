@@ -27,7 +27,7 @@ from email.parser import BytesParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 from urllib.request import Request, urlopen
 
 import server as planner
@@ -38,6 +38,7 @@ from delivery_bridge.versioning import compare_versions, manifest_version
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 PLUGIN_MANIFEST_PATH = Path(__file__).resolve().parent / ".codex-plugin" / "plugin.json"
+PLUGIN_ROOT = Path(__file__).resolve().parent
 # 执行器一律走这个命令行入口写任务面板。
 TASKBOARD_CLI = str(Path(__file__).resolve().parent / "taskboard.py")
 
@@ -153,6 +154,15 @@ PENDING_SESSION_SYNCS_PATH = RUNTIME_DIR / "pending-session-syncs.json"
 # Claude 是 print 模式的一次性子进程，没有常驻线程服务可读；会话记录只能自己落盘。
 CLAUDE_TRANSCRIPTS_DIR = RUNTIME_DIR / "claude-transcripts"
 MAX_CLAUDE_TRANSCRIPT_TURNS = 60
+# Codex 的 `thread/read` / `thread/resume` 只持久化部分条目：命令执行、文件改动和推理
+# 摘要都读不回来（协议里对 thread/rollback 的说明写得很明确）。桌面版能显示完整过程，
+# 靠的是自己留着实时通知流，这里做同一件事：把 item/started、item/completed 落盘。
+CODEX_THREAD_ITEMS_DIR = RUNTIME_DIR / "codex-thread-items"
+MAX_THREAD_JOURNAL_TURNS = 60
+MAX_THREAD_JOURNAL_ITEMS = 400
+# turn/start 的 summary 取值：auto / concise / detailed / none。auto 由模型自己决定详略，
+# 实测常常只给一两句。注意 app-server 会静默忽略不认识的字段，改名字前先实际验一遍。
+TURN_REASONING_SUMMARY = "detailed"
 MAX_CONVERSATIONS_PER_TASK = 12
 MAX_CONVERSATION_ATTACHMENTS = 5
 MAX_CONVERSATION_REFERENCES = 16
@@ -164,12 +174,18 @@ MAX_REQUIREMENT_PROTOTYPE_FILE_BYTES = 2 * 1024 * 1024
 MAX_REQUIREMENT_PROTOTYPE_TOTAL_BYTES = 8 * 1024 * 1024
 # 每一轮结束后，把面板可见的聊天正文备份到当前项目工作目录。它是可随项目
 # 共享的人工可读副本，不替代 Codex / Claude 保留的原始执行器会话。
-CHAT_ARCHIVE_DIRECTORY_NAME = "Chat"
+CHAT_ARCHIVE_DIRECTORY_NAME = "chat"
+# New archives are grouped by the owning requirement, so requirement and task
+# conversations for the same delivery stay together in a repository.
+CHAT_ARCHIVE_REQUIREMENTS_DIRECTORY_NAME = "requirements"
+CHAT_ARCHIVE_TASK_DIRECTORY_NAME = "task"
+# 早期版本使用大写目录；只用于恢复既有记录，所有新归档一律写入 chat/。
+LEGACY_CHAT_ARCHIVE_DIRECTORY_NAME = "Chat"
 CHAT_ARCHIVE_MAX_NAME_BYTES = 96
 CHAT_ARCHIVE_MAX_THREAD_ID_BYTES = 72
 CHAT_ARCHIVE_MAX_FILES_TO_SCAN = 500
 CHAT_ARCHIVE_MAX_FILE_BYTES = 5 * 1024 * 1024
-# 云端同步与 Git 本地归档相互独立：Git 决定 Chat/ 是否落到工作目录，云端开关决定
+# 云端同步与 Git 本地归档相互独立：Git 聊天同步开关决定 chat/ 是否落到工作目录，云端开关决定
 # 是否将用户明确选择的内容传给服务端。服务端也会复核这组类别，桥接不能绕过项目设置。
 CLOUD_SYNC_SCOPES = {"chat", "requirement", "design"}
 MAX_CLOUD_SYNC_FILE_BYTES = 8 * 1024 * 1024
@@ -180,6 +196,10 @@ MAX_REQUIREMENT_OUTLINE_BYTES = 2 * 1024 * 1024
 # 面板直接编辑大纲时走 POST，请求体本身限制在 64KB 级别，这里留出同量级的正文上限。
 MAX_EDITABLE_OUTLINE_BYTES = 512 * 1024
 MAX_WORKSPACE_ARTIFACT_BYTES = 50 * 1024 * 1024
+# 回复正文里的文件链接常常只写文件名（`ShenShiAccessibilityService.kt`），
+# 按工作区根目录拼出来的路径并不存在，只能靠一份文件名索引反查真实路径。
+WORKSPACE_FILE_INDEX_TTL_SECONDS = 30
+MAX_WORKSPACE_FILE_INDEX_ENTRIES = 40000
 # 需求大纲、任务文档、设计文档、测试用例这几个栏目都从「一个固定文件」升级成「一个目录里的多份文档」：
 # 目录里所有可读的 Markdown、纯文本和 HTML 文档都能在面板上选择预览，原来的固定文件名继续作为默认主文档，存量数据不受影响。
 DOCUMENT_SET_SUFFIXES = {".md", ".markdown", ".txt", ".html", ".htm"}
@@ -393,6 +413,29 @@ def provider_label(provider: str) -> str:
     return "Claude" if provider == "claude" else "Codex"
 
 
+def executor_type_of(value: Any) -> str:
+    """会话目录记录里的执行器类型，形如 codex / claude-prototype / codex-testing-cases。"""
+    if isinstance(value, dict):
+        return str(value.get("executorType") or "").strip().lower()
+    return str(value or "").strip().lower()
+
+
+def executor_provider_of(value: Any, fallback: str = "codex") -> str:
+    """这条会话是哪个 AI 工具留下的；读不出来就按调用方当前选的工具兜底。"""
+    head = executor_type_of(value).split("-", 1)[0]
+    return head if head in AI_PROVIDERS else ai_provider_of(fallback)
+
+
+def executor_purpose_of(value: Any) -> str:
+    """执行器类型里的用途后缀，拆解会话为空、原型是 prototype，跨工具列目录时只比这一段。"""
+    parts = executor_type_of(value).split("-", 1)
+    return parts[1] if len(parts) > 1 else ""
+
+
+def same_executor_purpose(row: Any, executor_type: str) -> bool:
+    return executor_purpose_of(row) == executor_purpose_of(executor_type)
+
+
 def reasoning_effort_of(value: Any, provider: str = "codex") -> str:
     effort = str((value or {}).get("reasoningEffort") or "").strip() if isinstance(value, dict) else str(value or "").strip()
     allowed = CLAUDE_REASONING_EFFORTS if provider == "claude" else CODEX_REASONING_EFFORTS
@@ -505,37 +548,94 @@ def path_codex_cli(host: str = "") -> tuple[str, str]:
     return command, ""
 
 
+CODEX_CLI_VERSIONS: dict[str, str] = {}
+
+
+def codex_cli_version(command: str) -> str:
+    """`codex --version` 的版本号，按可执行文件缓存；问不出来就返回空串。"""
+    if command in CODEX_CLI_VERSIONS:
+        return CODEX_CLI_VERSIONS[command]
+    version = ""
+    try:
+        result = subprocess.run([command, "--version"], capture_output=True, text=True, timeout=15)
+        version = (result.stdout or result.stderr or "").strip().split()[-1] if result.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError, IndexError):
+        version = ""
+    CODEX_CLI_VERSIONS[command] = version
+    return version
+
+
+def newest_codex_cli(candidates: list[str]) -> str:
+    """在几个都能用的 codex 里挑版本最高的那个，问不出版本时保持传入顺序。
+
+    Codex Desktop 自带的 codex 和它捆绑的 MCP 服务（node_repl、browser-use、computer-use）
+    是配套发版的：实测 PATH 上的 0.134.0 调 node_repl 会被拒（`sandboxCwd must be an
+    absolute file URI`），换成桌面端自带的 0.149.0-alpha，同一段代码同一组参数就能跑通。
+    所以这里不能只看"PATH 上有没有 codex"，还得看它够不够新。
+    """
+    available = [candidate for candidate in candidates if candidate]
+    if not available:
+        return ""
+    best = available[0]
+    for candidate in available[1:]:
+        if newer_codex_cli(candidate, best):
+            best = candidate
+    return best
+
+
+def newer_codex_cli(candidate: str, current: str) -> bool:
+    """版本问不出来或者格式不认识，就当它不比现有的新，保持原来的优先级。"""
+    candidate_version = codex_cli_version(candidate)
+    current_version = codex_cli_version(current)
+    if not candidate_version:
+        return False
+    if not current_version:
+        return True
+    try:
+        return compare_versions(candidate_version, current_version) > 0
+    except ValueError:
+        return False
+
+
+def codex_cli_candidates(host: str = "", runtime_dir: Path | None = None) -> list[str]:
+    """本机所有可直接拉起的 codex，按原来的优先级排列。"""
+    cache_path = codex_cli_cache_path(host, runtime_dir)
+    command, _ = path_codex_cli(host)
+    candidates = [command, str(cache_path) if cache_path.is_file() else ""]
+    candidates.extend(str(path) for path in codex_desktop_resource_paths(host) if path.is_file())
+    return [candidate for candidate in candidates if candidate]
+
+
 def available_codex_cli(host: str = "", runtime_dir: Path | None = None) -> str:
     """Locate a PATH CLI, a previously copied local CLI, or a Desktop resource."""
     cache_path = codex_cli_cache_path(host, runtime_dir)
     # 已经复制到运行时目录的 codex.exe 是确定能跑的，Windows 上优先用它。
     if (host or host_platform()) == "windows" and cache_path.is_file():
         return str(cache_path)
-    command, wrapper = path_codex_cli(host)
-    if command:
-        return command
-    if cache_path.is_file():
-        return str(cache_path)
-    for resource_path in codex_desktop_resource_paths(host):
-        if resource_path.is_file():
-            return str(resource_path)
-    return wrapper
+    _, wrapper = path_codex_cli(host)
+    return newest_codex_cli(codex_cli_candidates(host, runtime_dir)) or wrapper
 
 
 def provision_codex_cli(host: str = "", runtime_dir: Path | None = None) -> str:
-    """Copy Codex Desktop's bundled CLI locally when no standalone CLI exists."""
+    """Copy Codex Desktop's bundled CLI locally when it is the newest one on this machine."""
     cache_path = codex_cli_cache_path(host, runtime_dir)
     # 与 available_codex_cli 保持同一优先级，避免"检测到的"和"真正拉起的"不是同一个。
     if (host or host_platform()) == "windows" and cache_path.is_file():
         return str(cache_path)
     command, wrapper = path_codex_cli(host)
-    if command:
-        return command
-    if cache_path.is_file():
-        return str(cache_path)
-    source = next((path for path in codex_desktop_resource_paths(host) if path.is_file()), None)
+    chosen = newest_codex_cli(codex_cli_candidates(host, runtime_dir))
+    desktop_paths = {str(path) for path in codex_desktop_resource_paths(host)}
+    if chosen and chosen not in desktop_paths:
+        return chosen
+    source = Path(chosen) if chosen else next((path for path in codex_desktop_resource_paths(host) if path.is_file()), None)
     if source is None:
-        return wrapper
+        return command or wrapper
+    # 桌面端资源目录里的可执行文件本来就能直接跑，而且它的同目录伴生文件都在。
+    # 复制只是 Windows 那边为了绕开包装脚本才需要的，别为此搬运一个几百 MB 的二进制。
+    if (host or host_platform()) != "windows":
+        return str(source)
+    if cache_path.is_file() and cache_path.stat().st_size == source.stat().st_size:
+        return str(cache_path)
     try:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, cache_path)
@@ -544,8 +644,8 @@ def provision_codex_cli(host: str = "", runtime_dir: Path | None = None) -> str:
             companion_source = source.with_name(f"{companion}{source_suffix}")
             if companion_source.is_file():
                 shutil.copy2(companion_source, cache_path.with_name(companion_source.name))
-        if (host or host_platform()) != "windows":
-            cache_path.chmod(cache_path.stat().st_mode | 0o111)
+        # 复制过来的是另一个版本，之前问出来的版本号不能再算数。
+        CODEX_CLI_VERSIONS.pop(str(cache_path), None)
         return str(cache_path)
     except OSError:
         # Desktop resources are directly executable too. Keep the board usable
@@ -1184,19 +1284,113 @@ def build_conversation_prompt(
     )
 
 
-def requirement_outline_rule_lines(outline_path: str) -> list[str]:
-    """需求大纲的读写纪律。追加需求时最容易被写成只剩本轮那段，所以每一轮都要重申。"""
-    if not outline_path:
-        return []
+def planning_temp_segment(value: str, fallback: str) -> str:
+    """Return one readable, traversal-safe directory segment for planning drafts."""
+    candidate = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", str(value or "").strip())
+    candidate = re.sub(r"\s+", " ", candidate).strip(" .")
+    return (candidate or fallback)[:80]
+
+
+def planning_temp_document_path(requirement_name: str, requirement_key: str, thread_id: str) -> Path:
+    """Return the plugin-local draft file for one requirement chat window."""
+    requirement_segment = planning_temp_segment(requirement_name, requirement_key or "未命名需求")
+    thread_segment = planning_temp_segment(thread_id, "待分配聊天窗口")
+    return PLUGIN_ROOT / ".temp" / "requirements" / f"req_{requirement_segment}" / thread_segment / "temp.md"
+
+
+def write_planning_temp_summary(
+    path: Path,
+    requirement_name: str,
+    requirement_key: str,
+    thread_id: str,
+    user_message: str,
+    summary: str,
+) -> None:
+    """Atomically refresh the latest process artifact for one planning chat."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    body = "\n".join([
+        "# 需求梳理过程摘要",
+        "",
+        "> 临时过程产物，仅用于接续本聊天窗口；不等同于最终需求文档。",
+        "",
+        f"- 需求名称：{requirement_name or requirement_key or '未命名需求'}",
+        f"- 需求键：{requirement_key or '未指定'}",
+        f"- 聊天窗口 ID：{thread_id}",
+        f"- 更新时间：{utc_now()}",
+        "",
+        "## 本轮用户输入",
+        "",
+        (user_message or "（无文字输入）").strip(),
+        "",
+        "## 最新总结性产物",
+        "",
+        (summary or "（本轮没有可保存的总结）").strip(),
+        "",
+    ])
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(body, encoding="utf-8")
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, path)
+
+
+def delete_planning_temp_summary(path: Path) -> bool:
+    """Delete only one managed planning draft after a successful confirmation."""
+    managed_root = (PLUGIN_ROOT / ".temp" / "requirements").resolve()
+    candidate = path.resolve(strict=False)
+    try:
+        candidate.relative_to(managed_root)
+    except ValueError as exc:
+        raise BridgeFailure("需求过程摘要路径超出插件临时目录") from exc
+    if not path.is_file():
+        return False
+    path.unlink()
+    return True
+
+
+def planning_temp_rule_lines(temp_path: str, read_required: bool = False) -> list[str]:
+    if not temp_path:
+        return [
+            "本轮过程总结由桥接器在聊天窗口建立后自动写入插件安装目录的 `.temp/requirements/req_<需求名称>/<聊天窗口ID>/temp.md`；"
+            "不要为保存过程数据而创建或修改正式需求大纲。",
+        ]
+    read_rule = (
+        "本轮是确认写入回合：写最终需求文档前必须完整读取这份过程总结。"
+        if read_required
+        else "正常连续对话直接使用当前聊天上下文，不要重复读取这个文件；只有会话被压缩、恢复后上下文缺失，"
+        "或当前上下文已找不到此前确认结论时，才读取它作为恢复点。"
+    )
     return [
-        f"需求大纲文档: `{outline_path}`（相对项目工作目录）。这是本条需求跨会话的唯一沉淀。",
-        "开工前必须先读这个文件：存在就把它当作本需求已确认的上下文，接着上一轮继续，不要重复问已经写清楚的内容；不存在就按本轮梳理结果新建。",
-        "每一轮梳理给出拆解预览之后，都要把最新的完整需求大纲写回该文件（只写这一个文件，不要在其他位置另建大纲）。",
+        f"本聊天窗口的过程总结文件: `{temp_path}`（插件安装目录内，不属于项目正式交付文档）。",
+        read_rule,
+        "每轮结束后桥接器会用本轮输入和最新总结性产物整篇刷新它，"
+        "不要把过程记录、未确认方案或聊天流水写入正式需求大纲。",
+    ]
+
+
+def requirement_outline_rule_lines(outline_path: str, write_allowed: bool = False, temp_path: str = "") -> list[str]:
+    """Keep the final outline immutable until the board grants write confirmation."""
+    if not outline_path:
+        return planning_temp_rule_lines(temp_path)
+    if not write_allowed:
+        return [
+            f"最终需求大纲: `{outline_path}`（相对项目工作目录）。预览和讨论阶段它是只读的最终产物：存在时可读取其中已确认内容，"
+            "不存在时也不得创建；只有用户点击「确认并写入」后才能改变它。",
+            *planning_temp_rule_lines(temp_path),
+        ]
+    return [
+        f"最终需求大纲: `{outline_path}`（相对项目工作目录）。用户已点击「确认并写入」，本轮必须把最终确认结果写入这个文件。",
+        *planning_temp_rule_lines(temp_path, read_required=True),
+        "写入前先完整读取既有最终大纲（如存在）和本聊天窗口的过程总结，把用户最终确认的方案合并成一份完整需求产物；"
+        "过程聊天、被否决方案和未确认草稿不要带入最终文档。",
+        "`temp.md` 只是候选材料，禁止整段复制或按聊天顺序改写。先分析每条信息是否直接有助于需求目标、交付范围、实现约束、"
+        "关键业务规则、验收标准、测试准备或最终决策；只把有实际交付价值且已经确认的内容提炼成清晰、可执行、可验证的需求表述。",
+        "合并重复内容，删除寒暄、反复确认、讨论过程、未采纳备选、无结论推演、工具日志和关于聊天本身的元信息。"
+        "但不得借精简遗漏已确认的非目标、兼容性要求、异常与边界场景、风险约束或仍会影响交付的待确认问题。",
         "写回是「读全文 → 合并本轮增量 → 整篇覆盖」：先完整读一遍现有大纲（用户可能在面板上直接编辑过），"
         "把本轮追加或调整的需求并进对应章节，本轮没聊到的章节原样保留，只有用户明确要求删除的内容才能删。"
         "禁止只把本轮追加的那段需求写进文件，那等于把之前几轮的需求大纲整段丢掉。",
         "大纲用 Markdown 组织，至少包含：需求背景与目标、范围与不做的事、关键约束、勘察到的落点（真实模块/目录/接口）、任务拆解表（与预览一致）、验收标准、待确认问题。",
-        "确认写入任务后，也要把大纲里任务表的最终状态同步成实际落库的那一版。",
+        "把大纲里任务表的最终状态同步成实际落库的那一版。",
     ]
 
 
@@ -1228,6 +1422,7 @@ def build_planning_prompt(
     write_allowed: bool = False,
     workspace: Path | None = None,
     mention_context: list[str] | None = None,
+    thread_id: str = "",
 ) -> str:
     """Give a project-level Codex turn the precise planner-tool contract and scope.
 
@@ -1247,6 +1442,10 @@ def build_planning_prompt(
     ]
     requirement = requirement or {}
     requirement_key = str(requirement.get("requirementKey") or "")
+    temp_path = (
+        planning_temp_document_path(str(requirement.get("name") or ""), requirement_key, thread_id).as_posix()
+        if thread_id else ""
+    )
     # 同一条需求可能被反复追问，已经拆出来的任务要显式列出来：
     # 不给这份清单，第二轮会把第一轮建过的任务再建一遍。
     requirement_items = [
@@ -1280,7 +1479,7 @@ def build_planning_prompt(
         else [
             f"这是交付任务面板的需求梳理会话，请遵循 {PLANNING_SKILL} 技能。本轮只做梳理和预览，禁止写入任何任务面板数据。",
             "禁止执行 create-task-board-tasks、create-task-board-stage、create-task-board-module，也不要借 HTTP 请求或手工改文件绕过任务面板写入限制；未确认前这些写入命令会被命令行直接拒绝。",
-            "本轮的限制只针对任务面板数据：默认除下面给出的需求大纲文件外不修改工作区其他文件；如果用户明确要求生成或更新独立的流程图、图表、HTML 或其他需求资产，允许写入当前需求文档目录，但只能写该目录。已授予项目工作目录及需求指定关联目录的只读勘察权限；可使用终端的只读命令和当前会话可用的读取工具列目录、搜索并读取代码、配置、技能和文档。某个可选读取工具不可用时，改用其他可用的只读工具继续勘察，不要因此停止。",
+            "本轮的限制只针对任务面板数据：正式需求大纲保持只读；如果用户明确要求生成或更新独立的流程图、图表、HTML 或其他需求资产，允许写入当前需求文档目录，但只能写该目录。过程总结由桥接器写入插件安装目录。已授予项目工作目录及需求指定关联目录的只读勘察权限；可使用终端的只读命令和当前会话可用的读取工具列目录、搜索并读取代码、配置、技能和文档。某个可选读取工具不可用时，改用其他可用的只读工具继续勘察，不要因此停止。",
             "拆解前必须先勘察下方给出的项目工作目录：加载该目录下项目自己的开发技能（如 backend-development、web-development），读相关目录和现有实现，据此判断需求真正的落点。get-task-board-context 只给出面板侧上下文，不包含工程现状，不能拿它替代看代码。",
             "任务要落到勘察出的真实模块、目录或接口上，不要只按业务名词泛化出通用分层；工作区里找不到需求所指的模块时，先向用户说明并确认工作目录或范围，不要硬拆。",
             "请与用户对话把需求问清楚，然后输出一份可评审的拆解预览：先用 Markdown 表格列出「序号 / 任务标题 / 收益标签 / 负责人 / 里程碑 / 模块 / 类型 / 前置依赖」，每项给 1-3 个简短收益或作用标签；负责人统一展示为该需求的第一位主负责人（未指定则标为未指派）；再在表格下方逐条补充目标、范围和验收标准。",
@@ -1354,9 +1553,9 @@ def build_planning_prompt(
             if pre_generate_task_documents else []
         )
     )
-    # 需求大纲是这条需求跨会话的唯一沉淀：每一轮都带上路径，新开的会话靠读它把上下文接回来。
+    # 正式大纲只在确认轮更新；预览轮由插件安装目录里的聊天级 temp.md 接续上下文。
     outline_path = requirement_outline_path_of(requirement_key).as_posix() if requirement_key else ""
-    outline_lines = requirement_outline_rule_lines(outline_path)
+    outline_lines = requirement_outline_rule_lines(outline_path, write_allowed, temp_path)
     document_lines = requirement_document_rule_lines(requirement_key)
     # 被 @ 的历史需求：只给大纲产物地址，读不读、读哪一段由执行器按需决定。
     references = requirement.get("references") or []
@@ -1444,6 +1643,78 @@ def planning_detail_digest(requirement: dict[str, Any] | None) -> str:
     return hashlib.sha256(detail.encode("utf-8")).hexdigest()
 
 
+# 新建聊天首回合结束后用一轮短会话补标题。标题既用于需求，也用于任务会话；
+# 保持简短，才能在左侧会话列表完整辨认。
+CONVERSATION_TITLE_TIMEOUT_SECONDS = 3 * 60
+MAX_CONVERSATION_TITLE_CHARS = 30
+
+
+def build_conversation_title_prompt(user_message: str, reply: str) -> str:
+    """根据新聊天的首条用户消息和首轮回复，生成一个面板会话标题。
+
+    命名是面板内务，不能出现在用户可见的正式聊天里，也不应让模型读取代码或执行命令。
+    """
+    return wrap_bridge_context(
+        [
+            "这是交付任务面板的「聊天自动命名」回合：请根据一条新聊天的首轮沟通内容起标题。",
+            "",
+            "用户的首条需求或任务说明:",
+            (user_message or "").strip() or "（用户本轮没有文字输入）",
+            "",
+            "AI 首轮回复（可能很长，只取其中的主旨）:",
+            (reply or "").strip()[:4000] or "（本轮没有回复正文）",
+            "",
+            "要求:",
+            f"- 只输出标题本身，一行，不超过 {MAX_CONVERSATION_TITLE_CHARS} 个字，用中文。",
+            "- 标题要说清本次要做的事，能在聊天列表里被一眼认出，不要写成「需求」「任务」「优化」这类空话。",
+            "- 回复正文可能还没生成，这时只按用户的说明起名，不要等也不要追问。",
+            "- 不要引号、句号、序号、Markdown 记号，不要任何解释或前后缀。",
+            "- 不要读代码、不要执行命令、不要修改任何文件，也不要调用任务面板命令。",
+        ],
+        "请为这条聊天起一个标题，只回标题本身。",
+    )
+
+
+def conversation_title_of(text: str) -> str:
+    """把命名回合的回复收敛成一行标题：模型偶尔会带上引号、前缀或多余的说明。"""
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    # 「标题如下：」这类引导行不是标题，丢掉之后再取第一行。
+    lines = [line for line in lines if not line.endswith((":", "："))] or lines
+    if not lines:
+        return ""
+    candidate = re.sub(r"^[#>*\-\d.、\s]+", "", lines[0])
+    candidate = re.sub(r"^(?:标题|聊天标题|会话标题|需求标题|需求名称|任务标题)\s*[:：]\s*", "", candidate)
+    candidate = candidate.strip("*_`\"'“”‘’「」《》【】 \t").strip()
+    candidate = candidate.rstrip("。.！!")
+    return candidate[:MAX_CONVERSATION_TITLE_CHARS]
+
+
+# 需求名称留空时仍复用同一套标题生成和清洗规则；保留旧函数名，避免插件扩展脚本失效。
+REQUIREMENT_NAME_TIMEOUT_SECONDS = CONVERSATION_TITLE_TIMEOUT_SECONDS
+MAX_REQUIREMENT_NAME_CHARS = MAX_CONVERSATION_TITLE_CHARS
+
+
+def build_requirement_name_prompt(user_message: str, reply: str) -> str:
+    return build_conversation_title_prompt(user_message, reply)
+
+
+def requirement_name_of(text: str) -> str:
+    return conversation_title_of(text)
+
+
+# 开聊那一刻先用首条消息的前几个字占住需求名称：起名要跑一轮模型，最快也要几秒，
+# 这几秒里面板上只能显示需求编号，用户看着就像没生效。占位名等 AI 起好名再换掉。
+MAX_REQUIREMENT_PLACEHOLDER_CHARS = 10
+
+
+def placeholder_requirement_name(user_message: str) -> str:
+    """用户首条消息的前几个字，去掉附件上下文和 Markdown 记号后取头一段。"""
+    text = text_without_attachment_context(str(user_message or ""))
+    text = re.sub(r"^[#>*\-\d.、\s]+", "", " ".join(text.split()))
+    text = text.strip("*_`\"'“”‘’「」《》【】 \t")
+    return text[:MAX_REQUIREMENT_PLACEHOLDER_CHARS].strip()
+
+
 def build_planning_follow_up_prompt(
     program_id: int,
     context: dict[str, Any],
@@ -1455,6 +1726,7 @@ def build_planning_follow_up_prompt(
     workspace: Path | None = None,
     mention_context: list[str] | None = None,
     include_detail: bool = False,
+    thread_id: str = "",
 ) -> str:
     """同一条需求拆解会话的追加回合，只带会变的和丢不起的那几项。
 
@@ -1476,20 +1748,23 @@ def build_planning_follow_up_prompt(
     split_tasks = bool(requirement.get("splitTasks", True))
     outline_path = requirement_outline_path_of(requirement_key).as_posix() if requirement_key else ""
     document_directory = requirement_document_directory_of(requirement_key).as_posix() if requirement_key else ""
-    # 大纲还没落盘时，需求正文在本会话里只存在于首轮那条消息，会话一被压缩就彻底没了；
-    # 这种情况下每轮都重发正文，直到大纲写出来接管这份沉淀。
-    outline_written = readable_document(workspace, outline_path)
+    temp_path = (
+        planning_temp_document_path(str(requirement.get("name") or ""), requirement_key, thread_id)
+        if thread_id else None
+    )
+    # 正式大纲在预览期不落盘；由聊天级 temp.md 接管压缩后的上下文。
+    temp_written = bool(temp_path and temp_path.is_file())
     detail_lines = (
         [
             "需求详细信息（用户已在面板上改过，以这一版为准）:"
             if include_detail
-            else "需求详细信息（需求大纲尚未落盘，这里重发一份，避免会话压缩后丢失）:",
+            else "需求详细信息（聊天过程摘要尚未落盘，这里重发一份，避免会话压缩后丢失）:",
             str(requirement.get("detail") or "（未填写）"),
         ]
-        if include_detail or not outline_written
+        if include_detail or not temp_written
         else [
             "需求详细信息与本会话首轮给出的一致，没有变化；"
-            f"若上下文里已经找不到，就去读 `{outline_path}` 里已确认的需求背景与范围。",
+            f"若上下文里已经找不到，就去读 `{temp_path.as_posix()}` 里的上一轮总结。",
         ]
     )
     prototype_lines = (
@@ -1522,7 +1797,7 @@ def build_planning_follow_up_prompt(
         f"任务类型偏好: {selected_kind or '由你判断'}",
         f"现有里程碑键（取值只能从中选）: {'、'.join(stage_keys) or '无'}",
         f"现有模块键（取值只能从中选）: {'、'.join(module_keys) or '无'}",
-        *requirement_outline_rule_lines(outline_path),
+        *requirement_outline_rule_lines(outline_path, False, temp_path.as_posix() if temp_path else ""),
         *document_lines,
         *prototype_lines,
         *(mention_context or []),
@@ -1535,8 +1810,8 @@ def build_planning_follow_up_prompt(
         "回复结尾照旧提示用户：确认无误后点「确认并写入」，要调整就直接回复修改意见。",
         (
             f"本会话如果被压缩过，上面提到的需求背景和既往结论你在上下文里可能已经找不到："
-            f"先读 `{outline_path}` 把上下文接回来再动手，不要凭印象往下接。"
-            if outline_path
+            f"先读 `{temp_path.as_posix()}` 把上下文接回来再动手，不要凭印象往下接。"
+            if temp_path
             else "本会话如果被压缩过，先向用户确认需求背景和既往结论，不要凭印象往下接。"
         ),
         "本上下文标记闭合之后的内容，是用户本轮输入的原文。",
@@ -3419,8 +3694,18 @@ def merged_conversation_catalog(bindings: list[dict[str, Any]]) -> tuple[list[di
             if not thread_id:
                 continue
             previous = entries.get(thread_id)
-            if previous is None or str(entry.get("updatedAt") or "") >= str(previous.get("updatedAt") or ""):
-                entries[thread_id] = dict(entry)
+            # 同一条 thread 可能出现在多行会话记录的目录里；真正持有它的是 externalSessionId
+            # 指向它的那一行，归属执行器只能按这一行判定，否则跨工具会读错缓存。
+            owns_thread = str(binding.get("externalSessionId") or "") == thread_id
+            previous_owns_thread = str((owners.get(thread_id) or {}).get("externalSessionId") or "") == thread_id
+            if previous is not None and previous_owns_thread and not owns_thread:
+                continue
+            if (
+                previous is None
+                or (owns_thread and not previous_owns_thread)
+                or str(entry.get("updatedAt") or "") >= str(previous.get("updatedAt") or "")
+            ):
+                entries[thread_id] = {**entry, "executorType": executor_provider_of(binding)}
                 owners[thread_id] = binding
     catalog = sorted(entries.values(), key=lambda entry: str(entry.get("updatedAt") or ""), reverse=True)
     return catalog, owners
@@ -3496,6 +3781,250 @@ def validate_task_identity(value: Any) -> tuple[str, int, str]:
     return "", program_id, item_key
 
 
+def journal_item(item: dict[str, Any]) -> dict[str, Any]:
+    """把一条实时条目收敛成可落盘、可回放的形状。
+
+    面板从来只展示推理的 `summary`，原始推理正文（`content` / `encryptedContent`）
+    既不上屏也不归档；日志是同一份数据的另一种存放方式，同样不能把它留下来。
+    命令输出体积大且面板不展示，一并丢掉。
+    """
+    kept = {key: value for key, value in item.items() if key not in {"aggregatedOutput", "output", "stdout", "stderr"}}
+    if str(item.get("type") or "") == "reasoning":
+        summary = item.get("summary")
+        kept = {
+            "id": item.get("id"),
+            "type": "reasoning",
+            "status": item.get("status"),
+            "summary": summary if isinstance(summary, (str, list)) else [],
+        }
+    return kept
+
+
+REASONING_SUMMARY_METHODS = {"item/reasoning/summaryPartAdded", "item/reasoning/summaryTextDelta"}
+JOURNAL_METHODS = {"turn/started", "turn/completed", "item/started", "item/completed"} | REASONING_SUMMARY_METHODS
+
+
+class ThreadItemJournal:
+    """记录 app-server 的实时条目流，补上 `thread/read` 读不回来的执行过程。
+
+    协议里对 `thread/rollback` 的说明写明了这点：Turn 里存的 ThreadItems 是有损的，
+    命令执行这类交互不会被持久化，`thread/resume` 同理。实测一个「先跑 echo 再回答」
+    的回合，实时流里有 reasoning 和 commandExecution，`thread/read` 只剩首尾两条消息。
+    """
+
+    def __init__(self, root: Path = CODEX_THREAD_ITEMS_DIR) -> None:
+        self.root = root
+        self.lock = threading.Lock()
+        # item 事件不一定带 turnId，按线程记住当前回合，落到正确的那一轮上。
+        self.current_turns: dict[str, str] = {}
+
+    def _path(self, thread_id: str) -> Path:
+        return self.root / f"{hashlib.sha256(thread_id.encode('utf-8')).hexdigest()[:32]}.json"
+
+    def read(self, thread_id: str) -> list[dict[str, Any]]:
+        if not thread_id:
+            return []
+        path = self._path(thread_id)
+        with self.lock:
+            if not path.is_file():
+                return []
+            try:
+                value = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return []
+        turns = value.get("turns") if isinstance(value, dict) else None
+        return [turn for turn in turns or [] if isinstance(turn, dict)]
+
+    def _write(self, thread_id: str, turns: list[dict[str, Any]]) -> None:
+        path = self._path(thread_id)
+        payload = {"threadId": thread_id, "updatedAt": utc_now(), "turns": turns[-MAX_THREAD_JOURNAL_TURNS:]}
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temp_path = path.with_suffix(".tmp")
+            temp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            os.chmod(temp_path, 0o600)
+            os.replace(temp_path, path)
+        except OSError as exc:
+            print(f"保存 Codex 会话过程记录失败：{thread_id}: {exc}", file=sys.stderr, flush=True)
+
+    def record(self, message: dict[str, Any]) -> None:
+        """吃一条 app-server 通知；不认识的方法直接忽略，绝不打断读流线程。"""
+        method = str(message.get("method") or "")
+        if method not in JOURNAL_METHODS:
+            return
+        params = message.get("params") if isinstance(message.get("params"), dict) else {}
+        thread_id = str(params.get("threadId") or "")
+        if not thread_id:
+            return
+        turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
+        item = params.get("item") if isinstance(params.get("item"), dict) else {}
+        turn_id = str(params.get("turnId") or turn.get("id") or item.get("turnId") or "")
+        with self.lock:
+            if method in {"turn/started", "turn/completed"} and turn_id:
+                self.current_turns[thread_id] = turn_id
+            turn_id = turn_id or self.current_turns.get(thread_id, "")
+            if not turn_id:
+                return
+            turns = self.read_unlocked(thread_id)
+            entry = next((value for value in turns if str(value.get("id") or "") == turn_id), None)
+            if entry is None:
+                entry = {"id": turn_id, "status": "inProgress", "createdAt": utc_now(), "completedAt": "", "items": []}
+                turns.append(entry)
+            if method == "turn/started":
+                entry["status"] = str(turn.get("status") or entry.get("status") or "inProgress")
+            elif method == "turn/completed":
+                entry["status"] = str(turn.get("status") or "completed")
+                entry["completedAt"] = utc_now()
+                self.current_turns.pop(thread_id, None)
+            elif method in REASONING_SUMMARY_METHODS:
+                # 推理摘要不在 item 上，它是单独流出来的：item/completed 里的 summary 实测是空的。
+                item_id = str(params.get("itemId") or params.get("targetItemId") or item.get("id") or "")
+                if not item_id:
+                    return
+                target = self._reasoning_entry(entry, item_id)
+                index = params.get("summaryIndex")
+                if not (isinstance(index, int) and index >= 0):
+                    # 没给下标时：新分片就是往后追一段，文本增量落在当前这一段上。
+                    index = len(target["summary"]) if method == "item/reasoning/summaryPartAdded" else max(0, len(target["summary"]) - 1)
+                while len(target["summary"]) <= index:
+                    target["summary"].append("")
+                target["summary"][index] += str(params.get("delta") or params.get("text") or "")
+            else:
+                item_id = str(item.get("id") or "")
+                if not item_id:
+                    return
+                recorded = journal_item(item)
+                items = entry.setdefault("items", [])
+                existing = next((index for index, value in enumerate(items) if str(value.get("id") or "") == item_id), -1)
+                if existing >= 0:
+                    # 摘要是流式攒出来的，别被终态那条空 summary 覆盖掉。
+                    if not recorded.get("summary") and items[existing].get("summary"):
+                        recorded["summary"] = items[existing]["summary"]
+                    items[existing] = recorded
+                else:
+                    items.append(recorded)
+                del items[:-MAX_THREAD_JOURNAL_ITEMS]
+            self._write(thread_id, turns)
+
+    @staticmethod
+    def _reasoning_entry(turn: dict[str, Any], item_id: str) -> dict[str, Any]:
+        """摘要分片可能先于 item/started 到达，需要时就地建一条推理条目。"""
+        items = turn.setdefault("items", [])
+        target = next((value for value in items if str(value.get("id") or "") == item_id), None)
+        if target is None:
+            target = {"id": item_id, "type": "reasoning", "status": "inProgress", "summary": []}
+            items.append(target)
+        if not isinstance(target.get("summary"), list):
+            target["summary"] = [target["summary"]] if isinstance(target.get("summary"), str) and target["summary"] else []
+        return target
+
+    def read_unlocked(self, thread_id: str) -> list[dict[str, Any]]:
+        path = self._path(thread_id)
+        if not path.is_file():
+            return []
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        turns = value.get("turns") if isinstance(value, dict) else None
+        return [turn for turn in turns or [] if isinstance(turn, dict)]
+
+
+THREAD_ITEMS = ThreadItemJournal()
+
+
+def journal_item_signature(item: dict[str, Any]) -> tuple[str, str]:
+    """按内容认条目，不按 id 认。
+
+    实测同一条消息在实时流和 `thread/read` 里 id 并不相同（服务端落库时会重新分配），
+    只按 id 去重会把整轮消息重复一遍。
+    """
+    item_type = str(item.get("type") or "")
+    if item_type == "userMessage":
+        text = text_from_user_item(item)
+    elif item_type == "reasoning":
+        text = reasoning_summary_text(item)
+    elif item_type == "commandExecution":
+        command = item.get("command") or item.get("commands") or ""
+        text = "\n".join(str(part) for part in command) if isinstance(command, list) else str(command)
+    elif item_type in {"fileChange", "fileEdit"}:
+        text = "\n".join(change["path"] for change in file_changes_of(item))
+    else:
+        text = str(item.get("text") or item.get("content") or item.get("tool") or item.get("name") or "")
+    return item_type, " ".join(text.split())
+
+
+def reasoning_summary_parts(item: dict[str, Any]) -> list[str]:
+    """推理条目里的一段段摘要。字符串形式的按空行拆开，和流式分片对齐。"""
+    summary = item.get("summary") if isinstance(item, dict) else None
+    parts = summary if isinstance(summary, list) else re.split(r"\n{2,}", summary) if isinstance(summary, str) else []
+    return [part.strip() for part in parts if isinstance(part, str) and part.strip()]
+
+
+def normalized_reasoning_part(part: str) -> str:
+    return " ".join(part.split())
+
+
+def deduped_reasoning_item(item: dict[str, Any], known: set[str]) -> dict[str, Any] | None:
+    """`thread/read` 事后会把整轮摘要合成一条还回来，实时流里已经有的段落要去掉。
+
+    两边 id 对不上（服务端落库时重新分配），只能按内容认；全都见过就整条丢掉，
+    否则回合末尾会把前面的「分析」原样重放一遍。
+    """
+    remaining = [part for part in reasoning_summary_parts(item) if normalized_reasoning_part(part) not in known]
+    if not remaining:
+        return None
+    known.update(normalized_reasoning_part(part) for part in remaining)
+    return {**item, "summary": remaining}
+
+
+def merge_journal_turns(thread: dict[str, Any], journal_turns: list[dict[str, Any]]) -> dict[str, Any]:
+    """用实时记录补全 `thread/read` 的回合正文。
+
+    以服务端返回的回合顺序为准（它才知道整个线程的历史），逐轮把记录里的条目铺开；
+    服务端有、记录里没有的条目（比如桥接中途才接上的那一轮）按原样补在后面。
+    """
+    if not isinstance(thread, dict) or not journal_turns:
+        return thread
+    journal = {str(turn.get("id") or ""): turn for turn in journal_turns if str(turn.get("id") or "")}
+    if not journal:
+        return thread
+    turns = thread.get("turns") if isinstance(thread.get("turns"), list) else []
+    merged: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for turn in turns:
+        if not isinstance(turn, dict):
+            continue
+        turn_id = str(turn.get("id") or "")
+        seen.add(turn_id)
+        recorded = journal.get(turn_id)
+        if recorded is None:
+            merged.append(turn)
+            continue
+        items = [item for item in recorded.get("items") or [] if isinstance(item, dict)]
+        known = {journal_item_signature(item) for item in items}
+        # 摘要按段去重，不按整条：实时流一段一条，服务端事后给的是合在一起的全文。
+        known_parts = {
+            normalized_reasoning_part(part)
+            for item in items if str(item.get("type") or "") == "reasoning"
+            for part in reasoning_summary_parts(item)
+        }
+        for item in turn.get("items") or []:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("type") or "") == "reasoning":
+                deduped = deduped_reasoning_item(item, known_parts)
+                if deduped is not None:
+                    items.append(deduped)
+                continue
+            if journal_item_signature(item) not in known:
+                items.append(item)
+        merged.append({**turn, "items": items})
+    # 线程刚跑完就读，服务端有时还没把这一轮写进历史；记录里已经有了就直接补上。
+    merged.extend(turn for turn in journal_turns if str(turn.get("id") or "") not in seen)
+    return {**thread, "turns": merged}
+
+
 class AppServerClient:
     def __init__(self, workspace: Path, event_callback: Any = None, environment: dict[str, str] | None = None):
         self.workspace = workspace
@@ -3538,6 +4067,11 @@ class AppServerClient:
         for line in self.process.stdout:
             try:
                 message = json.loads(line)
+                # 先留痕再分发：`thread/read` 读不回执行过程，只有这条实时流是完整的。
+                try:
+                    THREAD_ITEMS.record(message)
+                except Exception as exc:  # 记录失败不能拖垮读流线程
+                    print(f"记录 Codex 会话过程失败：{exc}", file=sys.stderr, flush=True)
                 if self.event_callback is not None:
                     self.event_callback(message)
                 if "id" in message:
@@ -3628,10 +4162,10 @@ class AppServerClient:
             turn_params["model"] = model
         if reasoning_effort:
             turn_params["effort"] = reasoning_effort
-        # ``auto`` asks Codex for the most detailed supported *summary*, never
-        # for raw reasoning. The resulting summary is streamed and retained
-        # below as part of the task-board conversation.
-        turn_params["summary"] = "auto"
+        # ``detailed`` asks Codex for the fullest supported *summary*, never for
+        # raw reasoning. 合法取值是 auto / concise / detailed / none；auto 由模型自己
+        # 决定详略，实测经常只给一两句，和桌面版看到的过程对不上。
+        turn_params["summary"] = TURN_REASONING_SUMMARY
         self.send(
             "turn/start",
             3,
@@ -3640,6 +4174,13 @@ class AppServerClient:
         turn_result = self.wait_response(3)
         turn_id = str((turn_result.get("turn") or {}).get("id") or "")
         return thread_id, turn_id
+
+    def set_thread_name(self, thread_id: str, name: str, request_id: int = 2) -> None:
+        """Rename an existing Codex thread after its first answer is available."""
+        if not thread_id or not name.strip():
+            return
+        self.send("thread/name/set", request_id, {"threadId": thread_id, "name": name.strip()[:128]})
+        self.wait_response(request_id)
 
     def resume_thread(self, thread_id: str, request_id: int = 10) -> dict[str, Any]:
         self.send("thread/resume", request_id, {"threadId": thread_id, "cwd": str(self.workspace)})
@@ -3668,7 +4209,7 @@ class AppServerClient:
             params["model"] = model
         if reasoning_effort:
             params["effort"] = reasoning_effort
-        params["summary"] = "auto"
+        params["summary"] = TURN_REASONING_SUMMARY
         self.send(
             "turn/start",
             request_id,
@@ -3723,7 +4264,9 @@ class AppServerClient:
         self.send("thread/read", request_id, {"threadId": thread_id, "includeTurns": True})
         result = self.wait_response(request_id)
         thread = result.get("thread") or {}
-        return thread if isinstance(thread, dict) else {}
+        if not isinstance(thread, dict):
+            return {}
+        return merge_journal_turns(thread, THREAD_ITEMS.read(thread_id))
 
     def next_request_id(self) -> int:
         request_id = int(getattr(self, "request_sequence", 1000)) + 1
@@ -3816,6 +4359,26 @@ CLAUDE_TRANSCRIPTS = ClaudeTranscriptStore()
 # Claude 的工具调用要还原成面板认识的条目类型，才能和 Codex 的会话长得一样。
 CLAUDE_FILE_TOOLS = {"Edit", "MultiEdit", "Write", "NotebookEdit"}
 CLAUDE_COMMAND_TOOLS = {"Bash", "BashOutput", "KillShell"}
+# Codex 的过程是一条条 shell 命令，面板能从命令本身看出"这一步在读文件还是在检索"。
+# Claude 用的是具名工具，命令行里没有对应的字面量，所以这里直接把语义标出来。
+CLAUDE_READ_TOOLS = {"Read", "NotebookRead"}
+CLAUDE_SEARCH_TOOLS = {"Grep", "Glob"}
+
+
+def text_line_count(value: Any) -> int:
+    text = str(value or "")
+    return len(text.splitlines()) if text else 0
+
+
+def claude_edit_line_counts(name: str, payload: dict[str, Any]) -> tuple[int, int]:
+    """Claude 不给 diff，只能按替换前后的文本数行，得出和 Codex 同量级的 `+N -M`。"""
+    if name == "Write":
+        return text_line_count(payload.get("content")), 0
+    edits = payload.get("edits") if isinstance(payload.get("edits"), list) else []
+    units = [edit for edit in edits if isinstance(edit, dict)] or [payload]
+    added = sum(text_line_count(unit.get("new_string")) for unit in units)
+    removed = sum(text_line_count(unit.get("old_string")) for unit in units)
+    return added, removed
 
 
 def claude_tool_item(block: dict[str, Any]) -> dict[str, Any]:
@@ -3831,8 +4394,20 @@ def claude_tool_item(block: dict[str, Any]) -> dict[str, Any]:
         paths = [str(payload.get("file_path") or payload.get("notebook_path") or "").strip()]
         paths.extend(str(edit.get("file_path") or "").strip() for edit in edits if isinstance(edit, dict))
         kind = "add" if name == "Write" else "modify"
-        changes = [{"path": path, "kind": kind} for path in dict.fromkeys(paths) if path]
+        added, removed = claude_edit_line_counts(name, payload)
+        changes = [{"path": path, "kind": kind, "added": added, "removed": removed} for path in dict.fromkeys(paths) if path]
         return {**item, "type": "fileChange", "changes": changes}
+    if name in CLAUDE_READ_TOOLS:
+        target = str(payload.get("file_path") or payload.get("notebook_path") or "").strip()
+        return {**item, "type": "dynamicToolCall", "tool": name, "action": "read", "target": target}
+    if name in CLAUDE_SEARCH_TOOLS:
+        target = str(payload.get("path") or payload.get("glob") or "").strip()
+        pattern = str(payload.get("pattern") or "").strip()
+        return {**item, "type": "dynamicToolCall", "tool": name, "action": "search", "target": target, "pattern": pattern}
+    if name.startswith("mcp__"):
+        # mcp__<服务>__<工具>：拆开才能显示成和 Codex 一样的「服务/工具」。
+        parts = name.split("__")
+        return {**item, "type": "mcpToolCall", "server": parts[1] if len(parts) > 2 else "", "tool": parts[-1]}
     return {**item, "type": "dynamicToolCall", "tool": name}
 
 
@@ -3907,6 +4482,9 @@ class ClaudeCLIClient:
     def _consume(self, turn: dict[str, Any]) -> None:
         assert self.process is not None and self.process.stdout is not None
         final_text = ""
+        # 鉴权过期这类失败，Claude 会照常收尾并把错误当正文吐出来，只有 result 里的
+        # is_error 说明这轮没成。不认它的话，面板会把「登录过期」显示成一条完成的回答。
+        result_failed = False
         pending_tools: dict[str, dict[str, Any]] = {}
         for line in self.process.stdout:
             try:
@@ -3953,20 +4531,24 @@ class ClaudeCLIClient:
                 self._persist()
             if event_type == "result":
                 final_text = str(event.get("result") or final_text)
+                result_failed = bool(event.get("is_error"))
                 if not self.transcript_key:
                     self.thread_id = str(event.get("session_id") or self.thread_id)
         return_code = self.process.wait()
+        failed = return_code != 0 or result_failed
         if final_text and not any(item.get("text") == final_text for item in turn["items"]):
-            turn["items"].append({"id": secrets.token_urlsafe(8), "type": "agentMessage", "text": final_text, "status": "completed", "phase": "final_answer"})
+            turn["items"].append({"id": secrets.token_urlsafe(8), "type": "agentMessage", "text": final_text, "status": "failed" if failed else "completed", "phase": "final_answer"})
         elif final_text:
             # 最终回复和最后一条 assistant 文本相同：把它标成终态，面板才认得出这是结论。
             for item in reversed(turn["items"]):
                 if item.get("type") == "agentMessage" and item.get("text") == final_text:
                     item["phase"] = "final_answer"
+                    if failed:
+                        item["status"] = "failed"
                     break
         for item in pending_tools.values():
-            item["status"] = "completed" if return_code == 0 else "failed"
-        self.turn_status = "completed" if return_code == 0 else "failed"
+            item["status"] = "failed" if failed else "completed"
+        self.turn_status = "failed" if failed else "completed"
         turn.update({"status": self.turn_status, "completedAt": utc_now()})
         self._persist()
 
@@ -3982,6 +4564,11 @@ class ClaudeCLIClient:
         text = message_with_attachments(prompt, attachments or [])
         thread_id, turn_id = self._start(text, model=model, reasoning_effort=reasoning_effort, fast_mode=fast_mode)
         return self.thread_id, turn_id
+
+    def set_thread_name(self, thread_id: str, name: str, request_id: int = 2) -> None:
+        # Claude CLI has no persistent thread-name endpoint. Its panel-side session
+        # metadata is updated by the bridge, which is the title users see here.
+        return
 
     def resume_thread(self, thread_id: str, request_id: int = 10) -> dict[str, Any]:
         self.thread_id = thread_id
@@ -4279,6 +4866,58 @@ class WorkspaceArtifactStore:
         self.workspace = workspace.resolve()
         self.root = self.workspace / ".codex" / ARTIFACT_DIRECTORY_NAME
         self.lock = threading.Lock()
+        self.index_cache: dict[str, list[str]] | None = None
+        self.index_at = 0.0
+
+    def _file_index(self) -> dict[str, list[str]]:
+        """文件名 → 工作区相对路径。用 git 的清单，天然排除 .gitignore 里的构建产物。"""
+        now = time.monotonic()
+        if self.index_cache is not None and now - self.index_at < WORKSPACE_FILE_INDEX_TTL_SECONDS:
+            return self.index_cache
+        index: dict[str, list[str]] = {}
+        try:
+            completed = run_git(
+                self.workspace,
+                ["ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+                timeout=30,
+            )
+            entries = (completed.stdout or "").split("\0") if completed.returncode == 0 else []
+        except BridgeFailure:
+            entries = []
+        for entry in entries[:MAX_WORKSPACE_FILE_INDEX_ENTRIES]:
+            relative_text = entry.strip()
+            if not relative_text:
+                continue
+            index.setdefault(relative_text.rsplit("/", 1)[-1], []).append(relative_text)
+        self.index_cache = index
+        self.index_at = now
+        return index
+
+    def _locate(self, raw_path: str) -> tuple[Path, Path]:
+        """把回复里的链接落到工作区里的真实文件。"""
+        candidate = unquote(str(raw_path or "").strip())
+        # 链接常带行号（`foo.kt:42`、`foo.kt#L42`），指的还是同一份文件。
+        candidate = re.sub(r"(?::\d+){1,2}$", "", candidate.split("#", 1)[0]).strip()
+        if not candidate:
+            raise BridgeFailure("产物路径为空")
+        # 外部链接、锚点不是工作区文件，绝不能靠文件名反查蒙到一份同名文件上。
+        if candidate.startswith("//") or re.match(r"^[a-zA-Z][a-zA-Z\d+.-]*:", candidate):
+            raise BridgeFailure("链接不是项目内文件")
+        try:
+            return self._resolve(candidate)
+        except BridgeFailure:
+            pass
+        # 只写了文件名或写了一截尾部路径：全工作区反查，命中唯一一份才认，
+        # 同名多份时宁可不给预览，也不能点开另一个目录下的同名文件。
+        normalized = re.sub(r"^(?:\./)+", "", candidate.replace("\\", "/")).lstrip("/")
+        if not normalized or ".." in normalized.split("/"):
+            raise BridgeFailure("产物路径无效")
+        matches = self._file_index().get(normalized.rsplit("/", 1)[-1]) or []
+        if "/" in normalized:
+            matches = [item for item in matches if item == normalized or item.endswith(f"/{normalized}")]
+        if len(matches) != 1:
+            raise BridgeFailure("产物文件不存在" if not matches else "同名文件不唯一，无法确定预览目标")
+        return self._resolve(matches[0])
 
     def _resolve(self, raw_path: str) -> tuple[Path, Path]:
         candidate = Path(raw_path.strip())
@@ -4307,7 +4946,7 @@ class WorkspaceArtifactStore:
             self.root.mkdir(parents=True, exist_ok=True)
             for raw_path in paths:
                 try:
-                    path, relative = self._resolve(raw_path)
+                    path, relative = self._locate(raw_path)
                 except BridgeFailure:
                     continue
                 relative_text = relative.as_posix()
@@ -4432,8 +5071,8 @@ class ExecutionBridge:
         return program if isinstance(program, dict) else {}
 
     def _project_chat_archive_enabled(self, config: dict[str, Any], program_id: int) -> bool:
-        """The project-level Git switch is the explicit opt-in for workspace Chat/ archives."""
-        return bool(self._project_content_sync_settings(config, program_id).get("gitEnabled"))
+        """The explicit project Git chat-sync switch controls workspace chat/ archives."""
+        return bool(self._project_content_sync_settings(config, program_id).get("gitChatSyncEnabled"))
 
     @staticmethod
     def _project_cloud_sync_scopes(program: dict[str, Any]) -> set[str]:
@@ -4507,6 +5146,7 @@ class ExecutionBridge:
         resource_kind: str,
         resource_key: str,
         resource_name: str,
+        requirement_key: str = "",
         conversation_title: str,
         thread_id: str,
         provider: str,
@@ -4515,7 +5155,7 @@ class ExecutionBridge:
     ) -> None:
         """Best-effort workspace archive; failures must not hide the task result."""
         program = self._project_content_sync_settings(config, program_id)
-        archive_to_workspace = bool(program.get("gitEnabled"))
+        archive_to_workspace = bool(program.get("gitChatSyncEnabled"))
         cloud_scopes = self._project_cloud_sync_scopes(program)
         if not archive_to_workspace and not cloud_scopes:
             return
@@ -4523,13 +5163,20 @@ class ExecutionBridge:
             if thread_id and (archive_to_workspace or "chat" in cloud_scopes):
                 thread = client.read_thread(thread_id, request_id=client.next_request_id())
                 turns = thread.get("turns") if isinstance(thread, dict) else []
-                relative = chat_archive_relative_path(resource_kind, resource_key, resource_name, thread_id, phase)
+                relative = chat_archive_relative_path(
+                    resource_kind,
+                    resource_key,
+                    conversation_title or resource_name,
+                    thread_id,
+                    requirement_key=requirement_key,
+                )
                 if archive_to_workspace:
                     relative = archive_chat_snapshot(
                         self.workspace,
                         resource_kind=resource_kind,
                         resource_key=resource_key,
                         resource_name=resource_name,
+                        requirement_key=requirement_key,
                         conversation_title=conversation_title,
                         thread_id=thread_id,
                         provider=provider,
@@ -4549,6 +5196,7 @@ class ExecutionBridge:
                             resource_kind=resource_kind,
                             resource_key=resource_key,
                             resource_name=resource_name,
+                            requirement_key=requirement_key,
                             conversation_title=conversation_title,
                             thread_id=thread_id,
                             provider=provider,
@@ -4621,13 +5269,18 @@ class ExecutionBridge:
         """
         if not requirement_key:
             return None
+        # 目录不按执行器过滤：换了工具也要能看见此前用另一个工具留下的聊天，正文再按线程自己的执行器读。
         rows = planner.request_api(
             config,
             "GET",
             "/delivery/requirement/planning-sessions",
-            query={"programId": program_id, "requirementKey": requirement_key, "executorType": provider},
+            query={"programId": program_id, "requirementKey": requirement_key},
         )
-        rows = [row for row in (rows or []) if isinstance(row, dict) and str(row.get("threadId") or "")]
+        # 原型会话与拆解会话共用这张表，靠用途后缀区分；这里只要拆解本身。
+        rows = [
+            row for row in (rows or [])
+            if isinstance(row, dict) and str(row.get("threadId") or "") and same_executor_purpose(row, "")
+        ]
         if not rows:
             return None
         catalog = [
@@ -4637,6 +5290,7 @@ class ExecutionBridge:
                 "createdAt": str(row.get("createdAt") or ""),
                 "updatedAt": str(row.get("updatedAt") or ""),
                 "status": str(row.get("status") or "completed"),
+                "executorType": executor_provider_of(row, provider),
                 "active": False,
             }
             for row in rows
@@ -4646,6 +5300,7 @@ class ExecutionBridge:
         baseline = metadata.get("baseline") if isinstance(metadata.get("baseline"), dict) else {}
         return {
             "threadId": str(current.get("threadId") or ""),
+            "executorType": executor_provider_of(current, provider),
             "turnId": str(metadata.get("turnId") or ""),
             "stageKey": str(metadata.get("stageKey") or ""),
             "moduleKey": str(metadata.get("moduleKey") or ""),
@@ -4673,6 +5328,8 @@ class ExecutionBridge:
             (item for item in session.get("catalog") or [] if str(item.get("threadId")) == thread_id),
             {},
         )
+        # 线程归属跟着它自己的执行器走，别被当前选中的工具改写。
+        provider = executor_provider_of(entry, session.get("executorType") or provider)
         result = session.get("result") or {}
         metadata: dict[str, Any] = {
             "turnId": str(session.get("turnId") or ""),
@@ -4747,6 +5404,7 @@ class ExecutionBridge:
                 "programId": program_id,
                 "requirementKey": requirement_key,
                 "threadId": "",
+                "executorType": provider,
                 "turns": [],
                 "conversations": [],
                 "active": False,
@@ -4756,6 +5414,8 @@ class ExecutionBridge:
                 "selectedKind": "",
                 "result": {"items": [], "stages": [], "modules": [], "itemKeys": [], "stageKeys": [], "moduleKeys": [], "updatedAt": ""},
             }
+        thread_entry = next((entry for entry in catalog if str(entry.get("threadId")) == thread_id), {})
+        provider = executor_provider_of(thread_entry, session.get("executorType") or provider)
         client = (
             active["client"]
             if active is not None and active.get("threadId") == thread_id
@@ -4777,6 +5437,8 @@ class ExecutionBridge:
                 "programId": program_id,
                 "requirementKey": requirement_key,
                 "threadId": thread_id,
+                # 选中的这条线程属于哪个工具：面板据此对齐模型下拉和续聊参数。
+                "executorType": provider,
                 # 附件和产物按需求的伪任务键归档，拆解会话也要能把图片和文件回显出来。
                 "turns": serialize_turns(
                     thread.get("turns") or [],
@@ -4842,7 +5504,11 @@ class ExecutionBridge:
                         message,
                         [
                             *requirement_outline_rule_lines(
-                                requirement_outline_path_of(requirement_key).as_posix() if requirement_key else ""
+                                requirement_outline_path_of(requirement_key).as_posix() if requirement_key else "",
+                                False,
+                                planning_temp_document_path(
+                                    str(requirement.get("name") or ""), requirement_key, str(active["threadId"])
+                                ).as_posix(),
                             ),
                             *requirement_document_rule_lines(requirement_key),
                             *mention_context,
@@ -4853,19 +5519,22 @@ class ExecutionBridge:
                 attachments,
                 request_id=active["client"].next_request_id(),
             )
+            active.setdefault("userMessages", []).append(message)
             self.progress.publish(identity, "message", "已追加拆解要求", message, "running")
             return {"accepted": True, "bizLine": biz_line, "programId": program_id, "requirementKey": requirement_key, "threadId": active["threadId"], "turnId": active["turnId"], "active": True}
         catalog = self._planning_catalog(session)
         known_thread_ids = {str(entry["threadId"]) for entry in catalog}
         if requested_thread_id and requested_thread_id not in known_thread_ids:
             raise BridgeFailure("所选拆解会话不存在")
-        if not session or new_conversation or not session.get("threadId"):
+        started_new_conversation = not session or new_conversation or not session.get("threadId")
+        if started_new_conversation:
             # 一条新会话还没出过预览，没有可确认的方案。
             if confirm_write:
                 raise BridgeFailure("请先梳理需求并生成拆解预览，再确认写入")
             if len(catalog) >= MAX_PLANNING_CONVERSATIONS:
                 raise BridgeFailure("该需求保留的拆解会话已达上限")
-            title = f"需求拆解 · {requirement.get('name') or context.get('program', {}).get('name') or program_id}"
+            # 名称留空的新需求先用需求编号占位；标题由开聊时并行跑的那轮自动命名尽快补上。
+            title = f"需求拆解 · {requirement.get('name') or requirement_key or context.get('program', {}).get('name') or program_id}"
             if catalog:
                 title = f"{title} V0.0.{len(catalog)}"
             client = create_ai_client(
@@ -4904,6 +5573,11 @@ class ExecutionBridge:
             }
         else:
             thread_id = requested_thread_id or str(session.get("threadId") or "")
+            # 已有会话只能用它自己的执行器续：线程正文在那个执行器的缓存里，换工具读不到。
+            provider = executor_provider_of(
+                next((entry for entry in catalog if str(entry.get("threadId")) == thread_id), {}),
+                session.get("executorType") or provider,
+            )
             detail_digest = planning_detail_digest(requirement)
             client = create_ai_client(
                 provider,
@@ -4917,12 +5591,16 @@ class ExecutionBridge:
                 # （「不要重复建任务」这条约束正是靠它成立，会话被压缩后必须还在）、大纲读写纪律、
                 # 本轮的选择与 @ 引用。确认写入是另一套指令（写入契约、命令行动作），仍然走全量。
                 follow_up_prompt = (
-                    build_planning_prompt(program_id, context, message, selected_stage, selected_module, selected_kind, requirement, True, self.workspace, mention_context)
+                    build_planning_prompt(
+                        program_id, context, message, selected_stage, selected_module, selected_kind,
+                        requirement, True, self.workspace, mention_context, thread_id,
+                    )
                     if confirm_write
                     else build_planning_follow_up_prompt(
                         program_id, context, message, selected_stage, selected_module, selected_kind, requirement,
                         self.workspace, mention_context,
                         include_detail=detail_digest != str(session.get("detailDigest") or ""),
+                        thread_id=thread_id,
                     )
                 )
                 turn_id = client.start_turn(
@@ -4945,7 +5623,16 @@ class ExecutionBridge:
                     entry["updatedAt"] = utc_now()
         with self.lock:
             self.active.add(identity)
-            self.active_runs[identity] = {"client": client, "threadId": thread_id, "turnId": turn_id, "planning": True, "provider": provider, "config": config, "programId": program_id}
+            self.active_runs[identity] = {
+                "client": client,
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "planning": True,
+                "provider": provider,
+                "config": config,
+                "programId": program_id,
+                "userMessages": [message],
+            }
         # 目录当场写回服务端：这一轮还没跑完桥接就重启，聊天列表里也得留着这条会话。
         self._save_planning_session(config, program_id, requirement_key, provider, session)
         self.progress.publish(
@@ -4955,9 +5642,18 @@ class ExecutionBridge:
             f"{provider_label(provider)} 正在{'调用任务规划插件写入任务' if confirm_write else '整理拆解预览，确认前不会写入任务'}。",
             "running",
         )
+        namer: threading.Thread | None = None
+        naming_outcome: dict[str, str] | None = None
+        if started_new_conversation:
+            namer, naming_outcome = self._start_conversation_naming(
+                identity, config, program_id, requirement_key, provider, model, fast_mode,
+                message, session, thread_id,
+            )
         threading.Thread(
             target=self._follow_planning,
-            args=(identity, client, config, program_id, requirement_key, provider, session, thread_id, turn_id),
+            args=(identity, client, config, program_id, requirement_key, provider, session, thread_id, turn_id,
+                  model, reasoning_effort, fast_mode, message, started_new_conversation, confirm_write,
+                  namer, naming_outcome),
             daemon=True,
         ).start()
         return {"accepted": True, "bizLine": biz_line, "programId": program_id, "requirementKey": requirement_key, "threadId": thread_id, "turnId": turn_id, "active": True}
@@ -4984,6 +5680,193 @@ class ExecutionBridge:
         self.progress.publish(identity, "status", "已请求停止拆解", "正在等待 Codex 中断当前回合。", "running")
         return {"accepted": True, "bizLine": biz_line, "programId": program_id, "requirementKey": requirement_key, "threadId": active["threadId"], "turnId": active["turnId"], "active": True}
 
+    def _name_conversation(
+        self,
+        config: dict[str, Any],
+        program_id: int,
+        provider: str,
+        model: str,
+        reasoning_effort: str,
+        fast_mode: bool,
+        user_message: str,
+        reply: str,
+    ) -> str:
+        """起一轮只读短会话，为新聊天生成标题；超时则保留原始占位标题。"""
+        client = create_ai_client(
+            provider,
+            self.workspace,
+            None,
+            codex_environment(config, program_id, write_allowed=False, provider=provider),
+        )
+        try:
+            thread_id, turn_id = client.start_task(
+                "聊天自动命名",
+                build_conversation_title_prompt(user_message, reply),
+                None,
+                model,
+                reasoning_effort=reasoning_effort,
+                fast_mode=fast_mode,
+            )
+            outcome: dict[str, str] = {}
+
+            def wait() -> None:
+                outcome["status"] = client.wait_turn(turn_id)
+
+            waiter = threading.Thread(target=wait, daemon=True)
+            waiter.start()
+            waiter.join(CONVERSATION_TITLE_TIMEOUT_SECONDS)
+            if waiter.is_alive():
+                return ""
+            status = outcome.get("status") or "failed"
+            if status != "completed":
+                return ""
+            turn = client.read_turn(thread_id, turn_id, client.next_request_id())
+            return conversation_title_of(final_agent_text_from_output(execution_output(status, turn)))
+        finally:
+            client.close()
+
+    @staticmethod
+    def _rename_conversation(client: AppServerClient | ClaudeCLIClient, thread_id: str, title: str) -> None:
+        """Keep the provider-native title aligned when that provider supports renaming."""
+        if not title:
+            return
+        try:
+            client.set_thread_name(thread_id, title, request_id=client.next_request_id())
+        except Exception as exc:
+            # 面板的会话目录仍会保存新标题；原生线程重命名失败不能影响交付结果。
+            print(f"同步原生会话标题失败：{thread_id}: {exc}", file=sys.stderr, flush=True)
+
+    @staticmethod
+    def _write_requirement_name(
+        config: dict[str, Any],
+        program_id: int,
+        requirement_key: str,
+        name: str,
+        replace: str = "",
+    ) -> None:
+        """把生成的标题落到需求名称上。
+
+        `replace` 是这次允许覆盖的旧名称：留空表示只写空名称，传占位名表示只换掉那个占位名。
+        名称是用户随时能自己改的字段，服务端按同一条件再判一次，两边都不会盖掉用户填的名字。
+        """
+        name = str(name or "").strip()
+        replace = str(replace or "").strip()
+        if not requirement_key or not name or name == replace:
+            return
+        try:
+            requirement = planner.requirement_record(config, program_id, requirement_key)
+            if str(requirement.get("name") or "").strip() != replace:
+                return
+            planner.request_api(
+                config,
+                "POST",
+                "/delivery/requirement/name/update",
+                body={
+                    "programId": program_id,
+                    "requirementKey": requirement_key,
+                    "name": name,
+                    "replaceName": replace,
+                },
+            )
+        except Exception as exc:
+            print(f"回写需求名称失败：{program_id}/{requirement_key}: {exc}", file=sys.stderr, flush=True)
+
+    def _start_conversation_naming(
+        self,
+        identity: tuple[str, int, str],
+        config: dict[str, Any],
+        program_id: int,
+        requirement_key: str,
+        provider: str,
+        model: str,
+        fast_mode: bool,
+        user_message: str,
+        session: dict[str, Any],
+        thread_id: str,
+    ) -> tuple[threading.Thread, dict[str, str]]:
+        """新开聊天时就先定名字：标题只看用户的首条说明，不等首轮回复。
+
+        面板上一条没名字的需求只能按需求编号显示，等整轮拆解跑完才补名字太晚；
+        这一轮命名和拆解并行跑，会话标题和需求名称都在开聊的几十秒内确定下来。
+        起名本身也要跑一轮模型，那几秒里名称还是空的，所以先用首条消息的前几个字占位，
+        AI 的标题回来再把占位名换掉。整段失败都不影响拆解结果，回合结束时还会兜底补一次。
+        """
+        outcome: dict[str, str] = {}
+        placeholder = placeholder_requirement_name(user_message)
+        # 占位名同步写：这一步只是一个接口调用，要赶在本次请求返回前落库，用户才会立刻看到。
+        if placeholder:
+            self._write_requirement_name(config, program_id, requirement_key, placeholder)
+            outcome["placeholder"] = placeholder
+
+        def run() -> None:
+            try:
+                # 起名只看一句话，用最低推理强度跑：名字要在用户还盯着屏幕的时候就出来。
+                title = self._name_conversation(
+                    config, program_id, provider, model, "low", fast_mode, user_message, "",
+                )
+                if not title:
+                    return
+                outcome["title"] = title
+                for entry in session.get("catalog") or []:
+                    if str(entry.get("threadId") or "") == thread_id:
+                        entry["title"] = title
+                        entry["updatedAt"] = utc_now()
+                self._save_planning_session(config, program_id, requirement_key, provider, session)
+                self._write_requirement_name(config, program_id, requirement_key, title, placeholder)
+                self.progress.publish(identity, "status", "已确定需求标题", title, "running")
+            except Exception as exc:
+                print(f"开聊命名失败：{program_id}/{requirement_key}: {exc}", file=sys.stderr, flush=True)
+
+        namer = threading.Thread(target=run, daemon=True)
+        namer.start()
+        return namer, outcome
+
+    def _name_requirement_if_empty(
+        self,
+        identity: tuple[str, int, str],
+        config: dict[str, Any],
+        program_id: int,
+        requirement_key: str,
+        provider: str,
+        model: str,
+        reasoning_effort: str,
+        fast_mode: bool,
+        user_message: str,
+        client: AppServerClient,
+        thread_id: str,
+        turn_id: str,
+        suggested_name: str = "",
+    ) -> None:
+        """新建需求允许不填名称：这一轮聊完就按聊天内容补上标题。
+
+        开聊时占位名可能已经写进去了，所以「还没起过名」有两种样子：名称为空，
+        或者名称就是本轮首条消息的那个占位名。除此之外一律不动 —— 名称是用户随时能自己
+        改的字段，服务端按同一条件再判一次。整段失败都不影响拆解结果。
+        """
+        if not requirement_key:
+            return
+        try:
+            requirement = planner.requirement_record(config, program_id, requirement_key)
+        except Exception as exc:
+            print(f"读取需求名称失败：{program_id}/{requirement_key}: {exc}", file=sys.stderr, flush=True)
+            return
+        current = str(requirement.get("name") or "").strip()
+        placeholder = placeholder_requirement_name(user_message)
+        if current and current != placeholder:
+            return
+        self.progress.publish(identity, "status", "正在生成需求标题", "需求名称还没定，正在按本轮聊天内容生成标题。", "running")
+        try:
+            name = suggested_name.strip()
+            if not name:
+                turn = client.read_turn(thread_id, turn_id, client.next_request_id())
+                reply = final_agent_text_from_output(execution_output("completed", turn))
+                name = self._name_conversation(config, program_id, provider, model, reasoning_effort, fast_mode, user_message, reply)
+            if not name:
+                return
+            self._write_requirement_name(config, program_id, requirement_key, name, current)
+        except Exception as exc:
+            print(f"生成需求标题失败：{program_id}/{requirement_key}: {exc}", file=sys.stderr, flush=True)
+
     def _follow_planning(
         self,
         identity: tuple[str, int, str],
@@ -4995,6 +5878,14 @@ class ExecutionBridge:
         session: dict[str, Any],
         thread_id: str,
         turn_id: str,
+        model: str = "",
+        reasoning_effort: str = "",
+        fast_mode: bool = False,
+        user_message: str = "",
+        started_new_conversation: bool = False,
+        confirm_write: bool = False,
+        namer: threading.Thread | None = None,
+        naming_outcome: dict[str, str] | None = None,
     ) -> None:
         status = "failed"
         try:
@@ -5004,6 +5895,56 @@ class ExecutionBridge:
                 {},
             )
             title = str(entry.get("title") or "需求拆解")
+            generated_title = ""
+            reply = ""
+            if status == "completed":
+                turn = client.read_turn(thread_id, turn_id, client.next_request_id())
+                reply = final_agent_text_from_output(execution_output(status, turn))
+            # 只有新开聊天的首回合才自动命名；后续追问不能覆盖用户已经识别出的会话标题。
+            if started_new_conversation:
+                # 开聊时那轮命名一般早就回来了；万一还在跑，等它一下再决定要不要重命名。
+                if namer is not None and namer.is_alive():
+                    namer.join(CONVERSATION_TITLE_TIMEOUT_SECONDS)
+                generated_title = str((naming_outcome or {}).get("title") or "")
+                if not generated_title and status == "completed":
+                    generated_title = self._name_conversation(
+                        config, program_id, provider, model, reasoning_effort, fast_mode, user_message, reply,
+                    )
+                if generated_title:
+                    title = generated_title
+                    entry["title"] = title
+                    self._rename_conversation(client, thread_id, title)
+            # 命名放在释放本轮之前：面板是靠「回合结束」去取标题的，先放行会取到旧标题。
+            if status == "completed":
+                self._name_requirement_if_empty(
+                    identity, config, program_id, requirement_key, provider, model, reasoning_effort, fast_mode,
+                    user_message, client, thread_id, turn_id, generated_title,
+                )
+                try:
+                    requirement = planner.requirement_record(config, program_id, requirement_key)
+                    requirement_name = str(requirement.get("name") or "").strip() or generated_title or title
+                except Exception:
+                    requirement_name = generated_title or title or requirement_key
+                temp_path = planning_temp_document_path(requirement_name, requirement_key, thread_id)
+                if confirm_write:
+                    delete_planning_temp_summary(temp_path)
+                    session.pop("tempPath", None)
+                else:
+                    with self.lock:
+                        current_run = self.active_runs.get(identity) or {}
+                        round_messages = [
+                            str(item).strip() for item in current_run.get("userMessages") or [user_message]
+                            if str(item).strip()
+                        ]
+                    write_planning_temp_summary(
+                        temp_path,
+                        requirement_name,
+                        requirement_key,
+                        thread_id,
+                        "\n\n".join(round_messages) or user_message,
+                        reply,
+                    )
+                    session["tempPath"] = temp_path.as_posix()
             self._archive_terminal_chat(
                 client,
                 config=config,
@@ -5317,18 +6258,23 @@ class ExecutionBridge:
     def _load_requirement_testing_session(
         self, config: dict[str, Any], program_id: int, requirement_key: str, provider: str, thread_id: str = "",
     ) -> dict[str, Any] | None:
+        # 不按执行器过滤：换工具之后也要能看见此前那批聊天。
         rows = planner.request_api(
             config, "GET", "/delivery/requirement/testing-sessions",
-            query={"programId": program_id, "requirementKey": requirement_key, "executorType": provider},
+            query={"programId": program_id, "requirementKey": requirement_key},
         )
-        rows = [row for row in (rows or []) if isinstance(row, dict) and str(row.get("threadId") or "")]
+        rows = [
+            row for row in (rows or [])
+            if isinstance(row, dict) and str(row.get("threadId") or "") and same_executor_purpose(row, "")
+        ]
         if not rows:
             return None
         catalog = [
             {
                 "threadId": str(row.get("threadId") or ""), "title": str(row.get("title") or ""),
                 "createdAt": str(row.get("createdAt") or ""), "updatedAt": str(row.get("updatedAt") or ""),
-                "status": str(row.get("status") or "completed"), "active": False,
+                "status": str(row.get("status") or "completed"),
+                "executorType": executor_provider_of(row, provider), "active": False,
             }
             for row in rows
         ]
@@ -5336,6 +6282,7 @@ class ExecutionBridge:
         metadata = current.get("metadata") if isinstance(current.get("metadata"), dict) else {}
         return {
             "threadId": str(current.get("threadId") or ""), "turnId": str(metadata.get("turnId") or ""),
+            "executorType": executor_provider_of(current, provider),
             "detailDigest": str(metadata.get("detailDigest") or ""),
             "requirementKey": requirement_key, "catalog": catalog,
         }
@@ -5347,6 +6294,7 @@ class ExecutionBridge:
         if not requirement_key or not thread_id:
             return
         entry = next((item for item in session.get("catalog") or [] if str(item.get("threadId") or "") == thread_id), {})
+        provider = executor_provider_of(entry, session.get("executorType") or provider)
         try:
             planner.request_api(
                 config, "POST", "/delivery/requirement/testing-session/bind",
@@ -5426,12 +6374,16 @@ class ExecutionBridge:
             active = self.active_runs.get(identity)
         if not selected_thread_id:
             return {
-                "programId": program_id, "requirementKey": requirement_key, "threadId": "", "turns": [],
+                "programId": program_id, "requirementKey": requirement_key, "threadId": "", "executorType": provider, "turns": [],
                 "conversations": catalog, "active": False, "activeTurnId": "", "testingReport": requirement.get("testingReport") or "",
                 "testingStatus": requirement.get("testingStatus") or "todo", "testingReportPath": requirement.get("testingReportPath") or "",
                 "testingCasesStatus": requirement.get("testingCasesStatus") or "todo", "testingCases": requirement.get("testingCases") or "",
                 "testingCasesPath": requirement.get("testingCasesPath") or "",
             }
+        provider = executor_provider_of(
+            next((entry for entry in catalog if str(entry.get("threadId") or "") == selected_thread_id), {}),
+            (session or {}).get("executorType") or provider,
+        )
         client = active["client"] if active is not None and active.get("threadId") == selected_thread_id else create_ai_client(
             provider, self.workspace, environment=codex_environment(config, program_id, write_allowed=True),
         )
@@ -5447,6 +6399,7 @@ class ExecutionBridge:
                     entry["status"] = "interrupted"
             return {
                 "programId": program_id, "requirementKey": requirement_key, "threadId": selected_thread_id,
+                "executorType": provider,
                 "turns": serialize_turns(
                     thread.get("turns") or [],
                     lambda attachment_ids: [ConversationAttachmentStore._public(attachment) for attachment in self.attachments.resolve(program_id, item_key, attachment_ids)],
@@ -5517,6 +6470,11 @@ class ExecutionBridge:
             }
         else:
             thread_id = requested_thread_id or str(session.get("threadId") or "")
+            # 已有会话只能用它自己的执行器续：线程正文在那个执行器的缓存里，换工具读不到。
+            provider = executor_provider_of(
+                next((entry for entry in catalog if str(entry.get("threadId") or "") == thread_id), {}),
+                session.get("executorType") or provider,
+            )
             detail_digest = planning_detail_digest(requirement)
             client = create_ai_client(
                 provider, self.workspace, lambda event: self._publish_app_server_event(identity, event),
@@ -5941,15 +6899,16 @@ class ExecutionBridge:
         self, config: dict[str, Any], program_id: int, item_key: str, provider: str,
     ) -> list[dict[str, Any]]:
         executor_type = task_testing_cases_executor_type(provider)
+        # 只比用途后缀，不比工具：换成另一个工具之后，之前那批用例聊天也要留在列表里。
         sessions = planner.request_api(
             config,
             "GET",
             "/delivery/item/execution-session",
-            query={"programId": program_id, "itemKey": item_key, "executorType": executor_type},
+            query={"programId": program_id, "itemKey": item_key},
         ) or []
         rows = [
             session for session in sessions
-            if isinstance(session, dict) and str(session.get("executorType") or "") == executor_type
+            if isinstance(session, dict) and same_executor_purpose(session, executor_type)
         ]
         return rows
 
@@ -6039,13 +6998,15 @@ class ExecutionBridge:
             raise BridgeFailure("所选任务测试用例会话不存在")
         thread_id = selected_thread_id or current_thread_id or (str(catalog[0].get("threadId") or "") if catalog else "")
         binding = binding_by_thread.get(thread_id, binding)
+        # 线程正文在它自己那个执行器的缓存里：读跟着线程走，不跟当前选中的工具走。
+        provider = executor_provider_of(binding, provider)
         current_thread_id = str((binding or {}).get("externalSessionId") or "")
         identity = self._task_testing_cases_identity(program_id, item_key, provider)
         with self.lock:
             active = self.active_runs.get(identity)
         if not thread_id:
             return {
-                "programId": program_id, "itemKey": item_key, "threadId": "", "turns": [], "conversations": [],
+                "programId": program_id, "itemKey": item_key, "threadId": "", "executorType": provider, "turns": [], "conversations": [],
                 "active": False, "activeTurnId": "", "testingCasesStatus": task.get("testingCasesStatus") or "todo",
                 "testingCases": task.get("testingCases") or "", "testingCasesPath": task.get("testingCasesPath") or "",
             }
@@ -6076,7 +7037,7 @@ class ExecutionBridge:
                 if not entry["active"] and entry.get("status") == "running":
                     entry["status"] = "interrupted"
             return {
-                "programId": program_id, "itemKey": item_key, "threadId": thread_id,
+                "programId": program_id, "itemKey": item_key, "threadId": thread_id, "executorType": provider,
                 "turns": serialize_turns(thread.get("turns") or []), "conversations": catalog,
                 "active": active_for_thread is not None,
                 "activeTurnId": str((active_for_thread or {}).get("turnId") or ""),
@@ -6151,6 +7112,10 @@ class ExecutionBridge:
             raise BridgeFailure("所选任务测试用例会话不存在")
         if requested_thread_id:
             binding = binding_by_thread.get(requested_thread_id, binding)
+        if not new_conversation:
+            # 续已有会话只能用这条线程自己的执行器；identity 里带着 provider，要一起改。
+            provider = executor_provider_of(binding, provider)
+            identity = self._task_testing_cases_identity(program_id, item_key, provider)
         with self.lock:
             active = self.active_runs.get(identity)
         if active is not None:
@@ -6276,6 +7241,7 @@ class ExecutionBridge:
                 resource_kind="task",
                 resource_key=item_key,
                 resource_name=task_name,
+                requirement_key=str((task or {}).get("requirementKey") or ""),
                 conversation_title=f"{task_name} · 测试用例",
                 thread_id=thread_id,
                 provider=provider,
@@ -6645,7 +7611,11 @@ class ExecutionBridge:
 
         threading.Thread(
             target=self._follow,
-            args=(identity, client, config, program_id, item_key, updated_task, binding, turn_id),
+            args=(
+                identity, client, config, program_id, item_key, updated_task, binding, turn_id,
+                text_without_attachment_context(str(payload.get("followUp") or "")),
+                str(payload.get("model") or ""), str(payload.get("reasoningEffort") or ""), bool(payload.get("fastMode")),
+            ),
             daemon=True,
         ).start()
         return {
@@ -7123,6 +8093,8 @@ class ExecutionBridge:
             raise BridgeFailure("所选 Codex 会话不存在")
         thread_id = selected_thread_id or current_thread_id or (catalog[0]["threadId"] if catalog else "")
         binding = binding_by_thread.get(thread_id, current_binding)
+        # 线程正文在它自己那个执行器的会话缓存里：读和续都跟着线程走，不跟当前选中的工具走。
+        provider = executor_provider_of(binding, provider)
         current_thread_id = str((binding or {}).get("externalSessionId") or "")
         if not thread_id:
             return {
@@ -7130,6 +8102,7 @@ class ExecutionBridge:
                 "programId": program_id,
                 "itemKey": item_key,
                 "threadId": "",
+                "executorType": provider,
                 "turns": [],
                 "conversations": catalog,
                 "active": False,
@@ -7191,6 +8164,7 @@ class ExecutionBridge:
                 "programId": program_id,
                 "itemKey": item_key,
                 "threadId": thread_id,
+                "executorType": provider,
                 "turns": turns,
                 "conversations": catalog,
                 "active": active_for_thread is not None,
@@ -7412,17 +8386,18 @@ class ExecutionBridge:
     def _prototype_session_rows(
         self, config: dict[str, Any], program_id: int, requirement_key: str, provider: str,
     ) -> list[dict[str, Any]]:
+        # 只比用途后缀，不比工具：换成另一个工具之后，之前那批原型会话也要留在列表里。
         rows = planner.request_api(
             config,
             "GET",
             "/delivery/requirement/planning-sessions",
-            query={
-                "programId": program_id,
-                "requirementKey": requirement_key,
-                "executorType": requirement_prototype_executor_type(provider),
-            },
+            query={"programId": program_id, "requirementKey": requirement_key},
         )
-        return [row for row in (rows or []) if isinstance(row, dict) and str(row.get("threadId") or "")]
+        return [
+            row for row in (rows or [])
+            if isinstance(row, dict) and str(row.get("threadId") or "")
+            and same_executor_purpose(row, requirement_prototype_executor_type(provider))
+        ]
 
     def _save_prototype_session(
         self,
@@ -7647,7 +8622,11 @@ class ExecutionBridge:
         with self.lock:
             active = self.active_runs.get(identity)
         if not selected_thread_id:
-            return {"programId": program_id, "requirementKey": requirement_key, "threadId": "", "turns": [], "active": False, "activeTurnId": ""}
+            return {"programId": program_id, "requirementKey": requirement_key, "threadId": "", "executorType": provider, "turns": [], "active": False, "activeTurnId": ""}
+        # 线程正文在它自己那个执行器的缓存里：读跟着线程走，不跟当前选中的工具走。
+        provider = executor_provider_of(
+            next((row for row in rows if str(row.get("threadId") or "") == selected_thread_id), {}), provider,
+        )
         client = active["client"] if active is not None and active.get("threadId") == selected_thread_id else create_ai_client(
             provider, self.workspace, environment=codex_environment(config, program_id),
         )
@@ -7661,6 +8640,7 @@ class ExecutionBridge:
                 "programId": program_id,
                 "requirementKey": requirement_key,
                 "threadId": selected_thread_id,
+                "executorType": provider,
                 "turns": serialize_turns(
                     thread.get("turns") or [],
                     artifact_resolver=lambda paths: self.artifacts.register(config_biz_line(config), program_id, item_key, paths),
@@ -7691,6 +8671,11 @@ class ExecutionBridge:
         if requested_thread_id and requested_thread_id not in known_thread_ids:
             raise BridgeFailure("所选原型编辑会话不存在")
         selected_thread_id = requested_thread_id or str((rows[-1] if rows else {}).get("threadId") or "")
+        if selected_thread_id:
+            # 续已有原型会话只能用这条线程自己的执行器。
+            provider = executor_provider_of(
+                next((row for row in rows if str(row.get("threadId") or "") == selected_thread_id), {}), provider,
+            )
         return self._start_requirement_prototype(
             config,
             program_id,
@@ -7867,6 +8852,8 @@ class ExecutionBridge:
                 config, program_id, item_key, task, binding, message, attachments, model, provider, reasoning_effort, fast_mode, mention_context
             )
         thread_id = requested_thread_id or current_thread_id
+        # 续已有会话只能用这条线程自己的执行器，换工具读不到它的正文。
+        provider = executor_provider_of(binding, provider)
         metadata = (binding or {}).get("metadata") or {}
         running_turn_id = str(metadata.get("turnId") or "") if isinstance(metadata, dict) else ""
         if binding and binding.get("status") == "running" and thread_id == current_thread_id and running_turn_id:
@@ -7924,7 +8911,9 @@ class ExecutionBridge:
                 raise BridgeFailure("所选 Codex 会话当前没有正在运行的回合")
             if not binding or binding.get("status") != "running" or not thread_id or not turn_id:
                 raise BridgeFailure("该任务当前没有正在运行的 Codex 回合")
-            active = self._resume_active_turn(config, identity, task, binding, thread_id, turn_id, provider)
+            active = self._resume_active_turn(
+                config, identity, task, binding, thread_id, turn_id, executor_provider_of(binding, provider),
+            )
         client = active["client"]
         client.interrupt_turn(active["threadId"], active["turnId"], request_id=client.next_request_id())
         self.progress.publish(identity, "status", "已请求停止任务", "正在等待 Codex 中断当前回合。", "running")
@@ -8029,19 +9018,21 @@ class ExecutionBridge:
             config,
             "GET",
             "/delivery/item/execution-session",
-            query={"programId": program_id, "itemKey": item_key, "executorType": provider, "phase": phase},
+            query={"programId": program_id, "itemKey": item_key, "phase": phase},
         ) or []
         if not isinstance(sessions, list):
             return None
+        candidates = [
+            session
+            for session in sessions
+            if isinstance(session, dict)
+            and same_executor_purpose(session, "")
+            and str(session.get("phase") or "requirement") == phase
+        ]
+        # 优先当前选中的工具；没有就回落到同阶段另一个工具留下的会话，别让列表凭空空掉。
         return next(
-            (
-                session
-                for session in sessions
-                if isinstance(session, dict)
-                and session.get("executorType") == provider
-                and str(session.get("phase") or "requirement") == phase
-            ),
-            None,
+            (session for session in candidates if session.get("executorType") == provider),
+            next(iter(candidates), None),
         )
 
     def _task_session_bindings(
@@ -8051,17 +9042,21 @@ class ExecutionBridge:
         item_key: str,
         provider: str,
     ) -> list[dict[str, Any]]:
-        """Return this task's execution sessions from every delivery phase."""
+        """Return this task's execution sessions from every delivery phase.
+
+        执行器不参与过滤：换成另一个工具之后，之前那批聊天也要留在列表里，正文再按线程
+        自己的执行器去读。测试用例会话用的是带后缀的执行器类型，仍然要排除掉。
+        """
         sessions = planner.request_api(
             config,
             "GET",
             "/delivery/item/execution-session",
-            query={"programId": program_id, "itemKey": item_key, "executorType": provider},
+            query={"programId": program_id, "itemKey": item_key},
         ) or []
         return [
             session
             for session in sessions
-            if isinstance(session, dict) and str(session.get("executorType") or "") == provider
+            if isinstance(session, dict) and same_executor_purpose(session, "")
         ]
 
     def _start_new_conversation(
@@ -8159,7 +9154,10 @@ class ExecutionBridge:
         self.progress.publish(identity, "status", "已创建新的 Codex 会话", title, "running")
         threading.Thread(
             target=self._follow,
-            args=(identity, client, config, program_id, item_key, updated_task, refreshed_binding, turn_id),
+            args=(
+                identity, client, config, program_id, item_key, updated_task, refreshed_binding, turn_id,
+                text_without_attachment_context(text), model, reasoning_effort, fast_mode,
+            ),
             daemon=True,
         ).start()
         return {
@@ -8353,6 +9351,10 @@ class ExecutionBridge:
         task: dict[str, Any],
         binding: dict[str, Any],
         turn_id: str,
+        initial_message: str = "",
+        model: str = "",
+        reasoning_effort: str = "",
+        fast_mode: bool = False,
     ) -> None:
         provider = str((self.active_runs.get(identity) or {}).get("provider") or "codex")
         try:
@@ -8360,6 +9362,18 @@ class ExecutionBridge:
             turn = client.read_turn(client.thread_id, turn_id, request_id=client.next_request_id())
             task_name = str(task.get("title") or item_key)
             phase = str(task.get("phase") or "requirement")
+            thread_id = str(client.thread_id or binding.get("externalSessionId") or "")
+            entry = next((item for item in conversation_catalog(binding) if item.get("threadId") == thread_id), {})
+            title = str(entry.get("title") or task_name)
+            # 任务聊天也只在新开窗口的首回合命名，避免后续追问把既有标题改掉。
+            if turn_status == "completed" and initial_message.strip():
+                reply = final_agent_text_from_output(execution_output(turn_status, turn))
+                generated_title = self._name_conversation(
+                    config, program_id, provider, model, reasoning_effort, fast_mode, initial_message, reply,
+                )
+                if generated_title:
+                    title = generated_title
+                    self._rename_conversation(client, thread_id, title)
             self._archive_terminal_chat(
                 client,
                 config=config,
@@ -8367,8 +9381,9 @@ class ExecutionBridge:
                 resource_kind="task",
                 resource_key=item_key,
                 resource_name=task_name,
-                conversation_title=task_name,
-                thread_id=str(client.thread_id or binding.get("externalSessionId") or ""),
+                requirement_key=str(task.get("requirementKey") or ""),
+                conversation_title=title,
+                thread_id=thread_id,
                 provider=provider,
                 phase=phase,
                 terminal_status=turn_status,
@@ -8387,6 +9402,7 @@ class ExecutionBridge:
                     turn_status,
                     execution_output(turn_status, turn),
                     provider,
+                    title,
                 )
             # Closing app-server flushes the final turn to the shared Codex session
             # store. Consumers notified before this point can observe 100% progress
@@ -8421,6 +9437,7 @@ class ExecutionBridge:
         turn_status: str,
         execution_output_text: str = "",
         provider: str = "codex",
+        conversation_title: str = "",
     ) -> None:
         session_status = SESSION_STATUS.get(turn_status, "blocked")
         phase = str(task.get("phase") or "requirement")
@@ -8475,6 +9492,7 @@ class ExecutionBridge:
                     str(binding.get("externalSessionId") or ""),
                     turn_id,
                     turn_status,
+                    conversation_title,
                     phase=phase,
                 ),
                 "workspace": self.workspace.name,
@@ -8703,12 +9721,29 @@ FILE_CHANGE_ALIASES = {
 }
 
 
-def file_changes_of(item: dict[str, Any]) -> list[dict[str, str]]:
-    """Normalize one file-change item into `[{path, kind}]`.
+def diff_line_counts(diff: Any) -> tuple[int, int]:
+    """数一份 unified diff 的增删行数，面板据此显示 `+74 -4`。"""
+    if not isinstance(diff, str) or not diff:
+        return 0, 0
+    added = removed = 0
+    for line in diff.splitlines():
+        if line.startswith("+++") or line.startswith("---"):
+            continue
+        if line.startswith("+"):
+            added += 1
+        elif line.startswith("-"):
+            removed += 1
+    return added, removed
+
+
+def file_changes_of(item: dict[str, Any]) -> list[dict[str, Any]]:
+    """Normalize one file-change item into `[{path, kind, added, removed}]`.
 
     Codex 和 Claude 给的字段名不完全一样，面板只认 path + add/modify/delete/rename。
+    Codex 的 `kind` 实测是对象（`{"type": "update", "move_path": null}`），
+    当字符串读会一律退化成 modify，新增和删除就分不出来了。
     """
-    normalized: list[dict[str, str]] = []
+    normalized: list[dict[str, Any]] = []
     seen: set[str] = set()
     for change in item.get("changes") or []:
         if not isinstance(change, dict):
@@ -8717,9 +9752,13 @@ def file_changes_of(item: dict[str, Any]) -> list[dict[str, str]]:
         if not path or path in seen:
             continue
         seen.add(path)
-        raw_kind = str(change.get("kind") or change.get("type") or change.get("changeType") or "").strip().lower()
+        kind_value = change.get("kind") or change.get("type") or change.get("changeType") or ""
+        if isinstance(kind_value, dict):
+            kind_value = kind_value.get("type") or kind_value.get("kind") or ""
+        raw_kind = str(kind_value).strip().lower()
         kind = FILE_CHANGE_ALIASES.get(raw_kind, raw_kind if raw_kind in FILE_CHANGE_KINDS else "modify")
-        normalized.append({"path": path, "kind": kind})
+        added, removed = diff_line_counts(change.get("diff") or change.get("unifiedDiff") or change.get("unified_diff"))
+        normalized.append({"path": path, "kind": kind, "added": added, "removed": removed})
     return normalized
 
 
@@ -8737,23 +9776,28 @@ def chat_archive_component(value: Any, fallback: str, max_bytes: int) -> str:
 def chat_archive_relative_path(
     resource_kind: str,
     resource_key: str,
-    resource_name: str,
+    conversation_title: str,
     thread_id: str,
-    phase: str = "",
+    requirement_key: str = "",
 ) -> Path:
     """Build a stable, readable workspace-relative path for one conversation."""
     if resource_kind not in {"requirement", "task"}:
         raise BridgeFailure("聊天归档类型无效")
-    key = chat_archive_component(resource_key, resource_kind, 64)
-    name = chat_archive_component(resource_name, key, CHAT_ARCHIVE_MAX_NAME_BYTES)
+    owning_requirement_key = resource_key if resource_kind == "requirement" else requirement_key
+    owning_requirement_key = chat_archive_component(owning_requirement_key, "unassigned", 64)
+    # All current requirement keys are already `req-*`. Keep the expected
+    # directory convention for pre-migration or manually supplied keys too.
+    requirement_directory = (
+        owning_requirement_key
+        if owning_requirement_key.startswith("req-")
+        else f"req-{owning_requirement_key}"
+    )
+    title = chat_archive_component(conversation_title, resource_key or requirement_directory, CHAT_ARCHIVE_MAX_NAME_BYTES)
     thread = chat_archive_component(thread_id, "thread", CHAT_ARCHIVE_MAX_THREAD_ID_BYTES)
-    # A truncated safe filename alone could collide. The digest keeps a one-to-one mapping
-    # to the complete executor thread id, which is still recorded in the Markdown header.
-    digest = hashlib.sha256(thread_id.encode("utf-8")).hexdigest()[:12]
-    section = "需求" if resource_kind == "requirement" else "任务"
-    directory = Path(CHAT_ARCHIVE_DIRECTORY_NAME) / section / f"{key}--{name}"
-    phase_prefix = f"{chat_archive_component(phase, '阶段', 32)}--" if resource_kind == "task" and phase else ""
-    return directory / f"{phase_prefix}聊天--{thread}--{digest}.md"
+    directory = Path(CHAT_ARCHIVE_DIRECTORY_NAME) / CHAT_ARCHIVE_REQUIREMENTS_DIRECTORY_NAME / requirement_directory
+    if resource_kind == "task":
+        directory /= CHAT_ARCHIVE_TASK_DIRECTORY_NAME
+    return directory / f"{title}--{thread}.md"
 
 
 def visible_chat_archive_turns(turns: Any) -> list[dict[str, Any]]:
@@ -8803,6 +9847,7 @@ def archived_chat_text(
     resource_kind: str,
     resource_key: str,
     resource_name: str,
+    requirement_key: str = "",
     conversation_title: str,
     thread_id: str,
     provider: str,
@@ -8816,6 +9861,7 @@ def archived_chat_text(
         "format": "delivery-task-planner-chat/v1",
         "resourceType": resource_kind,
         "resourceKey": resource_key,
+        "requirementKey": resource_key if resource_kind == "requirement" else requirement_key,
         "resourceName": resource_name,
         "conversationTitle": conversation_title,
         "threadId": thread_id,
@@ -8879,6 +9925,7 @@ def archive_chat_snapshot(
     resource_kind: str,
     resource_key: str,
     resource_name: str,
+    requirement_key: str = "",
     conversation_title: str,
     thread_id: str,
     provider: str,
@@ -8889,7 +9936,13 @@ def archive_chat_snapshot(
     """Atomically replace one thread's project-local Markdown snapshot."""
     if not thread_id.strip():
         raise BridgeFailure("聊天归档缺少会话标识")
-    relative = chat_archive_relative_path(resource_kind, resource_key, resource_name, thread_id, phase)
+    relative = chat_archive_relative_path(
+        resource_kind,
+        resource_key,
+        conversation_title or resource_name,
+        thread_id,
+        requirement_key=requirement_key,
+    )
     root = workspace.resolve()
     destination = (root / relative).resolve()
     try:
@@ -8900,6 +9953,7 @@ def archive_chat_snapshot(
         resource_kind=resource_kind,
         resource_key=resource_key,
         resource_name=resource_name,
+        requirement_key=requirement_key,
         conversation_title=conversation_title,
         thread_id=thread_id,
         provider=provider,
@@ -8966,47 +10020,53 @@ def read_workspace_chat_archive(
     """Find a thread snapshot by its immutable metadata, not by a mutable display name."""
     if resource_kind not in {"requirement", "task"} or not resource_key or not thread_id:
         return {}
-    section = "需求" if resource_kind == "requirement" else "任务"
-    root = (workspace.resolve() / CHAT_ARCHIVE_DIRECTORY_NAME / section).resolve()
     workspace_root = workspace.resolve()
-    try:
-        root.relative_to(workspace_root)
-    except ValueError:
-        return {}
-    if not root.is_dir():
-        return {}
-    try:
-        candidates = root.rglob("*.md")
-        for count, candidate in enumerate(candidates, start=1):
-            if count > CHAT_ARCHIVE_MAX_FILES_TO_SCAN:
-                break
-            try:
-                resolved = candidate.resolve()
-                resolved.relative_to(root)
-                if not resolved.is_file() or resolved.stat().st_size > CHAT_ARCHIVE_MAX_FILE_BYTES:
+    archive_roots = [
+        workspace_root / CHAT_ARCHIVE_DIRECTORY_NAME / CHAT_ARCHIVE_REQUIREMENTS_DIRECTORY_NAME,
+        # Keep restoring already-synced archives after moving to the English layout.
+        workspace_root / CHAT_ARCHIVE_DIRECTORY_NAME / ("需求" if resource_kind == "requirement" else "任务"),
+        workspace_root / LEGACY_CHAT_ARCHIVE_DIRECTORY_NAME / ("需求" if resource_kind == "requirement" else "任务"),
+    ]
+    for archive_root in archive_roots:
+        root = archive_root.resolve()
+        try:
+            root.relative_to(workspace_root)
+        except ValueError:
+            continue
+        if not root.is_dir():
+            continue
+        try:
+            candidates = root.rglob("*.md")
+            for count, candidate in enumerate(candidates, start=1):
+                if count > CHAT_ARCHIVE_MAX_FILES_TO_SCAN:
+                    break
+                try:
+                    resolved = candidate.resolve()
+                    resolved.relative_to(root)
+                    if not resolved.is_file() or resolved.stat().st_size > CHAT_ARCHIVE_MAX_FILE_BYTES:
+                        continue
+                    content = resolved.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError, ValueError):
                     continue
-                content = resolved.read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError, ValueError):
-                continue
-            metadata = chat_archive_metadata(content)
-            if (
-                metadata.get("resourceType") != resource_kind
-                or metadata.get("resourceKey") != resource_key
-                or metadata.get("threadId") != thread_id
-            ):
-                continue
-            turns = archived_chat_turns(content)
-            if turns:
-                return {"id": thread_id, "turns": turns, "source": "workspaceArchive"}
-    except OSError:
-        return {}
+                metadata = chat_archive_metadata(content)
+                if (
+                    metadata.get("resourceType") != resource_kind
+                    or metadata.get("resourceKey") != resource_key
+                    or metadata.get("threadId") != thread_id
+                ):
+                    continue
+                turns = archived_chat_turns(content)
+                if turns:
+                    return {"id": thread_id, "turns": turns, "source": "workspaceArchive"}
+        except OSError:
+            continue
     return {}
 
 
 def cloud_sync_workspace_entries(workspace: Path, scopes: set[str]) -> tuple[list[tuple[str, str, Path, str]], int]:
     """Return only configured, workspace-contained files for a project cloud sync.
 
-    `Chat/` is isolated from regular project files. Requirement documents are readable
+    `chat/` is isolated from regular project files. Requirement documents are readable
     document formats under `doc/` excluding prototype directories; design documents are
     all regular files under a `prototype/` directory, including referenced images.
     """
@@ -9087,8 +10147,9 @@ def serialize_turns(
                 continue
             item_type = str(item.get("type") or "")
             text = ""
+            action = ""
             attachments: list[dict[str, Any]] = []
-            changes: list[dict[str, str]] = []
+            changes: list[dict[str, Any]] = []
             if item_type == "userMessage":
                 text = text_from_user_item(item)
                 attachment_ids = attachment_ids_from_text(text)
@@ -9112,7 +10173,10 @@ def serialize_turns(
                 command = item.get("command") or item.get("commands") or ""
                 text = "\n".join(str(part) for part in command) if isinstance(command, list) else str(command)
             elif item_type in {"mcpToolCall", "dynamicToolCall"}:
-                text = str(item.get("tool") or item.get("name") or item.get("server") or "")
+                # Claude 的读文件、检索是具名工具，命令行里没有可解析的字面量：
+                # 语义在 action/target 上，面板据此显示成「已读取 X」而不是「已调用 Read」。
+                action = str(item.get("action") or "")
+                text = str(item.get("pattern") or item.get("tool") or item.get("name") or item.get("server") or "")
             elif item_type in {"fileChange", "fileEdit"}:
                 changes = file_changes_of(item)
                 paths = [change["path"] for change in changes]
@@ -9126,6 +10190,8 @@ def serialize_turns(
                     "id": str(item.get("id") or ""),
                     "type": item_type,
                     "text": text,
+                    "action": action,
+                    "target": str(item.get("target") or ""),
                     "status": str(item.get("status") or ""),
                     "exitCode": item.get("exitCode"),
                     "phase": str(item.get("phase") or ""),

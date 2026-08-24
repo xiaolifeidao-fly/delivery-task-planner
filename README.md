@@ -8,7 +8,7 @@ All six delivery-board skills are maintained here under `skills/`. Four cover th
 
 | Skill | Scope |
 | --- | --- |
-| `delivery-task-planner` | Break a requirement into tasks and write them to the board (preview first, write only after the user confirms in the board); keeps the multi-document requirement directory at `doc/requirements/<requirementKey>/` with `需求大纲.md` as the primary document and can pre-generate each task's primary requirement document at `doc/<moduleKey>/<itemKey>/文档.md` |
+| `delivery-task-planner` | Break a requirement into tasks and write them to the board (preview first, write only after the user confirms in the board); keeps per-chat process summaries under the installed plugin's `.temp/requirements/` tree, updates `doc/requirements/<requirementKey>/需求大纲.md` only on confirmation, and can pre-generate each task's primary requirement document at `doc/<moduleKey>/<itemKey>/文档.md` |
 | `delivery-requirement-grooming` | A task's `requirement` phase — produce `doc/<module>/<itemKey>/文档.md` |
 | `delivery-action-execution` | A task's `development` phase — implement against that document; the final reply is stored as the task's action output |
 | `delivery-testing-report` | A task's `testing` phase — verify against the acceptance criteria; the final reply is stored as the task's test report (8MB limit) |

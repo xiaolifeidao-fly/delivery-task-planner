@@ -50,6 +50,7 @@ rsync -a --delete \
   --exclude '.git/' \
   --exclude '__pycache__/' \
   --exclude '.pytest_cache/' \
+  --exclude '.temp/' \
   --exclude '*.pyc' \
   "${plugin_root}/" "${install_root}/"
 
