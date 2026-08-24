@@ -2322,6 +2322,169 @@ def git_worktree_summary(workspace: Path) -> dict[str, int | bool]:
     }
 
 
+# 变更明细面板的两条硬上限：文件太多只列前面一批，单个文件太大就不回正文。
+MAX_GIT_CHANGE_FILES = 300
+MAX_GIT_CHANGE_FILE_BYTES = 512 * 1024
+
+
+def run_git_bytes(workspace: Path, args: list[str], timeout: int = 20) -> subprocess.CompletedProcess:
+    """要原样拿文件内容时用这个：stderr 单独收，也不做文本解码。"""
+    try:
+        return subprocess.run(
+            ["git", "-C", str(workspace), *args],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+        )
+    except FileNotFoundError as exc:
+        raise BridgeFailure("本机未安装 Git，请先在环境预设中完成安装") from exc
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise BridgeFailure(f"执行 Git 命令失败：{exc}") from exc
+
+
+def git_has_head(workspace: Path) -> bool:
+    return run_git(workspace, ["rev-parse", "--verify", "--quiet", "HEAD"]).returncode == 0
+
+
+def git_change_kind_of(state: str) -> str:
+    """把 porcelain 的两位状态压成面板要的四种：add / modify / delete / rename。"""
+    letters = {state[:1], state[1:2]} - {" "}
+    if "D" in letters:
+        return "delete"
+    if "R" in letters:
+        return "rename"
+    if "A" in letters or "?" in letters:
+        return "add"
+    return "modify"
+
+
+def git_numstat_totals(workspace: Path) -> dict[str, tuple[int, int]]:
+    """已跟踪文件相对 HEAD 的增删行数；二进制文件 git 给的是 -，按 0 计。"""
+    if not git_has_head(workspace):
+        return {}
+    completed = run_git(workspace, ["diff", "--numstat", "HEAD"], timeout=60)
+    if completed.returncode != 0:
+        return {}
+    totals: dict[str, tuple[int, int]] = {}
+    for line in (completed.stdout or "").splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        added = int(parts[0]) if parts[0].isdigit() else 0
+        removed = int(parts[1]) if parts[1].isdigit() else 0
+        # 重命名在 numstat 里是 "old => new" 这种写法，取最后一段当作现在的路径。
+        path = parts[2].split(" => ")[-1].strip("{}")
+        totals[path] = (added, removed)
+    return totals
+
+
+def git_untracked_line_count(workspace: Path, path: str) -> int:
+    target = workspace / path
+    try:
+        if not target.is_file() or target.stat().st_size > MAX_GIT_CHANGE_FILE_BYTES:
+            return 0
+        raw = target.read_bytes()
+    except OSError:
+        return 0
+    if b"\0" in raw:
+        return 0
+    return len(raw.splitlines())
+
+
+def git_change_files(workspace: Path) -> dict[str, Any]:
+    """列出工作区相对 HEAD 的文件级改动，给「变更」面板点开看明细用。"""
+    require_git_workspace(workspace)
+    completed = run_git(workspace, ["status", "--porcelain=v1", "-z"], timeout=60)
+    if completed.returncode != 0:
+        raise BridgeFailure(f"读取 Git 变更清单失败：{(completed.stdout or '').strip() or 'git 退出异常'}")
+    entries = [chunk for chunk in (completed.stdout or "").split("\0") if chunk]
+    totals = git_numstat_totals(workspace)
+    files: list[dict[str, Any]] = []
+    skip_next = False
+    for index, entry in enumerate(entries):
+        if skip_next:
+            # 重命名条目后面紧跟一条旧路径，-z 下没有引号可解析，只能靠位置跳过。
+            skip_next = False
+            continue
+        if len(entry) < 4:
+            continue
+        state = entry[:2]
+        path = entry[3:]
+        kind = git_change_kind_of(state)
+        if kind == "rename":
+            skip_next = index + 1 < len(entries)
+        untracked = state == "??"
+        added, removed = totals.get(path, (0, 0))
+        if untracked:
+            added = git_untracked_line_count(workspace, path)
+            removed = 0
+        files.append({
+            "path": path,
+            "kind": kind,
+            "added": added,
+            "removed": removed,
+            "staged": state[:1] not in {" ", "?"},
+            "untracked": untracked,
+        })
+    files.sort(key=lambda item: item["path"])
+    truncated = len(files) > MAX_GIT_CHANGE_FILES
+    return {
+        "workspace": str(workspace),
+        "branch": git_current_branch(workspace),
+        "files": files[:MAX_GIT_CHANGE_FILES],
+        "total": len(files),
+        "truncated": truncated,
+    }
+
+
+def git_change_text(raw: bytes) -> tuple[str, bool]:
+    """返回可展示的正文和「是不是二进制」；二进制一律不回正文。"""
+    if b"\0" in raw:
+        return "", True
+    try:
+        return raw.decode("utf-8"), False
+    except UnicodeDecodeError:
+        return "", True
+
+
+def git_change_detail(workspace: Path, path: str) -> dict[str, Any]:
+    """一个文件改动前后的两份正文，交给前端的 diff 组件对比。
+
+    只接受当前确实有改动的路径：这样既不用自己防目录穿越，也不会变成任意文件读取口子。
+    """
+    target = str(path or "").strip()
+    if not target:
+        raise BridgeFailure("缺少文件路径")
+    listing = git_change_files(workspace)
+    entry = next((item for item in listing["files"] if item["path"] == target), None)
+    if entry is None:
+        raise BridgeFailure(f"当前工作区没有这个文件的改动：{target}")
+    old_raw = b""
+    if not entry["untracked"] and entry["kind"] != "add" and git_has_head(workspace):
+        completed = run_git_bytes(workspace, ["show", f"HEAD:{target}"], timeout=60)
+        if completed.returncode == 0:
+            old_raw = completed.stdout or b""
+    new_raw = b""
+    working = workspace / target
+    try:
+        if working.is_file():
+            new_raw = working.read_bytes()
+    except OSError as exc:
+        raise BridgeFailure(f"读取文件失败：{exc}") from exc
+    if len(old_raw) > MAX_GIT_CHANGE_FILE_BYTES or len(new_raw) > MAX_GIT_CHANGE_FILE_BYTES:
+        return {**entry, "oldText": "", "newText": "", "binary": False, "truncated": True}
+    old_text, old_binary = git_change_text(old_raw)
+    new_text, new_binary = git_change_text(new_raw)
+    return {
+        **entry,
+        "oldText": old_text,
+        "newText": new_text,
+        "binary": old_binary or new_binary,
+        "truncated": False,
+    }
+
+
 def git_local_branch_for_reference(workspace: Path, reference: str, remote: str) -> tuple[str, str]:
     """解析本地或远端分支引用，返回应使用的本地名和可选远端引用。"""
     value = str(reference or "").strip()
@@ -2583,10 +2746,11 @@ def git_commit_message_of(value: str, branch: str) -> str:
     return message
 
 
-def git_push_branch(workspace: Path, branch: str, message: str = "") -> dict[str, Any]:
+def git_push_branch(workspace: Path, branch: str, message: str = "", push: bool = True) -> dict[str, Any]:
     """先把工作区改动提交到需求分支，再推到 origin。
 
     只做普通推送，不带 --force：远端已经跑在前面时报错给用户，不在这里替他决定怎么合。
+    push=False 时只提交不推送，给「仅提交」用：本地留一个提交点，什么时候推由用户决定。
     """
     if not valid_git_branch_name(branch):
         raise BridgeFailure("需求分支名不合法")
@@ -2613,6 +2777,16 @@ def git_push_branch(workspace: Path, branch: str, message: str = "") -> dict[str
         if commit.returncode != 0:
             raise BridgeFailure(f"提交改动失败：{(commit.stdout or '').strip() or 'git 退出异常'}")
         committed = True
+    if not push:
+        return {
+            "pushed": False,
+            "branch": branch,
+            "remote": remote,
+            "committed": committed,
+            "commitMessage": commit_message if committed else "",
+            "upToDate": False,
+            "output": "",
+        }
     completed = run_git(workspace, ["push", "--set-upstream", remote, f"{branch}:{branch}"], timeout=180)
     output = (completed.stdout or "").strip()
     if completed.returncode != 0:
@@ -5527,6 +5701,8 @@ class ExecutionBridge:
         if requested_thread_id and requested_thread_id not in known_thread_ids:
             raise BridgeFailure("所选拆解会话不存在")
         started_new_conversation = not session or new_conversation or not session.get("threadId")
+        # 这条需求此前一次拆解会话都没有：不管是新增还是编辑进来的，首轮都按用户的问题重定标题。
+        first_planning_conversation = started_new_conversation and not catalog
         if started_new_conversation:
             # 一条新会话还没出过预览，没有可确认的方案。
             if confirm_write:
@@ -5647,13 +5823,13 @@ class ExecutionBridge:
         if started_new_conversation:
             namer, naming_outcome = self._start_conversation_naming(
                 identity, config, program_id, requirement_key, provider, model, fast_mode,
-                message, session, thread_id,
+                message, session, thread_id, first_planning_conversation,
             )
         threading.Thread(
             target=self._follow_planning,
             args=(identity, client, config, program_id, requirement_key, provider, session, thread_id, turn_id,
                   model, reasoning_effort, fast_mode, message, started_new_conversation, confirm_write,
-                  namer, naming_outcome),
+                  namer, naming_outcome, first_planning_conversation),
             daemon=True,
         ).start()
         return {"accepted": True, "bizLine": biz_line, "programId": program_id, "requirementKey": requirement_key, "threadId": thread_id, "turnId": turn_id, "active": True}
@@ -5783,18 +5959,37 @@ class ExecutionBridge:
         user_message: str,
         session: dict[str, Any],
         thread_id: str,
-    ) -> tuple[threading.Thread, dict[str, str]]:
+        first_conversation: bool = False,
+    ) -> tuple[threading.Thread | None, dict[str, str]]:
         """新开聊天时就先定名字：标题只看用户的首条说明，不等首轮回复。
 
         面板上一条没名字的需求只能按需求编号显示，等整轮拆解跑完才补名字太晚；
         这一轮命名和拆解并行跑，会话标题和需求名称都在开聊的几十秒内确定下来。
         起名本身也要跑一轮模型，那几秒里名称还是空的，所以先用首条消息的前几个字占位，
         AI 的标题回来再把占位名换掉。整段失败都不影响拆解结果，回合结束时还会兜底补一次。
+
+        `first_conversation` 表示这条需求此前一次拆解会话都没有。这种需求即使已经带着
+        名字（从编辑入口进来的手填名），首轮也要按用户的问题重定一次标题：把当前这个名字
+        当成允许覆盖的旧值，而不是写占位名去盖掉它。
         """
         outcome: dict[str, str] = {}
+        # Git 新需求已经用需求编号作临时名：不要再按用户首句并行起名，
+        # 必须等首轮执行器返回反馈后，再根据完整问答生成正式标题。
+        try:
+            current_name = str((planner.requirement_record(config, program_id, requirement_key) or {}).get("name") or "").strip()
+        except Exception:
+            current_name = ""
+        if current_name == requirement_key:
+            outcome["placeholder"] = requirement_key
+            return None, outcome
         placeholder = placeholder_requirement_name(user_message)
-        # 占位名同步写：这一步只是一个接口调用，要赶在本次请求返回前落库，用户才会立刻看到。
-        if placeholder:
+        if current_name and first_conversation:
+            # 已经有名字、但一次都没聊过：不写占位名（面板上先留着用户看得懂的原名），
+            # 直接把这个名字作为允许被首轮标题覆盖的旧值。
+            placeholder = current_name
+            outcome["placeholder"] = current_name
+        elif not current_name and placeholder:
+            # 占位名同步写：这一步只是一个接口调用，要赶在本次请求返回前落库，用户才会立刻看到。
             self._write_requirement_name(config, program_id, requirement_key, placeholder)
             outcome["placeholder"] = placeholder
 
@@ -5836,12 +6031,17 @@ class ExecutionBridge:
         thread_id: str,
         turn_id: str,
         suggested_name: str = "",
+        first_conversation: bool = False,
     ) -> None:
         """新建需求允许不填名称：这一轮聊完就按聊天内容补上标题。
 
         开聊时占位名可能已经写进去了，所以「还没起过名」有两种样子：名称为空，
         或者名称就是本轮首条消息的那个占位名。除此之外一律不动 —— 名称是用户随时能自己
         改的字段，服务端按同一条件再判一次。整段失败都不影响拆解结果。
+
+        `first_conversation` 是这条需求的第一次拆解会话：手填过名字的需求也要按首轮问答
+        重定标题，所以此时当前名称本身就是允许被覆盖的旧值（开聊那轮并行命名没能出标题时
+        才轮得到这里兜底）。
         """
         if not requirement_key:
             return
@@ -5851,8 +6051,13 @@ class ExecutionBridge:
             print(f"读取需求名称失败：{program_id}/{requirement_key}: {exc}", file=sys.stderr, flush=True)
             return
         current = str(requirement.get("name") or "").strip()
+        # 开聊那轮已经把标题写进去了：这里不能再起一个名字把它换掉。
+        if current and current == suggested_name.strip():
+            return
         placeholder = placeholder_requirement_name(user_message)
-        if current and current != placeholder:
+        # Git 新需求的临时名称是需求编号；首轮 AI 回复完成后允许把它替换成正式标题。
+        allowed_placeholders = {placeholder, requirement_key}
+        if current and current not in allowed_placeholders and not first_conversation:
             return
         self.progress.publish(identity, "status", "正在生成需求标题", "需求名称还没定，正在按本轮聊天内容生成标题。", "running")
         try:
@@ -5886,6 +6091,7 @@ class ExecutionBridge:
         confirm_write: bool = False,
         namer: threading.Thread | None = None,
         naming_outcome: dict[str, str] | None = None,
+        first_conversation: bool = False,
     ) -> None:
         status = "failed"
         try:
@@ -5918,7 +6124,7 @@ class ExecutionBridge:
             if status == "completed":
                 self._name_requirement_if_empty(
                     identity, config, program_id, requirement_key, provider, model, reasoning_effort, fast_mode,
-                    user_message, client, thread_id, turn_id, generated_title,
+                    user_message, client, thread_id, turn_id, generated_title, first_conversation,
                 )
                 try:
                     requirement = planner.requirement_record(config, program_id, requirement_key)
@@ -7361,6 +7567,12 @@ class ExecutionBridge:
         branch = str(raw.get("branch") or "").strip()
         message = str(raw.get("message") or "")
         provider = ai_provider_of(raw)
+        commit_only = bool(raw.get("commitOnly"))
+        if commit_only:
+            # 仅提交是本机动作，失败原因基本是工作区自身的问题，不值得再起一轮 AI 去修。
+            result = git_push_branch(self.workspace, branch, message, push=False)
+            result["repaired"] = False
+            return result
         try:
             result = git_push_branch(self.workspace, branch, message)
             result["repaired"] = False
@@ -10389,6 +10601,31 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 self.json_response(400, {"error": str(exc)})
             except Exception as exc:
                 self.json_response(500, {"error": f"检查工作目录 Git 状态失败：{exc}"})
+            return
+        if parsed.path in {"/v1/codex/git/changes", "/v1/codex/git/change"}:
+            if not self.allowed_origin():
+                self.json_response(403, {"error": "origin not allowed"})
+                return
+            query = parse_qs(parsed.query)
+            program_id = program_id_of((query.get("programId") or [""])[0])
+            try:
+                self.bridge.request_config(
+                    {"programId": program_id},
+                    self.allowed_origin() or "",
+                    self.headers.get("token", "").strip(),
+                )
+                selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
+                if parsed.path.endswith("/changes"):
+                    self.json_response(200, git_change_files(selected_bridge.workspace))
+                else:
+                    self.json_response(200, git_change_detail(
+                        selected_bridge.workspace,
+                        str((query.get("path") or [""])[0]),
+                    ))
+            except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
+                self.json_response(400, {"error": str(exc)})
+            except Exception as exc:
+                self.json_response(500, {"error": f"读取 Git 变更失败：{exc}"})
             return
         if parsed.path in {"/v1/codex/git/branches", "/v1/codex/git/status"}:
             if not self.allowed_origin():

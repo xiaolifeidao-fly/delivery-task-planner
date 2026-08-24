@@ -2459,6 +2459,60 @@ class HttpBridgeTest(unittest.TestCase):
         self.assertEqual(("当前手机端是怎么发消", ""), (calls[0][1]["body"]["name"], calls[0][1]["body"]["replaceName"]))
         self.assertEqual(("确认手机端发消息实现", "当前手机端是怎么发消"), (calls[1][1]["body"]["name"], calls[1][1]["body"]["replaceName"]))
 
+    def test_conversation_naming_retitles_a_named_requirement_on_its_first_chat(self):
+        """编辑进来的需求也一样：一次都没聊过时，首轮的问题要重新定标题。
+
+        这种需求已经有用户填的名字，所以不写占位名 —— AI 标题落库之前，面板上留着原名。
+        """
+        executor = bridge.ExecutionBridge(Path.cwd())
+        session = {"threadId": "thread-1", "catalog": [{"threadId": "thread-1", "title": "需求拆解 · 手填的名字"}]}
+        record = {"requirementKey": "req-a", "name": "手填的名字"}
+        calls = []
+
+        def write(*args, **kwargs):
+            calls.append((args, kwargs))
+            record["name"] = kwargs["body"]["name"]
+            return {}
+
+        with (
+            patch.object(executor, "_name_conversation", return_value="确认手机端发消息实现"),
+            patch.object(executor, "_save_planning_session"),
+            patch.object(bridge.planner, "requirement_record", side_effect=lambda *args, **kwargs: dict(record)),
+            patch.object(bridge.planner, "request_api", side_effect=write),
+        ):
+            namer, outcome = executor._start_conversation_naming(
+                ("whatsapp", 2, "req-a"), {"_project_id": 2}, 2, "req-a", "codex", "", False,
+                "当前手机端是怎么发消息的", session, "thread-1", True,
+            )
+            namer.join(10)
+
+        self.assertEqual("确认手机端发消息实现", outcome.get("title"))
+        self.assertEqual("确认手机端发消息实现", session["catalog"][0]["title"])
+        # 只写一次：没有占位名这一步，直接拿手填的名字换成 AI 起的标题。
+        self.assertEqual(1, len(calls))
+        self.assertEqual(("确认手机端发消息实现", "手填的名字"), (calls[0][1]["body"]["name"], calls[0][1]["body"]["replaceName"]))
+
+    def test_conversation_naming_keeps_a_named_requirement_on_later_chats(self):
+        """已经聊过的需求再开新会话：只换会话标题，需求名称不动。"""
+        executor = bridge.ExecutionBridge(Path.cwd())
+        session = {"threadId": "thread-2", "catalog": [{"threadId": "thread-2", "title": "需求拆解 · 手填的名字"}]}
+        record = {"requirementKey": "req-a", "name": "手填的名字"}
+
+        with (
+            patch.object(executor, "_name_conversation", return_value="补充导出能力"),
+            patch.object(executor, "_save_planning_session"),
+            patch.object(bridge.planner, "requirement_record", side_effect=lambda *args, **kwargs: dict(record)),
+            patch.object(bridge.planner, "request_api") as request_api,
+        ):
+            namer, _ = executor._start_conversation_naming(
+                ("whatsapp", 2, "req-a"), {"_project_id": 2}, 2, "req-a", "codex", "", False,
+                "再补一个导出", session, "thread-2",
+            )
+            namer.join(10)
+
+        self.assertEqual("补充导出能力", session["catalog"][0]["title"])
+        request_api.assert_not_called()
+
     def test_conversation_naming_keeps_a_requirement_name_the_user_already_filled_in(self):
         executor = bridge.ExecutionBridge(Path.cwd())
         with (
