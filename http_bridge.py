@@ -2257,18 +2257,35 @@ def git_default_branch(workspace: Path, branches: list[str]) -> str:
     return branches[0] if branches else ""
 
 
+def git_fetch_all(workspace: Path, remote: str = "origin") -> str:
+    """把远端分支引用同步到本机。返回失败说明，空串表示成功或没有远端。
+
+    别人新建的需求分支只有 fetch 过才看得见；离线时不该把整个分支列表也一起废掉。
+    """
+    if remote not in git_output(workspace, ["remote"], "读取 Git 远端失败").split():
+        return ""
+    completed = run_git(workspace, ["fetch", "--prune", remote], timeout=180)
+    if completed.returncode != 0:
+        return (completed.stdout or "").strip() or "git 退出异常"
+    return ""
+
+
 def git_branch_catalog(workspace: Path) -> dict[str, Any]:
     """本地分支加远端分支，去重后按名称排序；origin/HEAD 这类符号引用不列出。"""
     require_git_workspace(workspace)
+    # 列分支前先同步远端引用：别人刚推的分支要能直接在建分支表单里选到。
+    fetch_error = git_fetch_all(workspace)
     listed = git_output(
         workspace,
         ["for-each-ref", "--format=%(refname:short)", "refs/heads", "refs/remotes"],
         "读取 Git 分支失败",
     )
+    # refs/remotes/origin/HEAD 的简写就是 origin，光判 /HEAD 结尾漏得掉，会混进分支下拉里。
+    remote_names = set(git_output(workspace, ["remote"], "读取 Git 远端失败").split())
     branches: list[str] = []
     for line in listed.splitlines():
         name = line.strip()
-        if not name or name.endswith("/HEAD"):
+        if not name or name.endswith("/HEAD") or name in remote_names:
             continue
         if name not in branches:
             branches.append(name)
@@ -2278,6 +2295,8 @@ def git_branch_catalog(workspace: Path) -> dict[str, Any]:
         "defaultBranch": git_default_branch(workspace, branches),
         # 面板要标注项目此刻所处的分支，游离 HEAD 时为空串。
         "currentBranch": git_current_branch(workspace),
+        # 拉取远端失败时照样给本地分支，但要让面板能说清列表可能不是最新的。
+        "fetchError": fetch_error,
     }
 
 
@@ -2519,7 +2538,14 @@ def git_local_branch_for_reference(workspace: Path, reference: str, remote: str)
         raise BridgeFailure("远端需求分支名不合法")
     exists = run_git(workspace, ["rev-parse", "--verify", "--quiet", f"refs/remotes/{remote_ref}"])
     if exists.returncode != 0:
-        raise BridgeFailure(f"本机和远端都不存在需求分支 {value}")
+        # 分支可能是别人刚推上来的，本机还没 fetch 过；先拉一次远端引用再判断。
+        fetched = run_git(workspace, ["fetch", remote, local], timeout=180)
+        exists = run_git(workspace, ["rev-parse", "--verify", "--quiet", f"refs/remotes/{remote_ref}"])
+        if exists.returncode != 0:
+            detail = (fetched.stdout or "").strip()
+            raise BridgeFailure(
+                f"本机和远端都不存在需求分支 {value}" + (f"。git 输出：{detail}" if fetched.returncode != 0 and detail else "")
+            )
     return local, remote_ref
 
 
@@ -2582,13 +2608,18 @@ def git_prepare_branch(
         raise BridgeFailure("当前工作目录处于游离 HEAD，不能切换需求分支")
     local, _ = git_local_branch_for_reference(workspace, reference, remote)
     if status["currentBranch"] == local:
+        # 已经在需求分支上：干净的工作区顺手拉一次最新，脏工作区不动它，交给用户先处理改动。
+        pulled_only = False if status["dirty"] else git_pull_branch(workspace, local, remote)
         return {
             "branch": local,
             "previousBranch": status["currentBranch"],
+            "pulled": pulled_only,
             "committed": False,
             "stashed": False,
-            "status": status,
+            "status": git_workspace_status(workspace, expected_remote_url, remote) if pulled_only else status,
         }
+    # 先把目标分支拉到远端最新，再决定怎么处理当前改动：拉不动就不该先提交一轮。
+    pulled = git_pull_branch(workspace, local, remote)
     committed = False
     stashed = False
     if status["dirty"]:
@@ -2639,6 +2670,7 @@ def git_prepare_branch(
     branch = git_checkout_reference(workspace, reference, remote)
     return {
         "branch": branch,
+        "pulled": pulled,
         "committed": committed,
         "stashed": stashed,
         "previousBranch": status["currentBranch"],
@@ -2738,6 +2770,7 @@ def build_git_push_repair_prompt(workspace: Path, branch: str, remote: str, fail
             failure,
             "",
             "处理要求:",
+            "- 面板已经把改动提交成提交点，并自动试过一次 rebase；失败后已经 --abort，仓库现在是干净状态，不在变基中。",
             "- 只解决提交与推送本身：拉取远端、rebase 或 merge、解决冲突、补提交、重新 push。",
             "- 解决冲突时保留双方的真实意图，不要为了让命令通过而删掉别人的改动。",
             "- 不要修改与本次冲突无关的业务实现，不要改动其他分支。",
@@ -2760,6 +2793,38 @@ def git_commit_message_of(value: str, branch: str) -> str:
     if "\x00" in message:
         raise BridgeFailure("提交说明不能包含控制字符")
     return message
+
+
+def git_rebase_onto_remote(workspace: Path, branch: str, remote: str = "origin") -> str:
+    """推送前把远端最新并进本地分支。返回 ""/"pulled"/"rebased"。
+
+    这里刻意不用 stash：改动在上一步已经提交成一个提交点，没有需要暂存的东西；
+    冲突留在 rebase 里比留在 stash pop 里可控得多，失败也会 --abort 回到干净状态。
+    """
+    if remote not in git_output(workspace, ["remote"], "读取 Git 远端失败").split():
+        return ""
+    fetched = run_git(workspace, ["fetch", remote, branch], timeout=180)
+    remote_ref = f"{remote}/{branch}"
+    if run_git(workspace, ["rev-parse", "--verify", "--quiet", f"refs/remotes/{remote_ref}"]).returncode != 0:
+        # 远端还没有这条分支，这次就是首推。
+        return ""
+    if fetched.returncode != 0:
+        raise BridgeFailure(f"拉取分支 {branch} 失败：{(fetched.stdout or '').strip() or 'git 退出异常'}")
+    if git_remote_ref_merged(workspace, remote_ref, branch):
+        return ""
+    if run_git(workspace, ["merge-base", "--is-ancestor", branch, remote_ref]).returncode == 0:
+        # 本地只是落后：快进即可，不要平白造一个合并提交。
+        completed = run_git(workspace, ["merge", "--ff-only", remote_ref], timeout=120)
+        if completed.returncode != 0:
+            raise BridgeFailure(f"快进到 {remote_ref} 失败：{(completed.stdout or '').strip() or 'git 退出异常'}")
+        return "pulled"
+    completed = run_git(workspace, ["rebase", remote_ref], timeout=300)
+    if completed.returncode != 0:
+        detail = (completed.stdout or "").strip() or "git 退出异常"
+        # 冲突不留在半路：先回到干净状态，再把原始输出抛上去交给 AI 兜底那一轮处理。
+        run_git(workspace, ["rebase", "--abort"], timeout=120)
+        raise BridgeFailure(f"本地分支 {branch} 与 {remote_ref} 有冲突，自动 rebase 没能完成：{detail}")
+    return "rebased"
 
 
 def git_push_branch(workspace: Path, branch: str, message: str = "", push: bool = True) -> dict[str, Any]:
@@ -2801,8 +2866,11 @@ def git_push_branch(workspace: Path, branch: str, message: str = "", push: bool 
             "committed": committed,
             "commitMessage": commit_message if committed else "",
             "upToDate": False,
+            "synced": "",
             "output": "",
         }
+    # 改动已经落成提交，这时候再并远端最新：非快进被拒绝之前就解决掉，别等 push 报错。
+    synced = git_rebase_onto_remote(workspace, branch, remote)
     completed = run_git(workspace, ["push", "--set-upstream", remote, f"{branch}:{branch}"], timeout=180)
     output = (completed.stdout or "").strip()
     if completed.returncode != 0:
@@ -2814,8 +2882,47 @@ def git_push_branch(workspace: Path, branch: str, message: str = "", push: bool 
         "committed": committed,
         "commitMessage": commit_message if committed else "",
         "upToDate": "Everything up-to-date" in output,
+        # 推送前是否并过远端最新："pulled" 是快进，"rebased" 是把本地提交挪到远端之后。
+        "synced": synced,
         "output": output[-2000:],
     }
+
+
+def git_remote_ref_merged(workspace: Path, remote_ref: str, local_branch: str) -> bool:
+    """远端引用是否已经在本地分支里；领先远端的本地分支不该被当成「拉取失败」。"""
+    return run_git(workspace, ["merge-base", "--is-ancestor", remote_ref, local_branch]).returncode == 0
+
+
+def git_pull_branch(workspace: Path, local: str, remote: str = "origin") -> bool:
+    """切到需求分支前先把它拉到远端最新；拉不动就报错，不带着旧代码切过去。
+
+    返回是否真的更新过本地分支。远端还没有这条分支时直接跳过：刚建的需求分支很正常。
+    """
+    remotes = git_output(workspace, ["remote"], "读取 Git 远端失败").split()
+    if remote not in remotes:
+        return False
+    fetched = run_git(workspace, ["fetch", remote, local], timeout=180)
+    remote_ref = f"{remote}/{local}"
+    if run_git(workspace, ["rev-parse", "--verify", "--quiet", f"refs/remotes/{remote_ref}"]).returncode != 0:
+        return False
+    if fetched.returncode != 0:
+        raise BridgeFailure(f"拉取需求分支 {local} 失败：{(fetched.stdout or '').strip() or 'git 退出异常'}")
+    if not git_branch_exists(workspace, local):
+        # 本机还没有这条分支，切换时会基于刚拉到的远端引用创建，已经是最新的。
+        return False
+    if git_remote_ref_merged(workspace, remote_ref, local):
+        return False
+    if git_current_branch(workspace) == local:
+        completed = run_git(workspace, ["merge", "--ff-only", remote_ref], timeout=120)
+    else:
+        completed = run_git(workspace, ["fetch", remote, f"{local}:{local}"], timeout=180)
+    if completed.returncode != 0:
+        raise BridgeFailure(
+            f"需求分支 {local} 无法快进到 {remote_ref}：本机的 {local} 上有还没推送的提交，或者已经和远端分叉。"
+            f"请先把 {local} 上的改动推送或自行合并，再重新切换。"
+            f"git 输出：{(completed.stdout or '').strip() or 'git 退出异常'}"
+        )
+    return True
 
 
 def git_sync_base_branch(workspace: Path, base_branch: str, remote: str = "origin") -> str:
@@ -2847,6 +2954,9 @@ def git_sync_base_branch(workspace: Path, base_branch: str, remote: str = "origi
     if not local_exists:
         # 本机还没有这条基准分支，直接从刚拉到的远端引用切出需求分支。
         return remote_ref
+    if git_remote_ref_merged(workspace, remote_ref, base_branch):
+        # 本地已经包含远端全部提交（可能还领先），没有可拉的东西。
+        return base_branch
     if git_current_branch(workspace) == base_branch:
         completed = run_git(workspace, ["merge", "--ff-only", remote_ref], timeout=120)
     else:
@@ -2867,21 +2977,38 @@ def git_create_branch(workspace: Path, base_branch: str, branch: str) -> dict[st
     if not valid_git_branch_name(branch):
         raise BridgeFailure("需求分支名不合法")
     require_git_workspace(workspace)
-    if run_git(workspace, ["check-ref-format", "--branch", branch]).returncode != 0:
+    remote = "origin"
+    has_remote = remote in git_output(workspace, ["remote"], "读取 Git 远端失败").split()
+    # 「已有分支」下拉给的是 origin/xxx；照原样建会多出一条名叫 origin/xxx 的本地分支。
+    local = branch[len(f"{remote}/"):] if has_remote and branch.startswith(f"{remote}/") else branch
+    if not local or run_git(workspace, ["check-ref-format", "--branch", local]).returncode != 0:
         raise BridgeFailure(f"需求分支名不符合 Git 规范：{branch}")
-    if git_branch_exists(workspace, branch):
-        git_checkout_branch(workspace, branch)
-        return {"created": False, "baseBranch": base_branch, "branch": branch}
+    if git_branch_exists(workspace, local):
+        # 本机已有这条分支：切过去并拉到远端最新，不覆盖已有提交。
+        git_checkout_branch(workspace, local)
+        git_pull_branch(workspace, local)
+        return {"created": False, "baseBranch": base_branch, "branch": local}
     if git_worktree_dirty(workspace):
         raise BridgeFailure("工作目录有未提交改动，无法创建需求分支，请先提交或暂存")
+    if has_remote:
+        run_git(workspace, ["fetch", remote, local], timeout=180)
+        if run_git(workspace, ["rev-parse", "--verify", "--quiet", f"refs/remotes/{remote}/{local}"]).returncode == 0:
+            # 别人已经推过同名分支：必须关联它，从基准分支另起一条会和远端分叉。
+            checkout = run_git(workspace, ["checkout", "--recurse-submodules", "-b", local, "--track", f"{remote}/{local}"])
+            if checkout.returncode != 0:
+                raise BridgeFailure(f"关联远端需求分支 {local} 失败：{(checkout.stdout or '').strip() or 'git 退出异常'}")
+            return {"created": False, "baseBranch": base_branch, "branch": local}
     # 先把基准分支拉到最新，再从它切出去；基准分支是否存在也在这一步确认。
     base_reference = git_sync_base_branch(workspace, base_branch)
-    # 从 origin/xxx 切出来时不要跟踪基准分支：需求分支后面要推到它自己的远端分支。
-    track = ["--no-track"] if base_reference != base_branch else []
-    completed = run_git(workspace, ["checkout", "--recurse-submodules", *track, "-b", branch, base_reference])
+    # 从远端引用切出来时不要跟踪基准分支：需求分支后面要推到它自己的远端分支。
+    from_remote_ref = run_git(
+        workspace, ["rev-parse", "--verify", "--quiet", f"refs/remotes/{base_reference}"],
+    ).returncode == 0
+    track = ["--no-track"] if from_remote_ref else []
+    completed = run_git(workspace, ["checkout", "--recurse-submodules", *track, "-b", local, base_reference])
     if completed.returncode != 0:
         raise BridgeFailure(f"创建需求分支失败：{(completed.stdout or '').strip() or 'git 退出异常'}")
-    return {"created": True, "baseBranch": base_branch, "branch": branch}
+    return {"created": True, "baseBranch": base_branch, "branch": local}
 
 
 def git_repository_url_of(value: Any) -> str:
@@ -7789,6 +7916,7 @@ class ExecutionBridge:
             "committed": True,
             "commitMessage": "",
             "upToDate": False,
+            "synced": "repaired",
             "repaired": True,
             "repairStatus": status,
             "repairSummary": summary,
