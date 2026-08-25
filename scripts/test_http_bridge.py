@@ -2731,6 +2731,77 @@ class HttpBridgeTest(unittest.TestCase):
 
         self.assertEqual(["a", "b", "c", "d"], started)
 
+    def test_stop_reports_a_turn_that_already_finished(self):
+        """Codex 说没有可中断的回合时，停止不该报错，只是这一下点晚了。"""
+        executor = bridge.ExecutionBridge(Path.cwd())
+        identity = bridge.task_identity("whatsapp", 1, "task-a")
+
+        class FinishedClient:
+            def interrupt_turn(self, _thread_id, _turn_id, request_id=13):
+                raise RuntimeError("no active turn to interrupt")
+
+            def next_request_id(self):
+                return 1
+
+        executor.active.add(identity)
+        executor.active_runs[identity] = {
+            "client": FinishedClient(), "threadId": "thread-a", "turnId": "turn-a",
+            "task": {"itemKey": "task-a"}, "config": self.runtime_config(), "provider": "codex",
+        }
+
+        result = executor.stop_conversation(
+            {"bizLine": "whatsapp", "programId": 1, "itemKey": "task-a"},
+            config=self.runtime_config(),
+        )
+
+        self.assertTrue(result["accepted"])
+        self.assertTrue(result["alreadyFinished"])
+
+    def test_stop_all_cancels_the_rest_of_a_running_batch(self):
+        """点了「全部停止」之后，批量队列里还没启动的任务不能再被拉起来。"""
+        statuses = {"a": "todo", "b": "todo"}
+        dependencies = {"a": [], "b": ["a"]}
+        started: list[str] = []
+        finalized: dict[str, str] = {}
+        executor = bridge.ExecutionBridge(Path.cwd())
+
+        def project_context(*_args):
+            return {
+                "items": [
+                    {"itemKey": key, "status": status, "dependsOnItemKeys": dependencies[key]}
+                    for key, status in statuses.items()
+                ],
+            }
+
+        def task_detail(_config, _program_id, item_key):
+            return {"itemKey": item_key, "title": item_key, "version": 1, "status": statuses[item_key]}
+
+        def execute(payload, batch_claim=False, config=None):
+            item_key = payload["task"]["itemKey"]
+            started.append(item_key)
+            statuses[item_key] = "done"
+            # 第一条刚跑起来，用户在任务进度里点了全部停止。
+            executor.stop_all_executions({"programId": 1}, config=self.runtime_config())
+            return {"accepted": True}
+
+        def finalize(_config, _program_id, _batch_id, status, summary, _provider="codex"):
+            finalized.update({"status": status, "summary": summary})
+
+        with (
+            patch.object(bridge.planner, "project_context", side_effect=project_context),
+            patch.object(executor, "_task_detail", side_effect=task_detail),
+            patch.object(executor, "execute", side_effect=execute),
+            patch.object(executor, "_update_execution_batch_item", return_value=None),
+            patch.object(executor, "_finalize_execution_batch", side_effect=finalize),
+        ):
+            executor._run_batch("batch-stop", self.runtime_config(), 1, ["a", "b"], "")
+
+        self.assertEqual(["a"], started)
+        self.assertEqual("blocked", finalized["status"])
+        self.assertIn("停止", finalized["summary"])
+        # 队列结束后取消标记要清掉，同一个批次号不会永远停在取消态。
+        self.assertNotIn("batch-stop", executor.cancelled_queues)
+
     def test_batch_continues_after_an_unsubstantive_interruption(self):
         statuses = {"a": "blocked", "b": "todo"}
         dependencies = {"a": [], "b": ["a"]}

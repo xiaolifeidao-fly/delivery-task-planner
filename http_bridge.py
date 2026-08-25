@@ -3873,6 +3873,11 @@ def conversation_catalog(binding: dict[str, Any] | None) -> list[dict[str, Any]]
     return catalog[:MAX_CONVERSATIONS_PER_TASK]
 
 
+def turn_already_finished(error: Exception) -> bool:
+    """Codex 在回合结束后会拒绝 interrupt。这不是停止失败，只是这一下点晚了。"""
+    return "no active turn" in str(error).lower()
+
+
 def conversation_metadata(
     binding: dict[str, Any] | None,
     thread_id: str,
@@ -5264,6 +5269,10 @@ class ExecutionBridge:
         # direct task execution request.
         self.sequence_satisfied: dict[str, set[str]] = {}
         self.batch_satisfied: dict[str, set[str]] = {}
+        # 用户在任务进度里点「全部停止」后，队列线程要能在下一个检查点自己收摊：
+        # 中断当前回合只结束正在跑的那一条，后面排队的任务得靠这两张表拦住。
+        self.queue_programs: dict[str, int] = {}
+        self.cancelled_queues: set[str] = set()
         self.lock = threading.Lock()
         self.progress = progress or ProgressStore()
         self.pending_session_syncs = pending_session_syncs or PendingSessionSyncStore()
@@ -7027,6 +7036,22 @@ class ExecutionBridge:
             raise BridgeFailure(f"任务面板未确认任务已进入进行中，已取消启动 {provider_label(provider)} 会话")
         return {**task, **updated}
 
+    def _register_queue(self, queue_id: str, program_id: int) -> None:
+        with self.lock:
+            self.queue_programs[queue_id] = program_id
+
+    def _release_queue(self, queue_id: str) -> None:
+        with self.lock:
+            self.queue_programs.pop(queue_id, None)
+            self.cancelled_queues.discard(queue_id)
+
+    def _abort_if_cancelled(self, queue_id: str) -> None:
+        """队列每启动一批任务前问一次：用户已经点过停止就别再往下拉了。"""
+        with self.lock:
+            cancelled = queue_id in self.cancelled_queues
+        if cancelled:
+            raise BridgeFailure("执行队列已被用户停止")
+
     @staticmethod
     def _create_execution_batch(
         config: dict[str, Any],
@@ -8038,8 +8063,10 @@ class ExecutionBridge:
         attempted_item = ""
         with self.lock:
             self.sequence_satisfied.setdefault(sequence_id, set())
+        self._register_queue(sequence_id, program_id)
         try:
             for item_key in item_keys:
+                self._abort_if_cancelled(sequence_id)
                 attempted_item = item_key
                 task = self._task_detail(config, program_id, item_key)
                 status = str(task.get("status") or "")
@@ -8122,6 +8149,7 @@ class ExecutionBridge:
                 self.active_sequences.discard(sequence_id)
                 self.sequence_tasks.difference_update(task_identity(biz_line, program_id, key) for key in item_keys)
                 self.sequence_satisfied.pop(sequence_id, None)
+            self._release_queue(sequence_id)
 
     def execute_batch(self, raw: Any, config: dict[str, Any] | None = None) -> dict[str, Any]:
         if not isinstance(raw, dict):
@@ -8229,9 +8257,11 @@ class ExecutionBridge:
         attempted_item = ""
         with self.lock:
             self.batch_satisfied.setdefault(batch_id, set())
+        self._register_queue(batch_id, program_id)
         try:
             remaining = set(item_keys)
             while remaining:
+                self._abort_if_cancelled(batch_id)
                 context = planner.project_context(config, program_id)
                 items = [item for item in context.get("items") or [] if isinstance(item, dict)]
                 by_key = {str(item.get("itemKey") or ""): item for item in items}
@@ -8273,6 +8303,7 @@ class ExecutionBridge:
                     raise BridgeFailure("批量队列没有可执行任务，仍在等待前置任务：" + "、".join(waiting))
 
                 for item_key in ready:
+                    self._abort_if_cancelled(batch_id)
                     attempted_item = item_key
                     task = self._task_detail(config, program_id, item_key)
                     self.execute(
@@ -8353,6 +8384,7 @@ class ExecutionBridge:
             with self.lock:
                 self.batch_tasks.difference_update(task_identity(biz_line, program_id, key) for key in item_keys)
                 self.batch_satisfied.pop(batch_id, None)
+            self._release_queue(batch_id)
 
     def conversation(
         self,
@@ -9201,15 +9233,79 @@ class ExecutionBridge:
                 config, identity, task, binding, thread_id, turn_id, executor_provider_of(binding, provider),
             )
         client = active["client"]
-        client.interrupt_turn(active["threadId"], active["turnId"], request_id=client.next_request_id())
+        try:
+            client.interrupt_turn(active["threadId"], active["turnId"], request_id=client.next_request_id())
+        except Exception as error:
+            if not turn_already_finished(error):
+                raise
+            # 回合早就跑完了，本地记录是残留；跟随线程会把会话状态收尾，这里只把事实告诉调用方。
+            self.progress.publish(
+                identity, "status", "任务已经结束", "该任务当前没有正在运行的回合，状态稍后自动同步。", "success",
+            )
+            return {
+                "accepted": True,
+                "alreadyFinished": True,
+                "bizLine": biz_line,
+                "programId": program_id,
+                "itemKey": item_key,
+                "threadId": active["threadId"],
+                "turnId": active["turnId"],
+            }
         self.progress.publish(identity, "status", "已请求停止任务", "正在等待 Codex 中断当前回合。", "running")
         return {
             "accepted": True,
+            "alreadyFinished": False,
             "bizLine": biz_line,
             "programId": program_id,
             "itemKey": item_key,
             "threadId": active["threadId"],
             "turnId": active["turnId"],
+        }
+
+    def stop_all_executions(self, raw: Any, config: dict[str, Any] | None = None) -> dict[str, Any]:
+        """停掉一个项目下所有任务执行：中断在跑的回合，并取消还在排队的批量/串行队列。
+
+        只针对任务执行本身，需求拆解、测试、环境预设这些会话各有各的停止入口，不在这里连坐。
+        """
+        if not isinstance(raw, dict):
+            raise BridgeFailure("请求体必须是 JSON 对象")
+        biz_line = biz_line_of(raw)
+        program_id = program_id_of(raw.get("programId"))
+        config = request_scoped_config(config, biz_line, program_id)
+        biz_line = config_biz_line(config)
+        with self.lock:
+            queue_ids = sorted(qid for qid, pid in self.queue_programs.items() if pid == program_id)
+            self.cancelled_queues.update(queue_ids)
+            runs = [
+                (identity, run) for identity, run in self.active_runs.items()
+                if identity[0] == biz_line and identity[1] == program_id and run.get("task")
+                and not run.get("taskTestingCases")
+            ]
+        stopped: list[str] = []
+        finished: list[str] = []
+        for identity, run in runs:
+            client = run.get("client")
+            thread_id = str(run.get("threadId") or "")
+            turn_id = str(run.get("turnId") or "")
+            if client is None or not thread_id or not turn_id:
+                continue
+            try:
+                client.interrupt_turn(thread_id, turn_id, request_id=client.next_request_id())
+            except Exception as error:
+                if turn_already_finished(error):
+                    finished.append(identity[2])
+                    continue
+                print(f"停止任务失败 {program_id}/{identity[2]}: {error}", file=sys.stderr, flush=True)
+                continue
+            stopped.append(identity[2])
+            self.progress.publish(identity, "status", "已请求停止任务", "正在等待中断当前回合。", "running")
+        return {
+            "accepted": True,
+            "bizLine": biz_line,
+            "programId": program_id,
+            "itemKeys": sorted(stopped),
+            "finishedItemKeys": sorted(finished),
+            "queueIds": queue_ids,
         }
 
     def _task_detail(self, config: dict[str, Any], program_id: int, item_key: str) -> dict[str, Any]:
@@ -11141,6 +11237,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
             "/v1/codex/requirement-outline",
             "/v1/codex/document-file",
             "/v1/codex/stop",
+            "/v1/codex/stop-all",
         }:
             self.json_response(404, {"error": "not found"})
             return
@@ -11270,6 +11367,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 if not item_key:
                     raise BridgeFailure("缺少任务标识")
                 self.json_response(202, selected_bridge.open_prototype_directory(program_id_of(payload.get("programId")), item_key, config=config))
+            elif path == "/v1/codex/stop-all":
+                self.json_response(202, selected_bridge.stop_all_executions(payload, config=config))
             else:
                 self.json_response(202, selected_bridge.stop_conversation(payload, config=config))
         except (BridgeFailure, planner.ToolFailure, json.JSONDecodeError, ValueError) as exc:
