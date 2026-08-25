@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from email.message import Message
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -3792,8 +3793,13 @@ class HttpBridgeTest(unittest.TestCase):
             self.assertEqual("doc/api/a", result["directory"])
             self.assertEqual("doc/api/a/文档.md", result["primaryPath"])
             self.assertEqual(
-                {"doc/api/a/文档.md", "doc/api/a/接口设计.md"},
+                {"doc/api/a/文档.md", "doc/api/a/接口设计.md", "doc/api/a/截图.png"},
                 {entry["path"] for entry in result["files"]},
+            )
+            # 非文本文件同样属于这个栏目，只是面板不当正文读，而是走附件预览与下载。
+            self.assertEqual(
+                {"doc/api/a/文档.md": True, "doc/api/a/接口设计.md": True, "doc/api/a/截图.png": False},
+                {entry["path"]: entry["previewable"] for entry in result["files"]},
             )
 
     def test_document_set_falls_back_to_the_first_document_when_the_primary_one_is_missing(self):
@@ -3863,6 +3869,107 @@ class HttpBridgeTest(unittest.TestCase):
                 {"doc/test/req-a/测试用例.md", "doc/test/req-a/补充场景.md"},
                 {entry["path"] for entry in testing_result["files"]},
             )
+
+    def test_multipart_bodies_split_into_plain_fields_and_uploaded_files(self):
+        boundary = "----test-boundary"
+        body = (
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="scope"\r\n\r\n'
+            "requirement-outline\r\n"
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="files"; filename="参考资料.pdf"\r\n'
+            "Content-Type: application/pdf\r\n\r\n"
+            "%PDF-1.4\r\n"
+            f"--{boundary}--\r\n"
+        ).encode("utf-8")
+        handler = object.__new__(bridge.BridgeHandler)
+        handler.headers = Message()
+        handler.headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
+        handler.rfile = io.BytesIO(body)
+
+        fields, uploads = handler.read_multipart(len(body))
+
+        self.assertEqual({"scope": "requirement-outline"}, fields)
+        self.assertEqual(1, len(uploads))
+        self.assertEqual("参考资料.pdf", uploads[0]["name"])
+        self.assertEqual("application/pdf", uploads[0]["contentType"])
+        self.assertEqual(b"%PDF-1.4", uploads[0]["data"])
+
+    def test_document_set_default_selection_skips_files_that_cannot_be_previewed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            column = workspace / "doc/requirements/req-a"
+            column.mkdir(parents=True)
+            (column / "参考资料.pdf").write_bytes(b"%PDF-1.4")
+            (column / "补充说明.md").write_text("# 补充\n", encoding="utf-8")
+            executor = bridge.ExecutionBridge(workspace)
+            with patch.object(executor, "_requirement_for_prototype", return_value={"requirementKey": "req-a"}):
+                result = executor.document_set(1, "requirement-outline", "req-a", config=self.runtime_config())
+
+            self.assertEqual("doc/requirements/req-a/补充说明.md", result["primaryPath"])
+
+    def test_uploaded_documents_land_in_the_requirement_directory_without_overwriting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            column = workspace / "doc/requirements/req-a"
+            column.mkdir(parents=True)
+            (column / "需求大纲.md").write_text("# 大纲\n", encoding="utf-8")
+            (column / "参考资料.pdf").write_bytes(b"%PDF-old")
+            executor = bridge.ExecutionBridge(workspace)
+            with patch.object(executor, "_requirement_for_prototype", return_value={"requirementKey": "req-a"}):
+                result = executor.upload_documents(
+                    1,
+                    "requirement-outline",
+                    "req-a",
+                    [
+                        {"name": "参考资料.pdf", "contentType": "application/pdf", "data": b"%PDF-new"},
+                        {"name": "粘贴的说明.md", "contentType": "text/markdown", "data": "# 说明\n".encode("utf-8")},
+                    ],
+                    config=self.runtime_config(),
+                )
+
+            self.assertEqual(
+                ["doc/requirements/req-a/参考资料-2.pdf", "doc/requirements/req-a/粘贴的说明.md"],
+                result["uploaded"],
+            )
+            self.assertEqual("doc/requirements/req-a/参考资料-2.pdf", result["primaryPath"])
+            self.assertEqual(b"%PDF-old", (column / "参考资料.pdf").read_bytes())
+            self.assertEqual(b"%PDF-new", (column / "参考资料-2.pdf").read_bytes())
+            self.assertEqual("# 说明\n", (column / "粘贴的说明.md").read_text(encoding="utf-8"))
+
+    def test_uploaded_document_names_cannot_escape_the_column_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            (workspace / "doc/requirements/req-a").mkdir(parents=True)
+            executor = bridge.ExecutionBridge(workspace)
+            with patch.object(executor, "_requirement_for_prototype", return_value={"requirementKey": "req-a"}):
+                result = executor.upload_documents(
+                    1,
+                    "requirement-outline",
+                    "req-a",
+                    [{"name": "../../逃逸.md", "contentType": "text/markdown", "data": b"x"}],
+                    config=self.runtime_config(),
+                )
+
+            self.assertEqual(["doc/requirements/req-a/逃逸.md"], result["uploaded"])
+            self.assertFalse((workspace / "逃逸.md").exists())
+
+    def test_document_attachment_registers_a_non_text_document_for_download(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            column = workspace / "doc/requirements/req-a"
+            column.mkdir(parents=True)
+            (column / "参考资料.pdf").write_bytes(b"%PDF-1.4 body")
+            executor = bridge.ExecutionBridge(workspace)
+            with patch.object(executor, "_requirement_for_prototype", return_value={"requirementKey": "req-a"}):
+                attachment = executor.document_attachment(
+                    1, "requirement-outline", "req-a", "doc/requirements/req-a/参考资料.pdf",
+                    config=self.runtime_config(),
+                )
+
+            self.assertEqual("参考资料.pdf", attachment["name"])
+            self.assertEqual("application/pdf", attachment["contentType"])
+            self.assertTrue(attachment["url"].startswith("/v1/codex/artifacts/"))
 
     def test_document_file_refuses_a_path_outside_its_column(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -205,6 +205,11 @@ MAX_WORKSPACE_FILE_INDEX_ENTRIES = 40000
 DOCUMENT_SET_SUFFIXES = {".md", ".markdown", ".txt", ".html", ".htm"}
 MAX_DOCUMENT_SET_FILES = 200
 MAX_DOCUMENT_SET_FILE_BYTES = 2 * 1024 * 1024
+# 面板还可以直接往栏目目录里放文档（本地选文件或粘贴正文）：什么后缀都收得下，
+# 但只有文本类文档能在面板里预览编辑，其余的走附件预览与下载。
+MAX_DOCUMENT_UPLOAD_FILES = 10
+MAX_DOCUMENT_UPLOAD_FILE_BYTES = 20 * 1024 * 1024
+MAX_DOCUMENT_UPLOAD_BYTES = MAX_DOCUMENT_UPLOAD_FILES * MAX_DOCUMENT_UPLOAD_FILE_BYTES + 128 * 1024
 # 测试技能把一条需求或一条任务的全部测试资产写在 doc/test/<键>/ 下。
 TESTING_ASSET_ROOT = "test"
 TESTING_CASES_FILE_NAME = "测试用例.md"
@@ -2404,7 +2409,9 @@ def git_untracked_line_count(workspace: Path, path: str) -> int:
 def git_change_files(workspace: Path) -> dict[str, Any]:
     """列出工作区相对 HEAD 的文件级改动，给「变更」面板点开看明细用。"""
     require_git_workspace(workspace)
-    completed = run_git(workspace, ["status", "--porcelain=v1", "-z"], timeout=60)
+    # -uall 让未跟踪目录展开成一条条文件，否则新增的整个目录只会收到一条以 / 结尾的条目，
+    # 面板既算不出行数，也读不到正文，点开只剩「没有可对比的内容」。
+    completed = run_git(workspace, ["status", "--porcelain=v1", "-z", "-uall"], timeout=60)
     if completed.returncode != 0:
         raise BridgeFailure(f"读取 Git 变更清单失败：{(completed.stdout or '').strip() or 'git 退出异常'}")
     entries = [chunk for chunk in (completed.stdout or "").split("\0") if chunk]
@@ -2811,6 +2818,48 @@ def git_push_branch(workspace: Path, branch: str, message: str = "", push: bool 
     }
 
 
+def git_sync_base_branch(workspace: Path, base_branch: str, remote: str = "origin") -> str:
+    """建需求分支前把基准分支拉到远端最新；否则新分支会切在过时的代码上。
+
+    返回真正用来切分支的引用：能同步就是本地基准分支，只存在于远端时返回 remote/xxx。
+    只做快进，分叉了就报错交回给用户，不在这里 merge 或 rebase。
+    """
+    remotes = git_output(workspace, ["remote"], "读取 Git 远端失败").split()
+    remote_prefix = f"{remote}/"
+    # 基准分支可能是用户直接选的 origin/xxx；拉取时要用远端那一侧的名字。
+    remote_side = base_branch[len(remote_prefix):] if base_branch.startswith(remote_prefix) else base_branch
+    local_exists = git_branch_exists(workspace, base_branch)
+    if remote not in remotes:
+        # 没有 origin 的纯本地仓库没有「最新」可拉，按本地基准分支继续。
+        if not local_exists:
+            raise BridgeFailure(f"基准分支不存在：{base_branch}")
+        return base_branch
+    fetched = run_git(workspace, ["fetch", remote, remote_side], timeout=180)
+    remote_ref = f"{remote}/{remote_side}"
+    remote_exists = run_git(workspace, ["rev-parse", "--verify", "--quiet", f"refs/remotes/{remote_ref}"]).returncode == 0
+    if not remote_exists:
+        # 远端没有这条分支：只可能是仅存在于本机的基准分支。
+        if local_exists:
+            return base_branch
+        raise BridgeFailure(f"基准分支在本机和 {remote} 都不存在：{base_branch}")
+    if fetched.returncode != 0:
+        raise BridgeFailure(f"拉取基准分支 {base_branch} 失败：{(fetched.stdout or '').strip() or 'git 退出异常'}")
+    if not local_exists:
+        # 本机还没有这条基准分支，直接从刚拉到的远端引用切出需求分支。
+        return remote_ref
+    if git_current_branch(workspace) == base_branch:
+        completed = run_git(workspace, ["merge", "--ff-only", remote_ref], timeout=120)
+    else:
+        # 不在基准分支上时用 fetch 的引用更新做快进，避免为了拉一次而来回切分支。
+        completed = run_git(workspace, ["fetch", remote, f"{remote_side}:{base_branch}"], timeout=180)
+    if completed.returncode != 0:
+        raise BridgeFailure(
+            f"基准分支 {base_branch} 无法快进到 {remote_ref}，可能已经分叉或有未推送的提交，"
+            f"请先自行处理：{(completed.stdout or '').strip() or 'git 退出异常'}"
+        )
+    return base_branch
+
+
 def git_create_branch(workspace: Path, base_branch: str, branch: str) -> dict[str, Any]:
     """从基准分支创建并切换到需求分支；分支已存在时只切换，不覆盖已有提交。"""
     if not valid_git_branch_name(base_branch):
@@ -2820,14 +2869,16 @@ def git_create_branch(workspace: Path, base_branch: str, branch: str) -> dict[st
     require_git_workspace(workspace)
     if run_git(workspace, ["check-ref-format", "--branch", branch]).returncode != 0:
         raise BridgeFailure(f"需求分支名不符合 Git 规范：{branch}")
-    if run_git(workspace, ["rev-parse", "--verify", "--quiet", f"{base_branch}^{{commit}}"]).returncode != 0:
-        raise BridgeFailure(f"基准分支不存在：{base_branch}")
     if git_branch_exists(workspace, branch):
         git_checkout_branch(workspace, branch)
         return {"created": False, "baseBranch": base_branch, "branch": branch}
     if git_worktree_dirty(workspace):
         raise BridgeFailure("工作目录有未提交改动，无法创建需求分支，请先提交或暂存")
-    completed = run_git(workspace, ["checkout", "--recurse-submodules", "-b", branch, base_branch])
+    # 先把基准分支拉到最新，再从它切出去；基准分支是否存在也在这一步确认。
+    base_reference = git_sync_base_branch(workspace, base_branch)
+    # 从 origin/xxx 切出来时不要跟踪基准分支：需求分支后面要推到它自己的远端分支。
+    track = ["--no-track"] if base_reference != base_branch else []
+    completed = run_git(workspace, ["checkout", "--recurse-submodules", *track, "-b", branch, base_reference])
     if completed.returncode != 0:
         raise BridgeFailure(f"创建需求分支失败：{(completed.stdout or '').strip() or 'git 退出异常'}")
     return {"created": True, "baseBranch": base_branch, "branch": branch}
@@ -3413,10 +3464,11 @@ def testing_asset_directory_of(key: str) -> Path:
 
 
 def document_set_entries(workspace: Path, relative_directory: Path, recursive: bool) -> list[dict[str, Any]]:
-    """List the readable text documents of one column, newest naming order first stable by path.
+    """List the documents of one column, stable by path.
 
-    只列目录里真实存在的文本文档：栏目从单文件升级成多文档后，面板的下拉框和文件列表都以这份清单为准，
-    不存在的文件不该出现在选项里。
+    目录里真实存在的文件都要列出来：文本文档（Markdown、纯文本、HTML）能在面板里直接预览和编辑，
+    面板上传进来的 PDF、Word、图片这类文件同样属于这个栏目，只是 previewable 为假，
+    面板会把它们交给附件预览或下载，而不是当文本读。
     """
     root = workspace.resolve()
     directory = (workspace / relative_directory).resolve()
@@ -3428,7 +3480,8 @@ def document_set_entries(workspace: Path, relative_directory: Path, recursive: b
         return []
     entries: list[dict[str, Any]] = []
     for path in sorted(directory.rglob("*") if recursive else directory.glob("*")):
-        if not path.is_file() or path.suffix.lower() not in DOCUMENT_SET_SUFFIXES:
+        # 隐藏文件是工具自己的中间产物（.DS_Store、.gitkeep），不是这个栏目的文档。
+        if not path.is_file() or path.name.startswith("."):
             continue
         resolved = path.resolve()
         try:
@@ -3442,19 +3495,23 @@ def document_set_entries(workspace: Path, relative_directory: Path, recursive: b
             "name": name,
             "size": stat.st_size,
             "updatedAt": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat().replace("+00:00", "Z"),
+            "previewable": resolved.suffix.lower() in DOCUMENT_SET_SUFFIXES,
+            "contentType": mimetypes.guess_type(resolved.name)[0] or "application/octet-stream",
         })
         if len(entries) >= MAX_DOCUMENT_SET_FILES:
             break
     return entries
 
 
-def document_in_set(workspace: Path, relative_directory: Path, raw_path: str) -> Path:
+def document_in_set(
+    workspace: Path, relative_directory: Path, raw_path: str, previewable_only: bool = True,
+) -> Path:
     """Resolve one document of a column and refuse anything outside that column's directory."""
     value = str(raw_path or "").strip()
     candidate = Path(value)
     if not value or candidate.is_absolute() or ".." in candidate.parts:
         raise BridgeFailure("文档路径无效")
-    if candidate.suffix.lower() not in DOCUMENT_SET_SUFFIXES:
+    if previewable_only and candidate.suffix.lower() not in DOCUMENT_SET_SUFFIXES:
         raise BridgeFailure("该文档不支持预览")
     path = (workspace / candidate).resolve()
     directory = (workspace / relative_directory).resolve()
@@ -3463,6 +3520,34 @@ def document_in_set(workspace: Path, relative_directory: Path, raw_path: str) ->
     except ValueError as exc:
         raise BridgeFailure("文档超出当前栏目目录") from exc
     return path
+
+
+def document_upload_name(raw_name: str) -> str:
+    """把浏览器传上来的文件名收敛成栏目目录里的一个安全文件名。
+
+    只取最后一段文件名，去掉路径分隔符和控制字符：上传口子决定的是「写哪个文件」，
+    不能让文件名自己带着目录跳出这个栏目。
+    """
+    cleaned = re.sub(r"[\\/\x00-\x1f]", "", Path(str(raw_name or "").replace("\\", "/")).name).strip()
+    if not cleaned or cleaned in {".", ".."} or cleaned.startswith("."):
+        raise BridgeFailure("文档文件名无效")
+    if len(cleaned) > 120:
+        suffix = Path(cleaned).suffix[:20]
+        cleaned = cleaned[: 120 - len(suffix)] + suffix
+    return cleaned
+
+
+def available_document_name(directory: Path, name: str) -> Path:
+    """同名文档不覆盖：会话写的文档和手动上传的文档共用一个目录，重名时顺延成 名字-2.后缀。"""
+    target = directory / name
+    if not target.exists():
+        return target
+    stem, suffix = Path(name).stem, Path(name).suffix
+    for index in range(2, 100):
+        candidate = directory / f"{stem}-{index}{suffix}"
+        if not candidate.exists():
+            return candidate
+    raise BridgeFailure("同名文档过多，请换一个文件名")
 
 
 def html_asset_payloads(workspace: Path, boundary: Path, html_path: Path, html: str) -> list[dict[str, str]]:
@@ -3550,6 +3635,11 @@ def document_payload(workspace: Path, path: Path, asset_boundary: Path | None = 
         "modifiedAt": datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat().replace("+00:00", "Z"),
         "assets": assets,
     }
+
+
+def document_attachment_item_key(scope: str, key: str) -> str:
+    """栏目文档登记成附件时的归属标识，和会话附件、任务产物区分开。"""
+    return f"__document__:{str(scope or '').strip()}:{str(key or '').strip()}"
 
 
 def requirement_prototype_item_key(requirement_key: str) -> str:
@@ -8631,8 +8721,10 @@ class ExecutionBridge:
         directory, primary, recursive = self._document_set_layout(config, program_id, scope, key)
         files = document_set_entries(self.workspace, directory, recursive)
         paths = {entry["path"] for entry in files}
-        # 主文档还没落盘时退回目录里的第一份，面板打开就有东西可看。
-        selected = primary if primary in paths else (files[0]["path"] if files else "")
+        # 主文档还没落盘时退回目录里的第一份可预览文档，面板打开就有东西可看；
+        # 上传进来的 PDF、图片这类文件不做默认选中，它们打开的是附件预览而不是正文。
+        previewable = [entry["path"] for entry in files if entry["previewable"]]
+        selected = primary if primary in paths else (previewable[0] if previewable else "")
         return {
             "scope": str(scope or "").strip(),
             "key": str(key or "").strip(),
@@ -8640,6 +8732,75 @@ class ExecutionBridge:
             "primaryPath": selected,
             "files": files,
         }
+
+    def upload_documents(
+        self,
+        program_id: int,
+        scope: str,
+        key: str,
+        uploads: list[dict[str, Any]],
+        biz_line: str = DEFAULT_BIZ_LINE,
+        config: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Save files the board picked (local files, or pasted text turned into a file) into one column.
+
+        面板本来只编辑会话产出的文档，需求目录还需要能放人手里的资料（PDF、Word、截图、粘过来的一段说明），
+        所以这里允许任意后缀落盘，但文件名一律收敛过、重名顺延，绝不覆盖会话已经写好的文档。
+        """
+        if not uploads:
+            raise BridgeFailure("没有要上传的文档")
+        if len(uploads) > MAX_DOCUMENT_UPLOAD_FILES:
+            raise BridgeFailure(f"一次最多上传 {MAX_DOCUMENT_UPLOAD_FILES} 份文档")
+        config = request_scoped_config(config, biz_line, program_id)
+        directory, _, _ = self._document_set_layout(config, program_id, scope, key)
+        prepared: list[tuple[str, bytes]] = []
+        for upload in uploads:
+            name = document_upload_name(str(upload.get("name") or ""))
+            data = upload.get("data")
+            if not isinstance(data, bytes) or not data:
+                raise BridgeFailure(f"文档 {name} 为空")
+            if len(data) > MAX_DOCUMENT_UPLOAD_FILE_BYTES:
+                raise BridgeFailure(f"文档 {name} 超过 20 MB")
+            prepared.append((name, data))
+        target_directory = (self.workspace / directory).resolve()
+        try:
+            target_directory.relative_to(self.workspace)
+        except ValueError as exc:
+            raise BridgeFailure("文档目录超出当前项目") from exc
+        target_directory.mkdir(parents=True, exist_ok=True)
+        uploaded: list[str] = []
+        for name, data in prepared:
+            target = available_document_name(target_directory, name)
+            target.write_bytes(data)
+            uploaded.append(target.resolve().relative_to(self.workspace).as_posix())
+        result = self.document_set(program_id, scope, key, config=config)
+        # 上传完就停在刚放进去的第一份上，用户不用自己再去列表里找。
+        result["primaryPath"] = uploaded[0] if uploaded else result["primaryPath"]
+        result["uploaded"] = uploaded
+        return result
+
+    def document_attachment(
+        self,
+        program_id: int,
+        scope: str,
+        key: str,
+        path: str,
+        biz_line: str = DEFAULT_BIZ_LINE,
+        config: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Register one non-text document of a column as an artifact so the board can preview or download it."""
+        config = request_scoped_config(config, biz_line, program_id)
+        directory, _, _ = self._document_set_layout(config, program_id, scope, key)
+        target = document_in_set(self.workspace, directory, path, previewable_only=False)
+        if not target.is_file():
+            raise BridgeFailure("文档不存在")
+        relative = target.relative_to(self.workspace).as_posix()
+        registered = self.artifacts.register(
+            config_biz_line(config), program_id, document_attachment_item_key(scope, key), [relative],
+        )
+        if not registered:
+            raise BridgeFailure("该文档无法预览或下载")
+        return registered[0]
 
     def document_file(
         self,
@@ -11236,6 +11397,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
             "/v1/codex/requirement-document",
             "/v1/codex/requirement-outline",
             "/v1/codex/document-file",
+            "/v1/codex/document-upload",
+            "/v1/codex/document-attachment",
             "/v1/codex/stop",
             "/v1/codex/stop-all",
         }:
@@ -11247,6 +11410,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
         try:
             if path == "/v1/codex/attachments":
                 self.handle_attachment_upload()
+                return
+            if path == "/v1/codex/document-upload":
+                self.handle_document_upload()
                 return
             if self.headers.get_content_type() != "application/json":
                 self.json_response(415, {"error": "application/json required"})
@@ -11348,6 +11514,14 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     payload.get("content"),
                     config=config,
                 ))
+            elif path == "/v1/codex/document-attachment":
+                self.json_response(200, selected_bridge.document_attachment(
+                    program_id_of(payload.get("programId")),
+                    str(payload.get("scope") or "").strip(),
+                    str(payload.get("key") or "").strip(),
+                    str(payload.get("path") or "").strip(),
+                    config=config,
+                ))
             elif path == "/v1/codex/cloud-sync":
                 self.json_response(200, selected_bridge.sync_cloud_workspace(
                     program_id_of(payload.get("programId")), config,
@@ -11405,19 +11579,42 @@ class BridgeHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             self.json_response(500, {"error": f"保存任务面板凭证失败：{exc}"})
 
-    def handle_attachment_upload(self) -> None:
+    def handle_document_upload(self) -> None:
+        """把面板选的本地文件（或粘贴正文生成的文件）写进某个栏目的目录。"""
         content_length = int(self.headers.get("Content-Length") or 0)
-        if content_length <= 0 or content_length > MAX_CONVERSATION_UPLOAD_BYTES:
-            raise BridgeFailure("附件请求体大小无效")
+        if content_length <= 0 or content_length > MAX_DOCUMENT_UPLOAD_BYTES:
+            raise BridgeFailure("文档请求体大小无效")
         if self.headers.get_content_type() != "multipart/form-data":
-            raise BridgeFailure("附件必须使用 multipart/form-data 上传")
+            raise BridgeFailure("文档必须使用 multipart/form-data 上传")
+        fields, uploads = self.read_multipart(content_length)
+        program_id = program_id_of(fields.get("programId"))
+        selected_bridge = self.bridge.for_workspace(fields.get("workspace"))
+        config = self.bridge.request_config(
+            {"programId": program_id},
+            self.allowed_origin() or "",
+            self.headers.get("token", "").strip(),
+        )
+        self.json_response(
+            201,
+            selected_bridge.upload_documents(
+                program_id,
+                fields.get("scope", ""),
+                fields.get("key", ""),
+                uploads,
+                config_biz_line(config),
+                config,
+            ),
+        )
+
+    def read_multipart(self, content_length: int) -> tuple[dict[str, str], list[dict[str, Any]]]:
+        """Split one multipart body into plain fields and uploaded files."""
         content_type = self.headers.get("Content-Type", "")
         raw = self.rfile.read(content_length)
         message = BytesParser(policy=policy.default).parsebytes(
             f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("ascii") + raw
         )
         if not message.is_multipart():
-            raise BridgeFailure("附件请求体不是有效的 multipart/form-data")
+            raise BridgeFailure("请求体不是有效的 multipart/form-data")
         fields: dict[str, str] = {}
         uploads: list[dict[str, Any]] = []
         for part in message.iter_parts():
@@ -11427,13 +11624,16 @@ class BridgeHandler(BaseHTTPRequestHandler):
             if not filename:
                 fields[name] = data.decode(part.get_content_charset() or "utf-8", errors="replace").strip()
                 continue
-            uploads.append(
-                {
-                    "name": filename,
-                    "contentType": part.get_content_type(),
-                    "data": data,
-                }
-            )
+            uploads.append({"name": filename, "contentType": part.get_content_type(), "data": data})
+        return fields, uploads
+
+    def handle_attachment_upload(self) -> None:
+        content_length = int(self.headers.get("Content-Length") or 0)
+        if content_length <= 0 or content_length > MAX_CONVERSATION_UPLOAD_BYTES:
+            raise BridgeFailure("附件请求体大小无效")
+        if self.headers.get_content_type() != "multipart/form-data":
+            raise BridgeFailure("附件必须使用 multipart/form-data 上传")
+        fields, uploads = self.read_multipart(content_length)
         program_id = program_id_of(fields.get("programId"))
         selected_bridge = self.bridge.for_workspace(fields.get("workspace"))
         config = self.bridge.request_config(
