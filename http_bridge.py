@@ -4935,8 +4935,12 @@ class AppServerClient:
         self.write({"method": method, "params": params})
 
     def wait_response(self, request_id: int, timeout: float = 20) -> dict[str, Any]:
-        with self.response_lock:
-            deadline = time.monotonic() + timeout
+        # 排队时间也算进预算：以前 deadline 是拿到锁之后才起算，一个回合正在跑的
+        # client 上并发发请求，实际等待会变成「排队 + timeout」，轻松超过调用方的上限。
+        deadline = time.monotonic() + timeout
+        if not self.response_lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
+            raise BridgeFailure("等待 Codex 响应超时")
+        try:
             deferred: list[dict[str, Any]] = []
             while time.monotonic() < deadline:
                 try:
@@ -4952,6 +4956,8 @@ class AppServerClient:
                 deferred.append(message)
             for later in deferred:
                 self.responses.put(later)
+        finally:
+            self.response_lock.release()
         raise BridgeFailure("等待 Codex 响应超时")
 
     def start_task(
@@ -5094,9 +5100,9 @@ class AppServerClient:
         self.send("turn/interrupt", request_id, {"threadId": thread_id, "turnId": turn_id})
         self.wait_response(request_id)
 
-    def read_thread(self, thread_id: str, request_id: int = 100) -> dict[str, Any]:
+    def read_thread(self, thread_id: str, request_id: int = 100, timeout: float = 20) -> dict[str, Any]:
         self.send("thread/read", request_id, {"threadId": thread_id, "includeTurns": True})
-        result = self.wait_response(request_id)
+        result = self.wait_response(request_id, timeout)
         thread = result.get("thread") or {}
         if not isinstance(thread, dict):
             return {}
@@ -5435,7 +5441,7 @@ class ClaudeCLIClient:
         if self.process and self.process.poll() is None:
             self.process.terminate()
 
-    def read_thread(self, thread_id: str, request_id: int = 100) -> dict[str, Any]:
+    def read_thread(self, thread_id: str, request_id: int = 100, timeout: float = 20) -> dict[str, Any]:
         # 本进程跑过这条会话就用内存里的实时状态，否则回落到落盘的历史记录。
         if self.turns and thread_id in {self.transcript_key, self.thread_id, ""}:
             return {"id": thread_id or self.thread_id, "turns": list(self.turns)}
@@ -5471,7 +5477,158 @@ def create_ai_client(provider: str, workspace: Path, event_callback: Any = None,
     return AppServerClient(workspace, event_callback, environment)
 
 
-def read_thread_or_empty(client: Any, thread_id: str) -> dict[str, Any]:
+# 只读快照的有效期。面板 3~5 秒轮询一次，这个值只用来合并「同一瞬间的重复读」，
+# 不会让正在跑的回合看起来卡住：回合活跃时正文走的是那一路自己的 client。
+THREAD_SNAPSHOT_TTL_SECONDS = 2.0
+# 只读执行器闲置多久就回收，别让空转的子进程一直挂着。
+THREAD_READER_IDLE_SECONDS = 300.0
+# 回合正在跑时读正文用的上限。这条路子共用执行器那一路的 JSON-RPC client，
+# app-server 忙着串流时不一定马上答 `thread/read`，必须明显低于面板 20s 的超时，
+# 否则浏览器先 abort、桥接还在空等，用户看到的就是一串 `(canceled)`。
+ACTIVE_THREAD_READ_TIMEOUT_SECONDS = 8.0
+# 兜底快照最多留几条，够覆盖同时开着的几个会话窗口就行。
+THREAD_LAST_GOOD_LIMIT = 64
+
+
+class ThreadReaderPool:
+    """只读会话正文用的执行器复用池 + 极短 TTL 快照缓存。
+
+    面板每 3~5 秒就要拉一次整段会话正文，而 Codex 的读法是「拉起一个
+    `codex app-server` 子进程 → 握手 → thread/read → 关掉」，一次几百毫秒到几秒。
+    几个弹窗一起轮询时这些子进程互相抢 CPU，单次请求被推到 20 秒开外，前端只能
+    按超时 abort（DevTools 里就是 `(canceled)`）。这里把只读执行器留着复用，
+    再给正文加一个很短的 TTL，把同一瞬间的重复轮询合并成一次真实读取。
+
+    只服务「没有活跃回合」的线程：回合在跑时调用方用的是那一路自己的 client，
+    正文直接来自内存，不经过这里，所以 TTL 带来的滞后最多一个 TTL。
+    """
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.readers: dict[tuple[str, str, str], dict[str, Any]] = {}
+        self.snapshots: dict[tuple[str, str, str], tuple[float, dict[str, Any]]] = {}
+        # 最后一次读到正文的快照，没有 TTL：回合跑到一半读不回来时拿它兜底，
+        # 总比把空会话甩给面板强（增量内容前端还有 SSE 那一路）。
+        self.last_good_snapshots: dict[tuple[str, str, str], dict[str, Any]] = {}
+
+    @staticmethod
+    def _environment_signature(environment: dict[str, str] | None) -> str:
+        return json.dumps(sorted((environment or {}).items()), ensure_ascii=False)
+
+    @staticmethod
+    def _alive(client: Any) -> bool:
+        process = getattr(client, "process", None)
+        # Claude 适配器平时没有常驻进程，构造本身也不贵，按存活处理即可。
+        return process is None or process.poll() is None
+
+    def _take_idle(self, now: float) -> list[dict[str, Any]]:
+        """摘出闲置太久的执行器，真正关进程放到锁外做，别让读请求跟着等。"""
+        stale: list[dict[str, Any]] = []
+        for key, entry in list(self.readers.items()):
+            if now - float(entry.get("usedAt") or 0.0) <= THREAD_READER_IDLE_SECONDS:
+                continue
+            stale.append(self.readers.pop(key))
+        # 过期快照顺手清掉，别让 dict 随会话数一直涨。
+        for key, (stamp, _) in list(self.snapshots.items()):
+            if now - stamp > THREAD_SNAPSHOT_TTL_SECONDS:
+                self.snapshots.pop(key, None)
+        return stale
+
+    @staticmethod
+    def _close_all(entries: list[dict[str, Any]]) -> None:
+        for entry in entries:
+            try:
+                entry["client"].close()
+            except Exception:
+                pass
+
+    def _reader(self, provider: str, workspace: Path, environment: dict[str, str] | None) -> dict[str, Any]:
+        key = (provider, str(workspace), self._environment_signature(environment))
+        now = time.time()
+        with self.lock:
+            stale = self._take_idle(now)
+            entry = self.readers.get(key)
+            if entry is not None and not self._alive(entry["client"]):
+                self.readers.pop(key, None)
+                entry = None
+            if entry is None:
+                entry = {
+                    "client": create_ai_client(provider, workspace, environment=environment),
+                    "lock": threading.Lock(),
+                    "usedAt": now,
+                }
+                self.readers[key] = entry
+            entry["usedAt"] = now
+        self._close_all(stale)
+        return entry
+
+    def read(
+        self,
+        provider: str,
+        workspace: Path,
+        environment: dict[str, str] | None,
+        thread_id: str,
+    ) -> dict[str, Any]:
+        if not thread_id:
+            return {}
+        cache_key = (provider, str(workspace), thread_id)
+        now = time.time()
+        with self.lock:
+            cached = self.snapshots.get(cache_key)
+            if cached is not None and now - cached[0] <= THREAD_SNAPSHOT_TTL_SECONDS:
+                return cached[1]
+        entry = self._reader(provider, workspace, environment)
+        with entry["lock"]:
+            # 拿到读锁的这一刻可能别人刚读完，再看一眼缓存，省掉一次真实读取。
+            with self.lock:
+                cached = self.snapshots.get(cache_key)
+                if cached is not None and time.time() - cached[0] <= THREAD_SNAPSHOT_TTL_SECONDS:
+                    return cached[1]
+            if not self._alive(entry["client"]):
+                entry = self._reader(provider, workspace, environment)
+            thread = read_thread_or_empty(entry["client"], thread_id)
+        with self.lock:
+            self.snapshots[cache_key] = (time.time(), thread)
+        self.remember(provider, workspace, thread_id, thread)
+        return thread
+
+    def remember(self, provider: str, workspace: Path, thread_id: str, thread: dict[str, Any]) -> None:
+        """记下最后一次读到的正文，供回合忙时兜底。空会话不记，免得把兜底也污染掉。"""
+        if not thread_id or not (thread.get("turns") or []):
+            return
+        key = (provider, str(workspace), thread_id)
+        with self.lock:
+            self.last_good_snapshots.pop(key, None)
+            self.last_good_snapshots[key] = thread
+            while len(self.last_good_snapshots) > THREAD_LAST_GOOD_LIMIT:
+                self.last_good_snapshots.pop(next(iter(self.last_good_snapshots)))
+
+    def last_good(self, provider: str, workspace: Path, thread_id: str) -> dict[str, Any]:
+        with self.lock:
+            return self.last_good_snapshots.get((provider, str(workspace), thread_id)) or {}
+
+    def invalidate(self, thread_id: str = "") -> None:
+        """会话正文被改过（发消息、回合结束、停止）时丢掉快照，别让面板多等一个 TTL。"""
+        with self.lock:
+            if not thread_id:
+                self.snapshots.clear()
+                return
+            for key in [key for key in self.snapshots if key[2] == thread_id]:
+                self.snapshots.pop(key, None)
+
+    def shutdown(self) -> None:
+        with self.lock:
+            readers = list(self.readers.values())
+            self.readers.clear()
+            self.snapshots.clear()
+            self.last_good_snapshots.clear()
+        self._close_all(readers)
+
+
+THREAD_READERS = ThreadReaderPool()
+
+
+def read_thread_or_empty(client: Any, thread_id: str, timeout: float = 20) -> dict[str, Any]:
     """读不到会话正文时按空会话返回，不把错误抛给需求编辑和任务详情。
 
     会话正文只落在发起这条聊天的那台机器上（Codex 的 rollout、Claude 的
@@ -5481,7 +5638,7 @@ def read_thread_or_empty(client: Any, thread_id: str) -> dict[str, Any]:
     if not thread_id:
         return {}
     try:
-        return client.read_thread(thread_id, request_id=client.next_request_id())
+        return client.read_thread(thread_id, request_id=client.next_request_id(), timeout=timeout)
     except (BridgeFailure, planner.ToolFailure, OSError, ValueError) as exc:
         print(f"本机读取会话正文失败，按空会话处理：{thread_id}: {exc}", file=sys.stderr, flush=True)
         return {}
@@ -6053,6 +6210,16 @@ class ExecutionBridge:
         except Exception as exc:
             print(f"归档或云端同步失败：{resource_kind}/{resource_key}/{thread_id}: {exc}", file=sys.stderr, flush=True)
 
+    def _release_active_run(self, identity: str) -> dict[str, Any] | None:
+        """回合结束就顺手丢掉这条线程的只读快照。
+
+        活跃期正文来自这一路自己的 client，不经过只读池；一旦收尾，面板下一轮
+        就会改走池子，这里主动失效可以避免它多等一个 TTL 才看到收尾内容。
+        """
+        entry = self.active_runs.pop(identity, None)
+        THREAD_READERS.invalidate(str((entry or {}).get("threadId") or ""))
+        return entry
+
     def _read_thread_with_workspace_archive(
         self,
         client: Any,
@@ -6061,9 +6228,27 @@ class ExecutionBridge:
         resource_key: str,
         config: dict[str, Any],
         program_id: int,
+        *,
+        provider: str = "codex",
+        environment: dict[str, str] | None = None,
+        workspace: Path | None = None,
     ) -> dict[str, Any]:
-        """Prefer the executor's local history, then fall back to this workspace's Chat archive."""
-        thread = read_thread_or_empty(client, thread_id)
+        """Prefer the executor's local history, then fall back to this workspace's Chat archive.
+
+        `client` 传空表示这条线程当前没有活跃回合，正文走只读复用池：不再为每次
+        轮询拉起一个执行器子进程，同一瞬间的重复读也会被合并掉。
+        """
+        reader_workspace = workspace or self.workspace
+        if client is None:
+            thread = THREAD_READERS.read(provider, reader_workspace, environment, thread_id)
+        else:
+            # 回合正在跑：共用执行器那一路的 client，给一个明显低于面板超时的上限，
+            # 读不回来就用上一次的好快照兜底，别让浏览器等到自己 abort。
+            thread = read_thread_or_empty(client, thread_id, timeout=ACTIVE_THREAD_READ_TIMEOUT_SECONDS)
+            if thread.get("turns"):
+                THREAD_READERS.remember(provider, reader_workspace, thread_id, thread)
+            else:
+                thread = THREAD_READERS.last_good(provider, reader_workspace, thread_id) or thread
         turns = thread.get("turns") if isinstance(thread, dict) else None
         if isinstance(turns, list) and turns:
             return thread
@@ -6258,49 +6443,42 @@ class ExecutionBridge:
             }
         thread_entry = next((entry for entry in catalog if str(entry.get("threadId")) == thread_id), {})
         provider = executor_provider_of(thread_entry, session.get("executorType") or provider)
-        client = (
-            active["client"]
-            if active is not None and active.get("threadId") == thread_id
-            else create_ai_client(provider, self.workspace, environment=codex_environment(config, program_id, write_allowed=False, provider=provider))
+        live_client = active["client"] if active is not None and active.get("threadId") == thread_id else None
+        thread = self._read_thread_with_workspace_archive(
+            live_client, thread_id, "requirement", requirement_key, config, program_id,
+            provider=provider,
+            environment=codex_environment(config, program_id, write_allowed=False, provider=provider),
         )
-        close_after = active is None or active.get("threadId") != thread_id
-        try:
-            thread = self._read_thread_with_workspace_archive(
-                client, thread_id, "requirement", requirement_key, config, program_id,
-            )
-            planning_item_key = self._planning_item_key(requirement_key)
-            for entry in catalog:
-                entry["active"] = bool(active is not None and entry.get("threadId") == active.get("threadId"))
-                # 目录里留着 running，但本进程没有对应的回合：多半是上一次桥接跑一半被重启了。
-                if not entry["active"] and entry.get("status") == "running":
-                    entry["status"] = "interrupted"
-            return {
-                "bizLine": biz_line,
-                "programId": program_id,
-                "requirementKey": requirement_key,
-                "threadId": thread_id,
-                # 选中的这条线程属于哪个工具：面板据此对齐模型下拉和续聊参数。
-                "executorType": provider,
-                # 附件和产物按需求的伪任务键归档，拆解会话也要能把图片和文件回显出来。
-                "turns": serialize_turns(
-                    thread.get("turns") or [],
-                    lambda attachment_ids: [
-                        ConversationAttachmentStore._public(attachment)
-                        for attachment in self.attachments.resolve(program_id, planning_item_key, attachment_ids)
-                    ],
-                    lambda paths: self.artifacts.register(config_biz_line(config), program_id, planning_item_key, paths),
-                ),
-                "conversations": catalog,
-                "active": bool(active is not None and active.get("threadId") == thread_id),
-                "activeTurnId": str((active or {}).get("turnId") or ""),
-                "selectedStageKey": str((session or {}).get("stageKey") or ""),
-                "selectedModuleKey": str((session or {}).get("moduleKey") or ""),
-                "selectedKind": str((session or {}).get("kind") or ""),
-                "result": dict((session or {}).get("result") or {}),
-            }
-        finally:
-            if close_after:
-                client.close()
+        planning_item_key = self._planning_item_key(requirement_key)
+        for entry in catalog:
+            entry["active"] = bool(active is not None and entry.get("threadId") == active.get("threadId"))
+            # 目录里留着 running，但本进程没有对应的回合：多半是上一次桥接跑一半被重启了。
+            if not entry["active"] and entry.get("status") == "running":
+                entry["status"] = "interrupted"
+        return {
+            "bizLine": biz_line,
+            "programId": program_id,
+            "requirementKey": requirement_key,
+            "threadId": thread_id,
+            # 选中的这条线程属于哪个工具：面板据此对齐模型下拉和续聊参数。
+            "executorType": provider,
+            # 附件和产物按需求的伪任务键归档，拆解会话也要能把图片和文件回显出来。
+            "turns": serialize_turns(
+                thread.get("turns") or [],
+                lambda attachment_ids: [
+                    ConversationAttachmentStore._public(attachment)
+                    for attachment in self.attachments.resolve(program_id, planning_item_key, attachment_ids)
+                ],
+                lambda paths: self.artifacts.register(config_biz_line(config), program_id, planning_item_key, paths),
+            ),
+            "conversations": catalog,
+            "active": bool(active is not None and active.get("threadId") == thread_id),
+            "activeTurnId": str((active or {}).get("turnId") or ""),
+            "selectedStageKey": str((session or {}).get("stageKey") or ""),
+            "selectedModuleKey": str((session or {}).get("moduleKey") or ""),
+            "selectedKind": str((session or {}).get("kind") or ""),
+            "result": dict((session or {}).get("result") or {}),
+        }
 
     def send_planning(self, raw: Any, config: dict[str, Any]) -> dict[str, Any]:
         provider = ai_provider_of(raw)
@@ -6858,7 +7036,7 @@ class ExecutionBridge:
                 current = self.active_runs.get(identity)
                 if current is not None and current.get("client") is client:
                     self.active.discard(identity)
-                    self.active_runs.pop(identity, None)
+                    self._release_active_run(identity)
 
     # ---------- 预设环境会话 ----------
 
@@ -6903,35 +7081,35 @@ class ExecutionBridge:
                 "activeTurnId": "",
                 "environmentStatuses": environment_statuses,
             }
-        client = (
+        live_client = (
             active["client"]
             if active is not None and active.get("environmentSetup") and active.get("threadId") == thread_id
-            else create_ai_client(
+            else None
+        )
+        thread = (
+            read_thread_or_empty(live_client, thread_id, timeout=ACTIVE_THREAD_READ_TIMEOUT_SECONDS)
+            if live_client is not None
+            else THREAD_READERS.read(
                 provider,
                 environment_setup_workspace(),
-                environment=codex_environment(config, program_id, write_allowed=False, provider=provider),
+                codex_environment(config, program_id, write_allowed=False, provider=provider),
+                thread_id,
             )
         )
-        close_after = active is None or active.get("threadId") != thread_id
-        try:
-            thread = read_thread_or_empty(client, thread_id)
-            for entry in catalog:
-                entry["active"] = bool(active is not None and entry.get("threadId") == active.get("threadId"))
-                # 目录里留着 running 但本进程没有对应回合：多半是上一次桥接跑一半被重启了。
-                if not entry["active"] and entry.get("status") == "running":
-                    entry["status"] = "interrupted"
-            return {
-                "programId": program_id,
-                "threadId": thread_id,
-                "turns": serialize_turns(thread.get("turns") or []),
-                "conversations": catalog,
-                "active": bool(active is not None and active.get("threadId") == thread_id),
-                "activeTurnId": str((active or {}).get("turnId") or ""),
-                "environmentStatuses": environment_statuses,
-            }
-        finally:
-            if close_after:
-                client.close()
+        for entry in catalog:
+            entry["active"] = bool(active is not None and entry.get("threadId") == active.get("threadId"))
+            # 目录里留着 running 但本进程没有对应回合：多半是上一次桥接跑一半被重启了。
+            if not entry["active"] and entry.get("status") == "running":
+                entry["status"] = "interrupted"
+        return {
+            "programId": program_id,
+            "threadId": thread_id,
+            "turns": serialize_turns(thread.get("turns") or []),
+            "conversations": catalog,
+            "active": bool(active is not None and active.get("threadId") == thread_id),
+            "activeTurnId": str((active or {}).get("turnId") or ""),
+            "environmentStatuses": environment_statuses,
+        }
 
     def send_environment_setup(self, raw: Any, config: dict[str, Any]) -> dict[str, Any]:
         provider = ai_provider_of(raw)
@@ -7119,7 +7297,7 @@ class ExecutionBridge:
                 current = self.active_runs.get(identity)
                 if current is not None and current.get("client") is client:
                     self.active.discard(identity)
-                    self.active_runs.pop(identity, None)
+                    self._release_active_run(identity)
 
     # ---------- 需求总体测试会话 ----------
 
@@ -7260,38 +7438,33 @@ class ExecutionBridge:
             next((entry for entry in catalog if str(entry.get("threadId") or "") == selected_thread_id), {}),
             (session or {}).get("executorType") or provider,
         )
-        client = active["client"] if active is not None and active.get("threadId") == selected_thread_id else create_ai_client(
-            provider, self.workspace, environment=codex_environment(config, program_id, write_allowed=True),
+        live_client = active["client"] if active is not None and active.get("threadId") == selected_thread_id else None
+        thread = self._read_thread_with_workspace_archive(
+            live_client, selected_thread_id, "requirement", requirement_key, config, program_id,
+            provider=provider,
+            environment=codex_environment(config, program_id, write_allowed=True),
         )
-        close_after = active is None or active.get("threadId") != selected_thread_id
-        try:
-            thread = self._read_thread_with_workspace_archive(
-                client, selected_thread_id, "requirement", requirement_key, config, program_id,
-            )
-            item_key = self._requirement_testing_item_key(requirement_key)
-            for entry in catalog:
-                entry["active"] = bool(active is not None and entry.get("threadId") == active.get("threadId"))
-                if not entry["active"] and entry.get("status") == "running":
-                    entry["status"] = "interrupted"
-            return {
-                "programId": program_id, "requirementKey": requirement_key, "threadId": selected_thread_id,
-                "executorType": provider,
-                "turns": serialize_turns(
-                    thread.get("turns") or [],
-                    lambda attachment_ids: [ConversationAttachmentStore._public(attachment) for attachment in self.attachments.resolve(program_id, item_key, attachment_ids)],
-                    lambda paths: self.artifacts.register(config_biz_line(config), program_id, item_key, paths),
-                ),
-                "conversations": catalog,
-                "active": bool(active is not None and active.get("threadId") == selected_thread_id),
-                "activeTurnId": str((active or {}).get("turnId") or ""),
-                "testingReport": requirement.get("testingReport") or "", "testingStatus": requirement.get("testingStatus") or "todo",
-                "testingReportPath": requirement.get("testingReportPath") or "",
-                "testingCasesStatus": requirement.get("testingCasesStatus") or "todo", "testingCases": requirement.get("testingCases") or "",
-                "testingCasesPath": requirement.get("testingCasesPath") or "",
-            }
-        finally:
-            if close_after:
-                client.close()
+        item_key = self._requirement_testing_item_key(requirement_key)
+        for entry in catalog:
+            entry["active"] = bool(active is not None and entry.get("threadId") == active.get("threadId"))
+            if not entry["active"] and entry.get("status") == "running":
+                entry["status"] = "interrupted"
+        return {
+            "programId": program_id, "requirementKey": requirement_key, "threadId": selected_thread_id,
+            "executorType": provider,
+            "turns": serialize_turns(
+                thread.get("turns") or [],
+                lambda attachment_ids: [ConversationAttachmentStore._public(attachment) for attachment in self.attachments.resolve(program_id, item_key, attachment_ids)],
+                lambda paths: self.artifacts.register(config_biz_line(config), program_id, item_key, paths),
+            ),
+            "conversations": catalog,
+            "active": bool(active is not None and active.get("threadId") == selected_thread_id),
+            "activeTurnId": str((active or {}).get("turnId") or ""),
+            "testingReport": requirement.get("testingReport") or "", "testingStatus": requirement.get("testingStatus") or "todo",
+            "testingReportPath": requirement.get("testingReportPath") or "",
+            "testingCasesStatus": requirement.get("testingCasesStatus") or "todo", "testingCases": requirement.get("testingCases") or "",
+            "testingCasesPath": requirement.get("testingCasesPath") or "",
+        }
 
     def send_requirement_testing(self, raw: Any, config: dict[str, Any]) -> dict[str, Any]:
         provider = ai_provider_of(raw)
@@ -7476,7 +7649,7 @@ class ExecutionBridge:
                 current = self.active_runs.get(identity)
                 if current is None or current.get("client") is client:
                     self.active.discard(identity)
-                    self.active_runs.pop(identity, None)
+                    self._release_active_run(identity)
 
     def models(self, config: dict[str, Any], provider: str = "codex") -> dict[str, Any]:
         program_id = program_id_of(config.get("_project_id"))
@@ -7912,34 +8085,25 @@ class ExecutionBridge:
             active_for_thread = self._resume_task_testing_cases_turn(
                 config, identity, task, binding, provider, thread_id, running_turn_id,
             )
-        if active_for_thread is not None:
-            client = active_for_thread["client"]
-            close_after = False
-        else:
-            client = create_ai_client(
-                provider, self.workspace, environment=codex_environment(config, program_id, write_allowed=True),
-            )
-            close_after = True
-        try:
-            thread = self._read_thread_with_workspace_archive(
-                client, thread_id, "task", item_key, config, program_id,
-            )
-            for entry in catalog:
-                entry["active"] = bool(active_for_thread is not None and entry.get("threadId") == thread_id)
-                if not entry["active"] and entry.get("status") == "running":
-                    entry["status"] = "interrupted"
-            return {
-                "programId": program_id, "itemKey": item_key, "threadId": thread_id, "executorType": provider,
-                "turns": serialize_turns(thread.get("turns") or []), "conversations": catalog,
-                "active": active_for_thread is not None,
-                "activeTurnId": str((active_for_thread or {}).get("turnId") or ""),
-                "testingCasesStatus": task.get("testingCasesStatus") or "todo",
-                "testingCases": task.get("testingCases") or "",
-                "testingCasesPath": task.get("testingCasesPath") or "",
-            }
-        finally:
-            if close_after:
-                client.close()
+        live_client = active_for_thread["client"] if active_for_thread is not None else None
+        thread = self._read_thread_with_workspace_archive(
+            live_client, thread_id, "task", item_key, config, program_id,
+            provider=provider,
+            environment=codex_environment(config, program_id, write_allowed=True),
+        )
+        for entry in catalog:
+            entry["active"] = bool(active_for_thread is not None and entry.get("threadId") == thread_id)
+            if not entry["active"] and entry.get("status") == "running":
+                entry["status"] = "interrupted"
+        return {
+            "programId": program_id, "itemKey": item_key, "threadId": thread_id, "executorType": provider,
+            "turns": serialize_turns(thread.get("turns") or []), "conversations": catalog,
+            "active": active_for_thread is not None,
+            "activeTurnId": str((active_for_thread or {}).get("turnId") or ""),
+            "testingCasesStatus": task.get("testingCasesStatus") or "todo",
+            "testingCases": task.get("testingCases") or "",
+            "testingCasesPath": task.get("testingCasesPath") or "",
+        }
 
     def _resume_task_testing_cases_turn(
         self,
@@ -7980,7 +8144,7 @@ class ExecutionBridge:
             client.close()
             with self.lock:
                 self.active.discard(identity)
-                self.active_runs.pop(identity, None)
+                self._release_active_run(identity)
             raise
 
     def generate_task_testing_cases(self, raw: Any, config: dict[str, Any]) -> dict[str, Any]:
@@ -8087,7 +8251,7 @@ class ExecutionBridge:
                 pass
             with self.lock:
                 self.active.discard(identity)
-                self.active_runs.pop(identity, None)
+                self._release_active_run(identity)
             raise
 
     def stop_task_testing_cases(self, raw: Any, config: dict[str, Any]) -> dict[str, Any]:
@@ -8186,7 +8350,7 @@ class ExecutionBridge:
                 current = self.active_runs.get(identity)
                 if current is None or current.get("client") is client:
                     self.active.discard(identity)
-                    self.active_runs.pop(identity, None)
+                    self._release_active_run(identity)
 
     def _ensure_requirement_git_branch(self, config: dict[str, Any], program_id: int, task: dict[str, Any]) -> str:
         """任务所属需求关联了 Git 分支时，验证工作目录已由用户确认切换。
@@ -8582,7 +8746,7 @@ class ExecutionBridge:
                     print(f"清理启动失败的执行会话失败：{program_id}/{item_key}: {cleanup_error}", file=sys.stderr, flush=True)
             with self.lock:
                 self.active.discard(identity)
-                self.active_runs.pop(identity, None)
+                self._release_active_run(identity)
             raise
 
         threading.Thread(
@@ -9109,60 +9273,53 @@ class ExecutionBridge:
                     active_for_thread = self._resume_active_turn(config, identity, task, binding, thread_id, turn_id, provider)
                 except Exception as exc:
                     print(f"恢复 Codex 执行会话失败：{program_id}/{item_key}: {exc}", file=sys.stderr, flush=True)
-        if active_for_thread is not None:
-            client = active_for_thread["client"]
-            close_after = False
-        else:
-            client = create_ai_client(provider, self.workspace, environment=codex_environment(config, program_id))
-            close_after = True
-        try:
-            thread = self._read_thread_with_workspace_archive(
-                client, thread_id, "task", item_key, config, program_id,
-            )
-            self.attachments.recover_generated_images(config_biz_line(config), program_id, item_key, thread_id)
-            turns = ensure_terminal_result(
-                serialize_turns(
-                    thread.get("turns") or [],
-                    lambda attachment_ids: [
-                        ConversationAttachmentStore._public(attachment)
-                        for attachment in self.attachments.resolve(program_id, item_key, attachment_ids)
-                    ],
-                    lambda paths: self.artifacts.register(config_biz_line(config), program_id, item_key, paths),
-                    lambda turn_id: self.attachments.generated_for_turn(
-                        program_id, item_key, thread_id, turn_id
-                    ),
+        live_client = active_for_thread["client"] if active_for_thread is not None else None
+        thread = self._read_thread_with_workspace_archive(
+            live_client, thread_id, "task", item_key, config, program_id,
+            provider=provider,
+            environment=codex_environment(config, program_id),
+        )
+        self.attachments.recover_generated_images(config_biz_line(config), program_id, item_key, thread_id)
+        turns = ensure_terminal_result(
+            serialize_turns(
+                thread.get("turns") or [],
+                lambda attachment_ids: [
+                    ConversationAttachmentStore._public(attachment)
+                    for attachment in self.attachments.resolve(program_id, item_key, attachment_ids)
+                ],
+                lambda paths: self.artifacts.register(config_biz_line(config), program_id, item_key, paths),
+                lambda turn_id: self.attachments.generated_for_turn(
+                    program_id, item_key, thread_id, turn_id
                 ),
-                task,
-                binding,
-            )
-            for entry in catalog:
-                entry["active"] = bool(
-                    entry["threadId"] == str((active or {}).get("threadId") or "")
-                    or bool(
-                        (binding_by_thread.get(str(entry.get("threadId") or "")) or {}).get("status") == "running"
-                        and str((binding_by_thread.get(str(entry.get("threadId") or "")) or {}).get("externalSessionId") or "") == entry["threadId"]
-                    )
+            ),
+            task,
+            binding,
+        )
+        for entry in catalog:
+            entry["active"] = bool(
+                entry["threadId"] == str((active or {}).get("threadId") or "")
+                or bool(
+                    (binding_by_thread.get(str(entry.get("threadId") or "")) or {}).get("status") == "running"
+                    and str((binding_by_thread.get(str(entry.get("threadId") or "")) or {}).get("externalSessionId") or "") == entry["threadId"]
                 )
-            return {
-                "bizLine": biz_line,
-                "programId": program_id,
-                "itemKey": item_key,
-                "threadId": thread_id,
-                "executorType": provider,
-                "turns": turns,
-                "conversations": catalog,
-                "active": active_for_thread is not None,
-                "taskHasActiveConversation": task_has_active_conversation,
-                "activeTurnId": str((active_for_thread or {}).get("turnId") or ""),
-                "taskStatus": str(task.get("status") or "todo"),
-                "taskPhase": str(task.get("phase") or "requirement"),
-                "taskProgress": int(task.get("progress") or 0),
-                "sessionPhase": str((binding or {}).get("phase") or task.get("phase") or "requirement"),
-                "sessionProgress": int((binding or {}).get("progress") or 0),
-            }
-        finally:
-            if close_after:
-                client.close()
+            )
+        return {
+            "bizLine": biz_line,
+            "programId": program_id,
+            "itemKey": item_key,
+            "threadId": thread_id,
+            "executorType": provider,
+            "turns": turns,
+            "conversations": catalog,
+            "active": active_for_thread is not None,
+            "taskHasActiveConversation": task_has_active_conversation,
+            "activeTurnId": str((active_for_thread or {}).get("turnId") or ""),
+            "taskStatus": str(task.get("status") or "todo"),
+            "taskPhase": str(task.get("phase") or "requirement"),
+            "taskProgress": int(task.get("progress") or 0),
+            "sessionPhase": str((binding or {}).get("phase") or task.get("phase") or "requirement"),
+            "sessionProgress": int((binding or {}).get("progress") or 0),
+        }
 
     def upload_conversation_attachments(
         self,
@@ -9684,30 +9841,25 @@ class ExecutionBridge:
         provider = executor_provider_of(
             next((row for row in rows if str(row.get("threadId") or "") == selected_thread_id), {}), provider,
         )
-        client = active["client"] if active is not None and active.get("threadId") == selected_thread_id else create_ai_client(
-            provider, self.workspace, environment=codex_environment(config, program_id),
+        live_client = active["client"] if active is not None and active.get("threadId") == selected_thread_id else None
+        thread = self._read_thread_with_workspace_archive(
+            live_client, selected_thread_id, "requirement", requirement_key, config, program_id,
+            provider=provider,
+            environment=codex_environment(config, program_id),
         )
-        close_after = active is None or active.get("threadId") != selected_thread_id
-        try:
-            thread = self._read_thread_with_workspace_archive(
-                client, selected_thread_id, "requirement", requirement_key, config, program_id,
-            )
-            item_key = requirement_prototype_item_key(requirement_key)
-            return {
-                "programId": program_id,
-                "requirementKey": requirement_key,
-                "threadId": selected_thread_id,
-                "executorType": provider,
-                "turns": serialize_turns(
-                    thread.get("turns") or [],
-                    artifact_resolver=lambda paths: self.artifacts.register(config_biz_line(config), program_id, item_key, paths),
-                ),
-                "active": bool(active is not None and active.get("threadId") == selected_thread_id and active.get("prototype")),
-                "activeTurnId": str((active or {}).get("turnId") or ""),
-            }
-        finally:
-            if close_after:
-                client.close()
+        item_key = requirement_prototype_item_key(requirement_key)
+        return {
+            "programId": program_id,
+            "requirementKey": requirement_key,
+            "threadId": selected_thread_id,
+            "executorType": provider,
+            "turns": serialize_turns(
+                thread.get("turns") or [],
+                artifact_resolver=lambda paths: self.artifacts.register(config_biz_line(config), program_id, item_key, paths),
+            ),
+            "active": bool(active is not None and active.get("threadId") == selected_thread_id and active.get("prototype")),
+            "activeTurnId": str((active or {}).get("turnId") or ""),
+        }
 
     def send_requirement_prototype_message(self, raw: Any, config: dict[str, Any] | None = None) -> dict[str, Any]:
         program_id, requirement_key, message, requested_thread_id, provider, model = validate_requirement_prototype_payload(raw, message_required=True)
@@ -9809,7 +9961,7 @@ class ExecutionBridge:
                 current = self.active_runs.get(identity)
                 if current is not None and current.get("client") is client:
                     self.active.discard(identity)
-                    self.active_runs.pop(identity, None)
+                    self._release_active_run(identity)
 
     def prototype_directory(
         self,
@@ -10294,7 +10446,7 @@ class ExecutionBridge:
             self._release_failed_claim(config, program_id, updated_task, provider)
             with self.lock:
                 self.active.discard(identity)
-                self.active_runs.pop(identity, None)
+                self._release_active_run(identity)
             raise
         self.progress.publish(identity, "status", "已创建新的 Codex 会话", title, "running")
         threading.Thread(
@@ -10396,7 +10548,7 @@ class ExecutionBridge:
             client.close()
             with self.lock:
                 self.active.discard(identity)
-                self.active_runs.pop(identity, None)
+                self._release_active_run(identity)
             raise
         self.progress.publish(identity, "status", "Codex 正在处理追加要求", text, "running")
         threading.Thread(
@@ -10454,7 +10606,7 @@ class ExecutionBridge:
             client.close()
             with self.lock:
                 self.active.discard(identity)
-                self.active_runs.pop(identity, None)
+                self._release_active_run(identity)
             raise
         threading.Thread(
             target=self._follow,
@@ -10630,7 +10782,7 @@ class ExecutionBridge:
                 current = self.active_runs.get(identity)
                 if current is None or current.get("client") is client:
                     self.active.discard(identity)
-                    self.active_runs.pop(identity, None)
+                    self._release_active_run(identity)
 
     def _sync_result(
         self,
@@ -12425,7 +12577,11 @@ def main() -> None:
     origins = set(args.allow_origin or ["*"])
     httpd = create_http_server(args.host, args.port, workspace, origins)
     threading.Thread(target=httpd.bridge.reconcile_forever, daemon=True).start()  # type: ignore[attr-defined]
-    httpd.serve_forever()
+    try:
+        httpd.serve_forever()
+    finally:
+        # 只读执行器是常驻子进程，退出时收干净，别留孤儿。
+        THREAD_READERS.shutdown()
 
 
 if __name__ == "__main__":
