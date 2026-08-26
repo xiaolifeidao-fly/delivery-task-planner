@@ -4432,6 +4432,23 @@ class GitBranchTest(unittest.TestCase):
         self.assertFalse(result["created"])
         self.assertEqual("feature/issue_req-1787112353409", bridge.git_current_branch(self.workspace))
 
+    def test_create_branch_pulls_the_latest_base_branch_first(self):
+        remote = self.add_origin()
+        subprocess.run(["git", "-C", str(self.workspace), "push", "-u", "origin", "main"], check=True, capture_output=True)
+        worker = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(worker, ignore_errors=True))
+        subprocess.run(["git", "clone", "--branch", "main", str(remote), str(worker)], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(worker), "config", "user.email", "worker@test"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(worker), "config", "user.name", "worker"], check=True, capture_output=True)
+        (worker / "remote.txt").write_text("latest", encoding="utf-8")
+        subprocess.run(["git", "-C", str(worker), "add", "."], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(worker), "commit", "-m", "remote latest"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(worker), "push", "origin", "main"], check=True, capture_output=True)
+
+        bridge.git_create_branch(self.workspace, "main", "feature/latest-base")
+
+        self.assertTrue((self.workspace / "remote.txt").is_file())
+
     def test_create_branch_rejects_an_unknown_base_branch(self):
         with self.assertRaises(bridge.BridgeFailure):
             bridge.git_create_branch(self.workspace, "release/none", "feature/issue_req-1787112353409")
@@ -4570,6 +4587,61 @@ class GitBranchTest(unittest.TestCase):
         )
         self.assertEqual("feat: 需求改动", log.stdout.strip())
 
+    def test_push_pulls_remote_changes_before_the_user_commit(self):
+        remote = self.add_origin()
+        bridge.git_create_branch(self.workspace, "main", "feature/issue_req-pull-first")
+        bridge.git_push_branch(self.workspace, "feature/issue_req-pull-first", "chore: initial push")
+        worker = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(worker, ignore_errors=True))
+        subprocess.run(
+            ["git", "clone", "--branch", "feature/issue_req-pull-first", str(remote), str(worker)],
+            check=True, capture_output=True,
+        )
+        subprocess.run(["git", "-C", str(worker), "config", "user.email", "worker@test"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(worker), "config", "user.name", "worker"], check=True, capture_output=True)
+        (worker / "remote.txt").write_text("remote", encoding="utf-8")
+        subprocess.run(["git", "-C", str(worker), "add", "."], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(worker), "commit", "-m", "remote change"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(worker), "push", "origin", "feature/issue_req-pull-first"], check=True, capture_output=True)
+        (self.workspace / "README.md").write_text("local", encoding="utf-8")
+
+        result = bridge.git_push_branch(self.workspace, "feature/issue_req-pull-first", "feat: local change")
+
+        self.assertTrue(result["committed"])
+        self.assertEqual("rebased", result["synced"])
+        self.assertTrue((self.workspace / "remote.txt").is_file())
+        log = subprocess.run(
+            ["git", "-C", str(self.workspace), "log", "-1", "--format=%s"],
+            check=True, capture_output=True, text=True,
+        )
+        self.assertEqual("feat: local change", log.stdout.strip())
+
+    def test_push_pull_conflict_restores_uncommitted_work_without_a_temporary_commit(self):
+        remote = self.add_origin()
+        branch = "feature/issue_req-pull-conflict"
+        bridge.git_create_branch(self.workspace, "main", branch)
+        bridge.git_push_branch(self.workspace, branch, "chore: initial push")
+        worker = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(worker, ignore_errors=True))
+        subprocess.run(["git", "clone", "--branch", branch, str(remote), str(worker)], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(worker), "config", "user.email", "worker@test"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(worker), "config", "user.name", "worker"], check=True, capture_output=True)
+        (worker / "README.md").write_text("remote", encoding="utf-8")
+        subprocess.run(["git", "-C", str(worker), "commit", "-am", "remote conflict"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(worker), "push", "origin", branch], check=True, capture_output=True)
+        (self.workspace / "README.md").write_text("local", encoding="utf-8")
+
+        with self.assertRaises(bridge.BridgeFailure):
+            bridge.git_push_branch(self.workspace, branch, "feat: local conflict")
+
+        self.assertEqual("local", (self.workspace / "README.md").read_text(encoding="utf-8"))
+        self.assertTrue(bridge.git_worktree_dirty(self.workspace))
+        log = subprocess.run(
+            ["git", "-C", str(self.workspace), "log", "-1", "--format=%s"],
+            check=True, capture_output=True, text=True,
+        )
+        self.assertNotEqual("delivery-task-planner: sync before commit", log.stdout.strip())
+
     def test_push_without_local_changes_only_pushes(self):
         self.add_origin()
         bridge.git_create_branch(self.workspace, "main", "feature/issue_req-1")
@@ -4633,6 +4705,36 @@ class GitBranchTest(unittest.TestCase):
         subprocess.run(["git", "-C", str(self.workspace), "add", ".gitignore"], check=True, capture_output=True)
         subprocess.run(["git", "-C", str(self.workspace), "commit", "-m", f"ignore {name}"], check=True, capture_output=True)
         return child
+
+    def test_pending_submodules_are_initialized_with_the_workspace(self):
+        # 造一个带子模块的远端仓库，模拟「clone 下来但子模块还是空目录」。
+        module = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(module, ignore_errors=True))
+        for args in (["init", "--initial-branch=main"], ["config", "user.email", "m@test"], ["config", "user.name", "m"]):
+            subprocess.run(["git", "-C", str(module), *args], check=True, capture_output=True)
+        (module / "lib.txt").write_text("lib", encoding="utf-8")
+        subprocess.run(["git", "-C", str(module), "add", "."], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(module), "commit", "-m", "init"], check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-C", str(self.workspace), "-c", "protocol.file.allow=always",
+             "submodule", "add", str(module), "server"],
+            check=True, capture_output=True,
+        )
+        subprocess.run(["git", "-C", str(self.workspace), "commit", "-m", "add submodule"], check=True, capture_output=True)
+        # 反初始化，回到「.gitmodules 有登记但本机没内容」的状态。
+        subprocess.run(["git", "-C", str(self.workspace), "submodule", "deinit", "-f", "server"], check=True, capture_output=True)
+
+        self.assertEqual(["server"], bridge.git_pending_submodules(self.workspace))
+        self.assertEqual(["server"], bridge.git_workspace_check(str(self.workspace))["pendingSubmodules"])
+        result = bridge.git_initialize_submodules(self.workspace)
+        self.assertEqual(["server"], result["submodules"])
+        self.assertEqual("", result["submoduleError"])
+        self.assertTrue((self.workspace / "server" / "lib.txt").is_file())
+        self.assertEqual([], bridge.git_pending_submodules(self.workspace))
+        # 没有子模块的仓库走这一步应该什么都不做，也不报错。
+        with tempfile.TemporaryDirectory() as plain:
+            subprocess.run(["git", "init", "-q", plain], check=True, capture_output=True)
+            self.assertEqual({"submodules": [], "submoduleError": ""}, bridge.git_initialize_submodules(Path(plain)))
 
     def test_subprojects_list_first_level_repositories_only(self):
         self.make_subproject("server")
@@ -4734,8 +4836,7 @@ class GitBranchTest(unittest.TestCase):
         bridge.git_create_branch(self.workspace, "main", "feature/issue_req-1")
         (server / "README.md").write_text("changed", encoding="utf-8")
         execution = bridge.ExecutionBridge(self.workspace)
-        records = {record["path"]: record for record in execution._push_branch_results(
-            {"branch": "feature/issue_req-1", "pushed": True, "committed": False, "upToDate": False},
+        records = {record["path"]: record for record in execution._push_subproject_branches(
             "feature/issue_req-1",
             "feat: 需求改动",
             ["server", "detached"],
@@ -4748,6 +4849,34 @@ class GitBranchTest(unittest.TestCase):
         self.assertFalse(bridge.git_worktree_dirty(server))
         # 游离 HEAD 没有可推送的分支，只能跳过。
         self.assertTrue(records["detached"]["skipped"])
+
+    def test_batch_push_executes_subprojects_before_the_root(self):
+        server = self.make_subproject("server")
+        self.add_origin()
+        branch = "feature/issue_req-push-order"
+        bridge.git_create_branch(self.workspace, "main", branch)
+        (server / "README.md").write_text("child changed", encoding="utf-8")
+        (self.workspace / "README.md").write_text("root changed", encoding="utf-8")
+        execution = bridge.ExecutionBridge(self.workspace)
+        calls: list[Path] = []
+        real_push = bridge.git_push_branch
+
+        def ordered_push(workspace: Path, *args, **kwargs):
+            calls.append(workspace.resolve())
+            return real_push(workspace, *args, **kwargs)
+
+        with patch.object(bridge, "git_push_branch", side_effect=ordered_push):
+            result = execution.push_requirement_branch({
+                "programId": 1,
+                "branch": branch,
+                "message": "feat: ordered push",
+                "targets": ["server"],
+                "commitOnly": True,
+            })
+
+        self.assertEqual([server.resolve(), self.workspace.resolve()], calls)
+        # 展示层仍然把主项目放第一行，避免改变前端现有的结果布局。
+        self.assertEqual(["", "server"], [record["path"] for record in result["results"]])
 
     def test_prepare_switches_subprojects_that_have_the_branch(self):
         server = self.make_subproject("server")

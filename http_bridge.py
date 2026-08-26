@@ -2957,7 +2957,7 @@ def git_rebase_onto_remote(workspace: Path, branch: str, remote: str = "origin")
 
 
 def git_push_branch(workspace: Path, branch: str, message: str = "", push: bool = True) -> dict[str, Any]:
-    """先把工作区改动提交到需求分支，再推到 origin。
+    """先同步远端最新，再把工作区改动提交到需求分支并推到 origin。
 
     只做普通推送，不带 --force：远端已经跑在前面时报错给用户，不在这里替他决定怎么合。
     push=False 时只提交不推送，给「仅提交」用：本地留一个提交点，什么时候推由用户决定。
@@ -2967,7 +2967,7 @@ def git_push_branch(workspace: Path, branch: str, message: str = "", push: bool 
     require_git_workspace(workspace)
     if not git_branch_exists(workspace, branch):
         raise BridgeFailure(f"本机不存在需求分支 {branch}，请先创建分支")
-    # 仅提交是纯本机动作：没配 origin 的仓库照样能落一个提交点，不该被推送的前置条件挡住。
+    # 仅提交在有 origin 时也要先同步最新；纯本地仓库仍可正常落一个提交点。
     remote = git_default_remote(workspace) if push else (
         "origin" if "origin" in git_output(workspace, ["remote"], "读取 Git 远端失败").split() else ""
     )
@@ -2982,14 +2982,36 @@ def git_push_branch(workspace: Path, branch: str, message: str = "", push: bool 
             )
         git_checkout_branch(workspace, branch)
     committed = False
+    synced = ""
     if dirty:
+        # 工作区有改动时不能直接 pull/rebase。先落一个仅供同步使用的临时提交，
+        # 同步完成（或失败并 abort）后立即拆回工作区改动，再用用户填写的说明正式提交。
+        # 这样远端冲突发生在正式提交之前，也不会把用户改动藏进 stash。
         add = run_git(workspace, ["add", "--all"])
         if add.returncode != 0:
             raise BridgeFailure(f"暂存改动失败：{(add.stdout or '').strip() or 'git 退出异常'}")
+        temporary = run_git(workspace, ["commit", "-m", "delivery-task-planner: sync before commit"], timeout=120)
+        if temporary.returncode != 0:
+            raise BridgeFailure(f"准备拉取前的临时提交失败：{(temporary.stdout or '').strip() or 'git 退出异常'}")
+        try:
+            if remote:
+                synced = git_rebase_onto_remote(workspace, branch, remote)
+        finally:
+            restored = run_git(workspace, ["reset", "--mixed", "HEAD^"], timeout=120)
+            if restored.returncode != 0:
+                raise BridgeFailure(
+                    f"拉取后恢复待提交改动失败：{(restored.stdout or '').strip() or 'git 退出异常'}"
+                )
+        commit = run_git(workspace, ["add", "--all"])
+        if commit.returncode != 0:
+            raise BridgeFailure(f"暂存改动失败：{(commit.stdout or '').strip() or 'git 退出异常'}")
         commit = run_git(workspace, ["commit", "-m", commit_message], timeout=120)
         if commit.returncode != 0:
             raise BridgeFailure(f"提交改动失败：{(commit.stdout or '').strip() or 'git 退出异常'}")
         committed = True
+    elif remote:
+        # 没有工作区改动也要在“提交/推送”动作开始时同步一次，避免基于旧分支判断已是最新。
+        synced = git_rebase_onto_remote(workspace, branch, remote)
     if not push:
         return {
             "pushed": False,
@@ -2998,11 +3020,11 @@ def git_push_branch(workspace: Path, branch: str, message: str = "", push: bool 
             "committed": committed,
             "commitMessage": commit_message if committed else "",
             "upToDate": False,
-            "synced": "",
+            "synced": synced,
             "output": "",
         }
-    # 改动已经落成提交，这时候再并远端最新：非快进被拒绝之前就解决掉，别等 push 报错。
-    synced = git_rebase_onto_remote(workspace, branch, remote)
+    # 首次同步与 push 之间远端仍可能变化；推送前再确认一次，关闭这段竞态窗口。
+    synced = git_rebase_onto_remote(workspace, branch, remote) or synced
     completed = run_git(workspace, ["push", "--set-upstream", remote, f"{branch}:{branch}"], timeout=180)
     output = (completed.stdout or "").strip()
     if completed.returncode != 0:
@@ -3321,6 +3343,7 @@ def git_workspace_check(value: Any) -> dict[str, Any]:
             "remoteName": "origin",
             "remoteConfigured": False,
             "empty": False,
+            "pendingSubmodules": [],
         }
     inside, _ = git_workspace_probe(resolved)
     if not inside:
@@ -3332,6 +3355,7 @@ def git_workspace_check(value: Any) -> dict[str, Any]:
             "remoteName": "origin",
             "remoteConfigured": False,
             "empty": not any(resolved.iterdir()),
+            "pendingSubmodules": [],
         }
     root = run_git(resolved, ["rev-parse", "--show-toplevel"])
     return {
@@ -3343,6 +3367,8 @@ def git_workspace_check(value: Any) -> dict[str, Any]:
         # 远端地址可能带内嵌凭据，只回传是否已配置。
         "remoteConfigured": bool(git_remote_url(resolved, "origin")),
         "empty": False,
+        # 目录早就是仓库、但子模块还是空的，也要能在偏好设置里补一次初始化。
+        "pendingSubmodules": git_pending_submodules(resolved),
     }
 
 
@@ -3363,6 +3389,50 @@ def git_adopt_remote_branch(workspace: Path, branch: str, remote: str) -> None:
     # 一次全塞进命令行可能超出系统参数上限，按批检出。
     for start in range(0, len(missing), 200):
         git_output(workspace, ["checkout", "--", *missing[start:start + 200]], "检出远端文件失败", timeout=300)
+
+
+def git_pending_submodules(workspace: Path) -> list[str]:
+    """.gitmodules 里登记了、但本机还没检出内容的子模块路径。
+
+    git submodule status 用行首的 - 标记「还没初始化」，这里只认这个标记，
+    不去猜目录空不空——子模块目录本来就可能有被忽略的构建产物。
+    """
+    if not (workspace / ".gitmodules").is_file():
+        return []
+    completed = run_git(workspace, ["submodule", "status", "--recursive"], timeout=120)
+    if completed.returncode != 0:
+        return []
+    pending: list[str] = []
+    for line in (completed.stdout or "").splitlines():
+        if not line.startswith("-"):
+            continue
+        parts = line[1:].strip().split()
+        if len(parts) >= 2:
+            pending.append(parts[1])
+    return pending
+
+
+def git_initialize_submodules(workspace: Path) -> dict[str, Any]:
+    """把 .gitmodules 里还没初始化的子模块一并拉下来。
+
+    子模块失败不该把主仓库的初始化算作失败：主仓库已经可用了，这里只把原因带回去。
+    """
+    pending = git_pending_submodules(workspace)
+    if not pending:
+        return {"submodules": [], "submoduleError": ""}
+    completed = run_git(workspace, ["submodule", "update", "--init", "--recursive"], timeout=1800)
+    if completed.returncode != 0:
+        return {
+            "submodules": pending,
+            "submoduleError": (completed.stdout or "").strip() or "git 退出异常",
+        }
+    remaining = git_pending_submodules(workspace)
+    return {
+        "submodules": [path for path in pending if path not in remaining],
+        "submoduleError": (
+            f"以下子模块仍未初始化：{'、'.join(remaining)}" if remaining else ""
+        ),
+    }
 
 
 def git_initialize_workspace(
@@ -3416,6 +3486,8 @@ def git_initialize_workspace(
         if created_git_directory and git_directory.is_dir():
             shutil.rmtree(git_directory, ignore_errors=True)
         raise
+    # 主仓库已经能用了，子模块是附带的一步：失败只回传原因，不回滚 .git。
+    submodules = git_initialize_submodules(workspace)
     return {
         "workspace": str(workspace),
         "initialized": True,
@@ -3423,6 +3495,7 @@ def git_initialize_workspace(
         "remoteName": remote,
         "adopted": adopted,
         "status": git_workspace_status(workspace, url, remote),
+        **submodules,
     }
 
 VERSION_RE = re.compile(r"(?<!\d)(\d+(?:\.\d+)+)")
@@ -8155,7 +8228,7 @@ class ExecutionBridge:
         )
 
     def push_requirement_branch(self, raw: Any, config: dict[str, Any] | None = None) -> dict[str, Any]:
-        """需求窗口的「推送到 Git」：先在本机提交并推送，失败或冲突再交给 AI 处理一轮。"""
+        """需求窗口的「推送到 Git」：先推子项目，最后提交并推送主项目。"""
         if not isinstance(raw, dict):
             raise BridgeFailure("请求体必须是 JSON 对象")
         program_id = program_id_of(raw.get("programId"))
@@ -8167,16 +8240,19 @@ class ExecutionBridge:
         commit_only = bool(raw.get("commitOnly"))
         # 子项目的改动也是这条需求的产物：不带上它们，推完远端仍然缺一半代码。
         targets = git_subproject_targets_of(self.workspace, raw.get("targets"), branch)
+        # 子项目必须先落提交：submodule 的新 commit 会表现为主项目里的 gitlink 改动，
+        # 主项目最后提交才能把这个指针一并带上。单个子项目失败仍继续其它项目和主项目。
+        child_records = self._push_subproject_branches(branch, message, targets, push=not commit_only)
         if commit_only:
             # 仅提交是本机动作，失败原因基本是工作区自身的问题，不值得再起一轮 AI 去修。
             result = git_push_branch(self.workspace, branch, message, push=False)
             result["repaired"] = False
-            result["results"] = self._push_branch_results(result, branch, message, targets, push=False)
+            result["results"] = self._push_branch_results(result, branch, child_records)
             return result
         try:
             result = git_push_branch(self.workspace, branch, message)
             result["repaired"] = False
-            result["results"] = self._push_branch_results(result, branch, message, targets)
+            result["results"] = self._push_branch_results(result, branch, child_records)
             return result
         except BridgeFailure as exc:
             failure = str(exc)
@@ -8209,32 +8285,22 @@ class ExecutionBridge:
             "repairSummary": summary,
             "output": failure,
         }
-        # 根目录是靠 AI 兜底才推上去的，子项目仍然按常规推一轮，别把它们落下。
-        repaired["results"] = self._push_branch_results(repaired, branch, message, targets)
+        # 子项目已经在主项目之前处理完成；AI 只修主项目，不能再把子项目重复推一轮。
+        repaired["results"] = self._push_branch_results(repaired, branch, child_records)
         return repaired
 
-    def _push_branch_results(
+    def _push_subproject_branches(
         self,
-        root: dict[str, Any],
         branch: str,
         message: str,
         targets: list[str],
         push: bool = True,
     ) -> list[dict[str, Any]]:
-        """把根目录的推送结果和各子项目的推送结果拼成一张表。
+        """按选择顺序先提交、推送各子项目，并返回各自结果。
 
         子项目失败只记录原因，不打断其它子项目：一个工程推不动不该让别的也停在本机。
         """
-        records: list[dict[str, Any]] = [{
-            "path": "",
-            "name": self.workspace.name,
-            "branch": str(root.get("branch") or branch),
-            "pushed": bool(root.get("pushed")),
-            "committed": bool(root.get("committed")),
-            "upToDate": bool(root.get("upToDate")),
-            "skipped": False,
-            "error": "",
-        }]
+        records: list[dict[str, Any]] = []
         for relative in targets:
             record: dict[str, Any] = {
                 "path": relative,
@@ -8266,6 +8332,24 @@ class ExecutionBridge:
                 record["error"] = str(exc)
             records.append(record)
         return records
+
+    def _push_branch_results(
+        self,
+        root: dict[str, Any],
+        branch: str,
+        children: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """结果展示仍保持主项目在第一行，但真实执行顺序是 children → root。"""
+        return [{
+            "path": "",
+            "name": self.workspace.name,
+            "branch": str(root.get("branch") or branch),
+            "pushed": bool(root.get("pushed")),
+            "committed": bool(root.get("committed")),
+            "upToDate": bool(root.get("upToDate")),
+            "skipped": False,
+            "error": "",
+        }, *children]
 
     def _repair_git_push(
         self,
@@ -11995,6 +12079,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
             "/v1/codex/prototype-directory/open",
             "/v1/codex/git/branch",
             "/v1/codex/git/init",
+            "/v1/codex/git/submodules",
             "/v1/codex/git/prepare",
             "/v1/codex/git/push",
             "/v1/codex/cloud-sync",
@@ -12037,6 +12122,20 @@ class BridgeHandler(BaseHTTPRequestHandler):
             payload = json.loads(self.rfile.read(length))
             if not isinstance(payload, dict):
                 raise BridgeFailure("请求体必须是 JSON 对象")
+            if path == "/v1/codex/git/submodules":
+                # 目录早就是仓库、只是子模块没拉下来：单独补这一步，不碰主仓库的分支和改动。
+                self.bridge.request_config(
+                    payload,
+                    self.allowed_origin() or "",
+                    self.headers.get("token", "").strip(),
+                )
+                submodule_workspace = self.bridge.for_workspace(payload.get("workspace")).workspace
+                require_git_workspace(submodule_workspace)
+                self.json_response(200, {
+                    "workspace": str(submodule_workspace),
+                    **git_initialize_submodules(submodule_workspace),
+                })
+                return
             if path == "/v1/codex/git/init":
                 # 初始化时目录还不是仓库、甚至可能还没建出来，不能先走 for_workspace 的存在性校验。
                 self.bridge.request_config(
