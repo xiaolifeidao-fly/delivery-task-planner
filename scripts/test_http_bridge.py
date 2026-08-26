@@ -2,12 +2,14 @@
 
 import importlib.util
 import base64
+import collections
 import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from email.message import Message
 from pathlib import Path
@@ -4088,7 +4090,9 @@ class HttpBridgeTest(unittest.TestCase):
         client = unittest.mock.MagicMock()
         client.thread_id = "thread-1"
         client.wait_turn.return_value = "completed"
-        client.read_turn.return_value = {"items": [{"type": "agentMessage", "text": "done"}]}
+        client.read_turn.return_value = {
+            "items": [{"type": "commandExecution", "command": "go build ./..."}, {"type": "agentMessage", "text": "done"}],
+        }
         order = []
         client.close.side_effect = lambda: order.append("close")
         executor.progress.publish = unittest.mock.MagicMock(side_effect=lambda *_args: order.append("publish"))
@@ -4104,6 +4108,127 @@ class HttpBridgeTest(unittest.TestCase):
 
         self.assertEqual(["sync", "close", "publish", "close"], order)
         archive.assert_called_once()
+
+    def test_corrupted_turn_is_detected_when_a_working_phase_calls_no_tool(self):
+        turn = {"items": [{"type": "agentMessage", "text": "我已经完成了改造。"}]}
+
+        self.assertTrue(bridge.corrupted_turn_reason("completed", turn, "development"))
+        self.assertTrue(bridge.corrupted_turn_reason("completed", turn, "testing"))
+        # 梳理需求只写文档，没有命令执行是正常的，不能按同一条判定。
+        self.assertEqual("", bridge.corrupted_turn_reason("completed", turn, "requirement"))
+        # 非正常结束走既有的失败路径，这里不重复判定。
+        self.assertEqual("", bridge.corrupted_turn_reason("interrupted", turn, "development"))
+
+    def test_corrupted_turn_accepts_a_round_that_actually_touched_the_workspace(self):
+        for item_type in ("commandExecution", "fileChange", "fileEdit", "mcpToolCall", "dynamicToolCall"):
+            turn = {"items": [{"type": item_type}, {"type": "agentMessage", "text": "完成"}]}
+            self.assertEqual("", bridge.corrupted_turn_reason("completed", turn, "development"), item_type)
+
+    def test_corrupted_turn_catches_a_leaked_tool_schema_even_in_the_grooming_phase(self):
+        # 实测形态：调用没发成调用帧，schema 和超时毫秒数被写进正文，开头的 T 还被吃掉了。
+        leaked = '先读技能文件。ARGET_TOOL_SCHEMA={"type":"function","description":"Executor tool"}"120000'
+        turn = {"items": [{"type": "commandExecution"}, {"type": "agentMessage", "text": leaked}]}
+
+        self.assertTrue(bridge.corrupted_turn_reason("completed", turn, "requirement"))
+        self.assertTrue(bridge.corrupted_turn_reason("completed", turn, "development"))
+        full = turn["items"][1]["text"].replace("ARGET_TOOL_SCHEMA", "TARGET_TOOL_SCHEMA")
+        turn["items"][1]["text"] = full
+        self.assertTrue(bridge.corrupted_turn_reason("completed", turn, "development"))
+
+    def test_corrupted_turn_is_retried_once_with_the_same_prompt(self):
+        executor = bridge.ExecutionBridge(Path.cwd())
+        client = unittest.mock.MagicMock()
+        client.thread_id = "thread-1"
+        client.next_request_id.return_value = 11
+        client.start_turn.return_value = "turn-2"
+        client.wait_turn.return_value = "completed"
+        client.read_turn.return_value = {
+            "items": [{"type": "commandExecution", "command": "pwd"}, {"type": "agentMessage", "text": "已改完"}],
+        }
+        executor.progress.publish = unittest.mock.MagicMock()
+
+        turn_id, status, turn, reason = executor._retry_corrupted_turn(
+            ("whatsapp", 1, "a"), client, "turn-1", "completed",
+            {"items": [{"type": "agentMessage", "text": "我没有可用的工具"}]},
+            "development", "原始提示词", model="gpt-5.6-terra", reasoning_effort="xhigh",
+        )
+
+        self.assertEqual(("turn-2", "completed", ""), (turn_id, status, reason))
+        self.assertEqual("commandExecution", turn["items"][0]["type"])
+        client.start_turn.assert_called_once()
+        self.assertEqual("原始提示词", client.start_turn.call_args.args[1])
+        self.assertEqual("xhigh", client.start_turn.call_args.kwargs["reasoning_effort"])
+
+    def test_corrupted_turn_fails_the_round_when_the_retry_is_also_toolless(self):
+        executor = bridge.ExecutionBridge(Path.cwd())
+        client = unittest.mock.MagicMock()
+        client.thread_id = "thread-1"
+        client.next_request_id.return_value = 11
+        client.start_turn.return_value = "turn-2"
+        client.wait_turn.return_value = "completed"
+        client.read_turn.return_value = {"items": [{"type": "agentMessage", "text": "本会话没有暴露工具"}]}
+        executor.progress.publish = unittest.mock.MagicMock()
+
+        turn_id, status, _turn, reason = executor._retry_corrupted_turn(
+            ("whatsapp", 1, "a"), client, "turn-1", "completed",
+            {"items": [{"type": "agentMessage", "text": "我没有可用的工具"}]},
+            "development", "原始提示词",
+        )
+
+        self.assertEqual(("turn-2", "failed"), (turn_id, status))
+        self.assertIn("重试后依然无效", reason)
+
+    def test_corrupted_turn_skips_the_retry_when_the_user_already_sent_a_new_round(self):
+        executor = bridge.ExecutionBridge(Path.cwd())
+        identity = ("whatsapp", 1, "a")
+        executor.active_runs[identity] = {"turnId": "turn-9"}
+        client = unittest.mock.MagicMock()
+        client.thread_id = "thread-1"
+
+        turn_id, status, _turn, reason = executor._retry_corrupted_turn(
+            identity, client, "turn-1", "completed",
+            {"items": [{"type": "agentMessage", "text": "我没有可用的工具"}]},
+            "development", "原始提示词",
+        )
+
+        self.assertEqual(("turn-1", "failed"), (turn_id, status))
+        self.assertTrue(reason)
+        client.start_turn.assert_not_called()
+
+    def test_follow_keeps_an_invalid_round_out_of_the_task_deliverable(self):
+        executor = bridge.ExecutionBridge(Path.cwd())
+        client = unittest.mock.MagicMock()
+        client.thread_id = "thread-1"
+        client.wait_turn.return_value = "completed"
+        client.read_turn.return_value = {"items": [{"type": "agentMessage", "text": "本会话没有暴露 shell 工具"}]}
+        executor.progress.publish = unittest.mock.MagicMock()
+        synced = {}
+
+        with (
+            patch.object(executor, "_sync_result", side_effect=lambda *args: synced.update(args=args)),
+            patch.object(executor, "_archive_terminal_chat"),
+        ):
+            executor._follow(
+                ("whatsapp", 1, "a"), client, {}, 1, "a",
+                {"phase": "development"}, {"version": 2}, "turn-1",
+            )
+
+        _config, _program, _key, _task, _binding, _turn_id, status, output, _provider, _title, reason = synced["args"]
+        self.assertEqual("failed", status)
+        self.assertEqual("", output)
+        self.assertTrue(reason)
+
+    def test_app_server_stderr_is_kept_for_diagnostics_instead_of_dropped(self):
+        client = bridge.AppServerClient.__new__(bridge.AppServerClient)
+        client.process = unittest.mock.MagicMock()
+        client.process.stderr = iter(["", "mcp startup timed out\n", "model refresh failed\n"])
+        client.stderr_lock = threading.Lock()
+        client.stderr_lines = collections.deque(maxlen=bridge.APP_SERVER_STDERR_TAIL)
+
+        client._drain_stderr()
+
+        self.assertEqual("mcp startup timed out\nmodel refresh failed", client.stderr_tail())
+        self.assertEqual("model refresh failed", client.stderr_tail(limit=1))
 
     def test_reconcile_does_not_scan_projects_without_a_current_user_token(self):
         executor = bridge.ExecutionBridge(Path.cwd())
@@ -4470,6 +4595,157 @@ class GitBranchTest(unittest.TestCase):
         self.add_origin()
         with self.assertRaises(bridge.BridgeFailure):
             bridge.git_push_branch(self.workspace, "feature/issue_missing", "")
+
+    def make_subproject(self, name: str, branch: str = "main") -> Path:
+        """在工作目录下造一个独立的 Git 子工程，模拟「一个目录里摆多个仓库」的布局。"""
+        child = self.workspace / name
+        child.mkdir()
+        for args in (
+            ["init", f"--initial-branch={branch}"],
+            ["config", "user.email", "bridge@test"],
+            ["config", "user.name", "bridge"],
+        ):
+            subprocess.run(["git", "-C", str(child), *args], check=True, capture_output=True)
+        (child / "README.md").write_text(name, encoding="utf-8")
+        subprocess.run(["git", "-C", str(child), "add", "."], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(child), "commit", "-m", "init"], check=True, capture_output=True)
+        # 根仓库不该把子工程的内容也算成自己的改动，否则建分支会被脏工作区拦下。
+        ignore = self.workspace / ".gitignore"
+        existing = ignore.read_text(encoding="utf-8").splitlines() if ignore.exists() else []
+        ignore.write_text("\n".join(sorted({*existing, f"{name}/"})) + "\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.workspace), "add", ".gitignore"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(self.workspace), "commit", "-m", f"ignore {name}"], check=True, capture_output=True)
+        return child
+
+    def test_subprojects_list_first_level_repositories_only(self):
+        self.make_subproject("server")
+        plain = self.workspace / "docs"
+        plain.mkdir()
+        (plain / "note.md").write_text("note", encoding="utf-8")
+        nested = self.workspace / "apps"
+        nested.mkdir()
+        (nested / "web").mkdir()
+        subprocess.run(["git", "-C", str(nested / "web"), "init", "-q"], check=True, capture_output=True)
+        self.assertEqual(
+            ["server"],
+            [path.name for path in bridge.git_subproject_workspaces(self.workspace)],
+        )
+
+    def test_workspace_projects_report_each_project_branch_and_changes(self):
+        child = self.make_subproject("server")
+        bridge.git_create_branch(self.workspace, "main", "feature/issue_req-1")
+        (child / "README.md").write_text("changed", encoding="utf-8")
+        catalog = bridge.git_workspace_projects(self.workspace, "feature/issue_req-1")
+        root, server = catalog["projects"]
+        self.assertEqual("", root["path"])
+        self.assertEqual("feature/issue_req-1", root["currentBranch"])
+        self.assertTrue(root["hasBranch"])
+        self.assertEqual("server", server["path"])
+        self.assertEqual("main", server["currentBranch"])
+        self.assertFalse(server["hasBranch"])
+        self.assertEqual(1, server["changed"])
+
+    def test_branch_creation_covers_the_selected_subprojects(self):
+        self.make_subproject("server")
+        self.make_subproject("web")
+        result = bridge.git_create_branch_targets(
+            self.workspace, "main", "feature/issue_req-1", ["server"],
+        )
+        self.assertTrue(result["created"])
+        self.assertEqual("feature/issue_req-1", bridge.git_current_branch(self.workspace / "server"))
+        # 没勾的子项目一点都不该动。
+        self.assertEqual("main", bridge.git_current_branch(self.workspace / "web"))
+        self.assertEqual(["", "server"], [record["path"] for record in result["results"]])
+        self.assertTrue(all(not record["error"] for record in result["results"]))
+
+    def test_branch_creation_can_skip_a_root_that_already_has_the_branch(self):
+        server = self.make_subproject("server")
+        bridge.git_create_branch(self.workspace, "main", "feature/issue_req-1")
+        # 根目录留一份没提交的改动：补建子项目分支不该被它挡住，也不该顺手把它带走。
+        (self.workspace / "README.md").write_text("wip", encoding="utf-8")
+        result = bridge.git_create_branch_targets(
+            self.workspace, "main", "feature/issue_req-1", ["server"], skip_root=True,
+        )
+        self.assertTrue(result["results"][0]["skipped"])
+        self.assertEqual("feature/issue_req-1", bridge.git_current_branch(server))
+        self.assertEqual("wip", (self.workspace / "README.md").read_text(encoding="utf-8"))
+
+    def test_branch_creation_refuses_to_skip_a_root_without_the_branch(self):
+        self.make_subproject("server")
+        with self.assertRaises(bridge.BridgeFailure):
+            bridge.git_create_branch_targets(
+                self.workspace, "main", "feature/issue_req-1", ["server"], skip_root=True,
+            )
+
+    def test_branch_creation_falls_back_to_the_subproject_default_branch(self):
+        child = self.make_subproject("server", branch="develop")
+        result = bridge.git_create_branch_targets(
+            self.workspace, "main", "feature/issue_req-1", ["server"],
+        )
+        self.assertEqual("feature/issue_req-1", bridge.git_current_branch(child))
+        self.assertEqual("develop", result["results"][1]["baseBranch"])
+
+    def test_branch_creation_keeps_other_subprojects_when_one_fails(self):
+        self.make_subproject("server")
+        broken = self.workspace / "broken"
+        broken.mkdir()
+        subprocess.run(["git", "-C", str(broken), "init", "-q"], check=True, capture_output=True)
+        ignore = self.workspace / ".gitignore"
+        ignore.write_text(ignore.read_text(encoding="utf-8") + "broken/\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.workspace), "commit", "-am", "ignore broken"], check=True, capture_output=True)
+        result = bridge.git_create_branch_targets(
+            self.workspace, "main", "feature/issue_req-1", ["broken", "server"],
+        )
+        records = {record["path"]: record for record in result["results"]}
+        # 空仓库连一条提交都没有，建不出分支；但同一轮里的 server 照样要建好。
+        self.assertTrue(records["broken"]["error"])
+        self.assertEqual("feature/issue_req-1", bridge.git_current_branch(self.workspace / "server"))
+
+    def test_branch_creation_rejects_paths_outside_the_workspace(self):
+        result = bridge.git_create_branch_targets(
+            self.workspace, "main", "feature/issue_req-1", ["../escape"],
+        )
+        self.assertTrue(result["results"][1]["error"])
+
+    def test_push_commits_subprojects_on_their_own_branch_when_the_branch_is_missing(self):
+        server = self.make_subproject("server")
+        detached = self.make_subproject("detached")
+        subprocess.run(
+            ["git", "-C", str(detached), "checkout", "--detach", "HEAD"], check=True, capture_output=True,
+        )
+        self.add_origin()
+        bridge.git_create_branch(self.workspace, "main", "feature/issue_req-1")
+        (server / "README.md").write_text("changed", encoding="utf-8")
+        execution = bridge.ExecutionBridge(self.workspace)
+        records = {record["path"]: record for record in execution._push_branch_results(
+            {"branch": "feature/issue_req-1", "pushed": True, "committed": False, "upToDate": False},
+            "feature/issue_req-1",
+            "feat: 需求改动",
+            ["server", "detached"],
+            push=False,
+        )}
+        # 子项目没有需求分支：改动提交到它自己当前的 main 上，而不是被跳过。
+        self.assertEqual("main", records["server"]["branch"])
+        self.assertTrue(records["server"]["committed"])
+        self.assertFalse(records["server"]["error"])
+        self.assertFalse(bridge.git_worktree_dirty(server))
+        # 游离 HEAD 没有可推送的分支，只能跳过。
+        self.assertTrue(records["detached"]["skipped"])
+
+    def test_prepare_switches_subprojects_that_have_the_branch(self):
+        server = self.make_subproject("server")
+        web = self.make_subproject("web")
+        bridge.git_create_branch_targets(self.workspace, "main", "feature/issue_req-1", ["server"])
+        bridge.git_checkout_branch(self.workspace, "main")
+        bridge.git_checkout_branch(server, "main")
+        targets = bridge.git_subproject_targets_of(self.workspace, None, "feature/issue_req-1")
+        self.assertEqual(["server"], targets)
+        result = bridge.git_prepare_branch_targets(
+            self.workspace, "feature/issue_req-1", "switch", "", "", "origin", targets,
+        )
+        self.assertEqual("feature/issue_req-1", bridge.git_current_branch(server))
+        self.assertEqual("main", bridge.git_current_branch(web))
+        self.assertEqual(["", "server"], [record["path"] for record in result["results"]])
 
     def test_task_prompt_pins_changes_to_the_requirement_branch(self):
         prompt = bridge.build_task_prompt({

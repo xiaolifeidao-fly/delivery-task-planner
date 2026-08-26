@@ -21,6 +21,7 @@ import sys
 import threading
 import time
 import uuid
+from collections import deque
 from datetime import datetime, timezone
 from email import policy
 from email.parser import BytesParser
@@ -163,6 +164,9 @@ MAX_THREAD_JOURNAL_ITEMS = 400
 # turn/start 的 summary 取值：auto / concise / detailed / none。auto 由模型自己决定详略，
 # 实测常常只给一两句。注意 app-server 会静默忽略不认识的字段，改名字前先实际验一遍。
 TURN_REASONING_SUMMARY = "detailed"
+# app-server 的 stderr 只在出问题时才有内容（MCP 启动超时、模型列表拉取失败之类），
+# 留最后这几行就够定位，全部堆在内存里没有意义。
+APP_SERVER_STDERR_TAIL = 40
 MAX_CONVERSATIONS_PER_TASK = 12
 MAX_CONVERSATION_ATTACHMENTS = 5
 MAX_CONVERSATION_REFERENCES = 16
@@ -2727,6 +2731,122 @@ def git_submodule_label(workspace: Path, submodule: Path) -> str:
     return submodule.resolve().relative_to(workspace.resolve()).as_posix()
 
 
+# 扫子项目时不进这些目录：依赖和产物目录里也可能躺着 .git，但它们不是这个项目的工程。
+GIT_SUBPROJECT_SKIP_DIRS = {
+    "node_modules", "vendor", "dist", "build", "out", "target",
+    "__pycache__", "venv", ".venv", "tmp", "temp",
+}
+
+
+def git_subproject_workspaces(workspace: Path) -> list[Path]:
+    """工作目录下一级子目录里自带 .git 的独立工程，按目录名排序。
+
+    只看一级：再往下扫要为每个候选目录多跑一轮 IO，而实际的多工程布局都是
+    「工作目录/工程名」这一层。已注册成 submodule 的目录同样自带 .git，照样列出来。
+    """
+    root = workspace.resolve()
+    try:
+        children = sorted(root.iterdir(), key=lambda item: item.name.casefold())
+    except OSError as exc:
+        raise BridgeFailure(f"读取项目工作目录失败：{exc}") from exc
+    result: list[Path] = []
+    for child in children:
+        if child.name.startswith(".") or child.name in GIT_SUBPROJECT_SKIP_DIRS:
+            continue
+        if child.is_symlink() or not child.is_dir():
+            continue
+        if not (child / ".git").exists():
+            continue
+        result.append(child.resolve())
+    return result
+
+
+def git_subproject_workspace_of(workspace: Path, relative: str) -> Path:
+    """把前端传回来的子项目相对路径还原成目录；只认扫描列出来的那一级。"""
+    value = str(relative or "").strip().strip("/")
+    root = workspace.resolve()
+    if not value or value == ".":
+        return root
+    candidate = (root / value).resolve()
+    if candidate == root:
+        return root
+    if candidate not in git_subproject_workspaces(root):
+        raise BridgeFailure(f"子项目不存在或不是 Git 仓库：{value}")
+    return candidate
+
+
+def git_branch_reference_exists(workspace: Path, branch: str, remote: str = "origin") -> bool:
+    """本机或已同步的远端引用里有没有这条分支；只读本地引用，不联网 fetch。"""
+    if not valid_git_branch_name(branch):
+        return False
+    if git_branch_exists(workspace, branch):
+        return True
+    return run_git(workspace, ["rev-parse", "--verify", "--quiet", f"refs/remotes/{remote}/{branch}"]).returncode == 0
+
+
+def git_project_snapshot(workspace: Path, relative: str, branch: str = "", remote: str = "origin") -> dict[str, Any]:
+    """单个工程的 Git 快照。读不动的工程只把原因带回去，不连累同级的其它工程。"""
+    record: dict[str, Any] = {
+        "path": relative,
+        "name": relative or workspace.name,
+        "workspace": str(workspace),
+        "isGitRepository": False,
+        "hasBranch": False,
+        "error": "",
+        "remoteName": remote,
+        "remoteMatches": True,
+        "currentBranch": "",
+        "detached": False,
+        "dirty": False,
+        "changed": 0,
+        "staged": 0,
+        "unstaged": 0,
+        "untracked": 0,
+        "checkedAt": int(time.time()),
+    }
+    try:
+        record.update(git_workspace_status(workspace, "", remote))
+        if branch:
+            record["hasBranch"] = git_branch_reference_exists(workspace, branch, remote)
+    except BridgeFailure as exc:
+        record["error"] = str(exc)
+    # git_workspace_status 会覆盖 workspace，但不认识 path / name，这里补回来。
+    record["path"] = relative
+    record["name"] = relative or workspace.name
+    return record
+
+
+def git_workspace_projects(workspace: Path, branch: str = "", remote: str = "origin") -> dict[str, Any]:
+    """根工作目录加一级子项目的 Git 快照，给需求窗口的 Git 面板分工程展示。"""
+    projects = [git_project_snapshot(workspace, "", branch, remote)]
+    for child in git_subproject_workspaces(workspace):
+        projects.append(git_project_snapshot(child, child.name, branch, remote))
+    return {"workspace": str(workspace), "projects": projects}
+
+
+def git_subproject_targets_of(workspace: Path, raw: Any, branch: str = "", remote: str = "origin") -> list[str]:
+    """请求里带了 targets 就按它来，没带就自动选出所有已有这条分支的子项目。
+
+    没带 targets 的调用方（需求列表的分支检查、旧版本控制台）也该把子项目一起带上，
+    否则切完分支只有根目录跟着走，子工程还停在别的需求上。
+    """
+    if raw is None:
+        if not branch:
+            return []
+        return [
+            child.name for child in git_subproject_workspaces(workspace)
+            if git_branch_reference_exists(child, branch, remote)
+        ]
+    if not isinstance(raw, list):
+        raise BridgeFailure("子项目列表格式不正确")
+    targets: list[str] = []
+    for value in raw:
+        name = str(value or "").strip().strip("/")
+        if name and name != "." and name not in targets:
+            targets.append(name)
+    return targets
+
+
 def git_checkout_branch(workspace: Path, branch: str) -> None:
     """切换到已存在的本地分支；工作区有未提交改动时不强行切，交回给用户处理。"""
     if git_current_branch(workspace) == branch:
@@ -2838,7 +2958,10 @@ def git_push_branch(workspace: Path, branch: str, message: str = "", push: bool 
     require_git_workspace(workspace)
     if not git_branch_exists(workspace, branch):
         raise BridgeFailure(f"本机不存在需求分支 {branch}，请先创建分支")
-    remote = git_default_remote(workspace)
+    # 仅提交是纯本机动作：没配 origin 的仓库照样能落一个提交点，不该被推送的前置条件挡住。
+    remote = git_default_remote(workspace) if push else (
+        "origin" if "origin" in git_output(workspace, ["remote"], "读取 Git 远端失败").split() else ""
+    )
     commit_message = git_commit_message_of(message, branch)
     current = git_current_branch(workspace)
     dirty = git_worktree_dirty(workspace)
@@ -3009,6 +3132,134 @@ def git_create_branch(workspace: Path, base_branch: str, branch: str) -> dict[st
     if completed.returncode != 0:
         raise BridgeFailure(f"创建需求分支失败：{(completed.stdout or '').strip() or 'git 退出异常'}")
     return {"created": True, "baseBranch": base_branch, "branch": local}
+
+
+def git_effective_base_branch(workspace: Path, base_branch: str, remote: str = "origin") -> str:
+    """子项目不一定有同名基准分支：没有就退回它自己的默认分支，而不是直接建不出来。"""
+    if git_branch_reference_exists(workspace, base_branch, remote):
+        return base_branch
+    listed = git_output(
+        workspace,
+        ["for-each-ref", "--format=%(refname:short)", "refs/heads", "refs/remotes"],
+        "读取 Git 分支失败",
+    )
+    remote_names = set(git_output(workspace, ["remote"], "读取 Git 远端失败").split())
+    branches = [
+        name for name in (line.strip() for line in listed.splitlines())
+        if name and not name.endswith("/HEAD") and name not in remote_names
+    ]
+    fallback = git_default_branch(workspace, branches)
+    if not fallback:
+        raise BridgeFailure(f"子项目里没有基准分支 {base_branch}，也找不到可用的默认分支")
+    return fallback
+
+
+def git_create_branch_targets(
+    workspace: Path,
+    base_branch: str,
+    branch: str,
+    targets: list[str],
+    skip_root: bool = False,
+) -> dict[str, Any]:
+    """在根工作目录和选中的子项目里创建同一条需求分支。
+
+    根目录失败照旧直接报错（需求还没落库，不该留下半条关联）；子项目失败只记在结果里，
+    不回滚已经建好的分支——把已完成的部分撤掉比留着更难收拾。
+
+    skip_root 用于「给已有需求补建子项目分支」：根目录早就在这条分支上，这一轮不该顺手
+    切它、拉它，工作区里没提交的改动更不该被牵连。
+    """
+    if skip_root:
+        require_git_workspace(workspace)
+        remote = "origin"
+        has_remote = remote in git_output(workspace, ["remote"], "读取 Git 远端失败").split()
+        local = branch[len(f"{remote}/"):] if has_remote and branch.startswith(f"{remote}/") else branch
+        if not git_branch_exists(workspace, local):
+            raise BridgeFailure(f"根工作目录还没有需求分支 {local}，请先创建需求分支")
+        result: dict[str, Any] = {"created": False, "baseBranch": base_branch, "branch": local}
+    else:
+        result = git_create_branch(workspace, base_branch, branch)
+        local = str(result["branch"])
+    records: list[dict[str, Any]] = [{
+        "path": "",
+        "name": workspace.name,
+        "branch": local,
+        "baseBranch": str(result["baseBranch"]),
+        "created": bool(result["created"]),
+        "skipped": skip_root,
+        "error": "",
+    }]
+    for relative in targets:
+        record: dict[str, Any] = {
+            "path": relative,
+            "name": relative,
+            "branch": local,
+            "baseBranch": "",
+            "created": False,
+            "error": "",
+        }
+        try:
+            child = git_subproject_workspace_of(workspace, relative)
+            if child == workspace.resolve():
+                continue
+            base = git_effective_base_branch(child, base_branch)
+            child_result = git_create_branch(child, base, local)
+            record["baseBranch"] = str(child_result["baseBranch"])
+            record["created"] = bool(child_result["created"])
+        except BridgeFailure as exc:
+            record["error"] = str(exc)
+        records.append(record)
+    result["results"] = records
+    return result
+
+
+def git_prepare_branch_targets(
+    workspace: Path,
+    reference: str,
+    strategy: str,
+    commit_message: str,
+    expected_remote_url: str,
+    remote: str,
+    targets: list[str],
+) -> dict[str, Any]:
+    """根工作目录切完需求分支后，把选中的子项目也切到同一条分支上。
+
+    子项目里没有这条分支时跳过：不是每个工程都参与这条需求，缺分支不算失败。
+    """
+    result = git_prepare_branch(workspace, reference, strategy, commit_message, expected_remote_url, remote)
+    branch = str(result["branch"])
+    records: list[dict[str, Any]] = [{
+        "path": "",
+        "name": workspace.name,
+        "branch": branch,
+        "switched": True,
+        "skipped": False,
+        "error": "",
+    }]
+    for relative in targets:
+        record: dict[str, Any] = {
+            "path": relative,
+            "name": relative,
+            "branch": branch,
+            "switched": False,
+            "skipped": False,
+            "error": "",
+        }
+        try:
+            child = git_subproject_workspace_of(workspace, relative)
+            if child == workspace.resolve():
+                continue
+            if not git_branch_reference_exists(child, branch, remote):
+                record["skipped"] = True
+            else:
+                child_result = git_prepare_branch(child, branch, strategy, commit_message, "", remote)
+                record["branch"] = str(child_result["branch"])
+                record["switched"] = True
+        except BridgeFailure as exc:
+            record["error"] = str(exc)
+        records.append(record)
+    result["results"] = records
+    return result
 
 
 def git_repository_url_of(value: Any) -> str:
@@ -4520,6 +4771,8 @@ class AppServerClient:
         self.responses: queue.Queue[dict[str, Any]] = queue.Queue()
         self.write_lock = threading.Lock()
         self.response_lock = threading.Lock()
+        self.stderr_lock = threading.Lock()
+        self.stderr_lines: deque[str] = deque(maxlen=APP_SERVER_STDERR_TAIL)
         threading.Thread(target=self._read_stdout, daemon=True).start()
         threading.Thread(target=self._drain_stderr, daemon=True).start()
         self.send(
@@ -4550,9 +4803,23 @@ class AppServerClient:
                 continue
 
     def _drain_stderr(self) -> None:
+        """留痕而不是丢弃：这一路是 app-server 唯一会说出问题的地方。
+
+        以前这里直接 `pass`，MCP 启动超时、模型列表拉不回来这类告警在桥接器侧
+        完全没有痕迹，只能事后去翻 `~/.codex/sessions` 的 rollout。
+        """
         assert self.process.stderr is not None
-        for _ in self.process.stderr:
-            pass
+        for line in self.process.stderr:
+            text = line.rstrip()
+            if not text:
+                continue
+            with self.stderr_lock:
+                self.stderr_lines.append(text)
+            print(f"[codex app-server] {text}", file=sys.stderr, flush=True)
+
+    def stderr_tail(self, limit: int = 10) -> str:
+        with self.stderr_lock:
+            return "\n".join(list(self.stderr_lines)[-limit:])
 
     def write(self, message: dict[str, Any]) -> None:
         with self.write_lock:
@@ -5086,6 +5353,10 @@ class ClaudeCLIClient:
 
     def next_request_id(self) -> int:
         return 1
+
+    def stderr_tail(self, limit: int = 10) -> str:
+        # Claude CLI 的诊断信息走 stream-json，stderr 这一路没有可留痕的内容。
+        return ""
 
     def list_models(self, request_id: int = 20) -> list[dict[str, Any]]:
         return [{"model": value, "displayName": label} for value, label in [("opus", "Opus 5"), ("sonnet", "Sonnet 5")]]
@@ -7862,13 +8133,16 @@ class ExecutionBridge:
         if busy:
             raise BridgeFailure(f"本机仍有任务在执行（{', '.join(busy)}），不能切换项目分支")
         remote = str(raw.get("remoteName") or "origin").strip() or "origin"
-        return git_prepare_branch(
+        # 没传 targets 的调用方（需求列表的分支检查）也要带上子项目，否则只有根目录跟着切。
+        targets = git_subproject_targets_of(self.workspace, raw.get("targets"), branch, remote)
+        return git_prepare_branch_targets(
             self.workspace,
             branch,
             str(raw.get("strategy") or "switch").strip(),
             str(raw.get("commitMessage") or ""),
             str(raw.get("expectedRemoteUrl") or ""),
             remote,
+            targets,
         )
 
     def push_requirement_branch(self, raw: Any, config: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -7882,14 +8156,18 @@ class ExecutionBridge:
         message = str(raw.get("message") or "")
         provider = ai_provider_of(raw)
         commit_only = bool(raw.get("commitOnly"))
+        # 子项目的改动也是这条需求的产物：不带上它们，推完远端仍然缺一半代码。
+        targets = git_subproject_targets_of(self.workspace, raw.get("targets"), branch)
         if commit_only:
             # 仅提交是本机动作，失败原因基本是工作区自身的问题，不值得再起一轮 AI 去修。
             result = git_push_branch(self.workspace, branch, message, push=False)
             result["repaired"] = False
+            result["results"] = self._push_branch_results(result, branch, message, targets, push=False)
             return result
         try:
             result = git_push_branch(self.workspace, branch, message)
             result["repaired"] = False
+            result["results"] = self._push_branch_results(result, branch, message, targets)
             return result
         except BridgeFailure as exc:
             failure = str(exc)
@@ -7909,7 +8187,7 @@ class ExecutionBridge:
         # 以仓库的真实状态判定成功与否，不采信 AI 的结论。
         if not git_branch_synced(self.workspace, branch, remote):
             raise BridgeFailure(f"推送失败，{provider_label(provider)} 也没能解决：{failure}\n\n处理说明：{summary or '无'}")
-        return {
+        repaired = {
             "pushed": True,
             "branch": branch,
             "remote": remote,
@@ -7922,6 +8200,63 @@ class ExecutionBridge:
             "repairSummary": summary,
             "output": failure,
         }
+        # 根目录是靠 AI 兜底才推上去的，子项目仍然按常规推一轮，别把它们落下。
+        repaired["results"] = self._push_branch_results(repaired, branch, message, targets)
+        return repaired
+
+    def _push_branch_results(
+        self,
+        root: dict[str, Any],
+        branch: str,
+        message: str,
+        targets: list[str],
+        push: bool = True,
+    ) -> list[dict[str, Any]]:
+        """把根目录的推送结果和各子项目的推送结果拼成一张表。
+
+        子项目失败只记录原因，不打断其它子项目：一个工程推不动不该让别的也停在本机。
+        """
+        records: list[dict[str, Any]] = [{
+            "path": "",
+            "name": self.workspace.name,
+            "branch": str(root.get("branch") or branch),
+            "pushed": bool(root.get("pushed")),
+            "committed": bool(root.get("committed")),
+            "upToDate": bool(root.get("upToDate")),
+            "skipped": False,
+            "error": "",
+        }]
+        for relative in targets:
+            record: dict[str, Any] = {
+                "path": relative,
+                "name": relative,
+                "branch": branch,
+                "pushed": False,
+                "committed": False,
+                "upToDate": False,
+                "skipped": False,
+                "error": "",
+            }
+            try:
+                child = git_subproject_workspace_of(self.workspace, relative)
+                if child == self.workspace.resolve():
+                    continue
+                # 子项目本机没有这条需求分支时，提交推送它自己当前所处的分支：多工程工作目录里
+                # 每个工程有自己的分支节奏，不该因为分支名对不上就把这一轮的改动留在本机。
+                child_branch = branch if git_branch_exists(child, branch) else git_current_branch(child)
+                record["branch"] = child_branch
+                # 游离 HEAD 没有可推送的分支，跳过并如实标出来，不替用户猜该推到哪。
+                if not child_branch:
+                    record["skipped"] = True
+                else:
+                    child_result = git_push_branch(child, child_branch, message, push=push)
+                    record["pushed"] = bool(child_result.get("pushed"))
+                    record["committed"] = bool(child_result.get("committed"))
+                    record["upToDate"] = bool(child_result.get("upToDate"))
+            except BridgeFailure as exc:
+                record["error"] = str(exc)
+            records.append(record)
+        return records
 
     def _repair_git_push(
         self,
@@ -8061,9 +8396,11 @@ class ExecutionBridge:
         try:
             previous_binding = self._session_binding(config, program_id, item_key, phase, provider)
             title = conversation_title(task, previous_binding)
+            # 留一份提示词原文：这一轮如果没能发出工具调用，要用同样的输入重试一次。
+            task_prompt = build_task_prompt(payload, self.workspace)
             thread_id, turn_id = client.start_task(
                 title,
-                build_task_prompt(payload, self.workspace),
+                task_prompt,
                 payload.get("followUpAttachments") if isinstance(payload.get("followUpAttachments"), list) else None,
                 str(payload.get("model") or ""),
                 reasoning_effort=str(payload.get("reasoningEffort") or ""),
@@ -8142,6 +8479,7 @@ class ExecutionBridge:
                 identity, client, config, program_id, item_key, updated_task, binding, turn_id,
                 text_without_attachment_context(str(payload.get("followUp") or "")),
                 str(payload.get("model") or ""), str(payload.get("reasoningEffort") or ""), bool(payload.get("fastMode")),
+                task_prompt,
             ),
             daemon=True,
         ).start()
@@ -10012,6 +10350,60 @@ class ExecutionBridge:
         if event is not None:
             self.progress.publish(identity, *event)
 
+    def _retry_corrupted_turn(
+        self,
+        identity: tuple[str, int, str],
+        client: AppServerClient | ClaudeCLIClient,
+        turn_id: str,
+        turn_status: str,
+        turn: dict[str, Any],
+        phase: str,
+        turn_prompt: str,
+        model: str = "",
+        reasoning_effort: str = "",
+        fast_mode: bool = False,
+    ) -> tuple[str, str, dict[str, Any], str]:
+        """一轮没能发出任何工具调用就用同样的输入重跑一次，仍然不行就判失败。
+
+        返回 `(turn_id, turn_status, turn, corrupted_reason)`。`corrupted_reason`
+        非空表示重试后依然无效，此时状态已经被改成 `failed`，调用方不要把这一轮
+        的文字当成产物存下去。
+        """
+        reason = corrupted_turn_reason(turn_status, turn, phase)
+        if not reason:
+            return turn_id, turn_status, turn, ""
+        diagnostics = getattr(client, "stderr_tail", lambda limit=10: "")()
+        print(
+            f"检测到无效执行回合：{identity} {reason}" + (f"\napp-server stderr:\n{diagnostics}" if diagnostics else ""),
+            file=sys.stderr,
+            flush=True,
+        )
+        with self.lock:
+            current = self.active_runs.get(identity)
+            # 用户已经追加了新回合，那一轮有自己的 _follow，这里不该再插一轮进去。
+            has_newer_turn = current is not None and str(current.get("turnId") or "") != turn_id
+        if has_newer_turn or not turn_prompt.strip():
+            return turn_id, "failed", turn, reason
+        self.progress.publish(identity, "status", "本轮执行无效，正在自动重试", reason, "running")
+        retried_id = client.start_turn(
+            str(client.thread_id or ""),
+            turn_prompt,
+            request_id=client.next_request_id(),
+            model=model,
+            reasoning_effort=reasoning_effort,
+            fast_mode=fast_mode,
+        )
+        with self.lock:
+            current = self.active_runs.get(identity)
+            if current is not None:
+                current["turnId"] = retried_id
+        retried_status = client.wait_turn(retried_id)
+        retried_turn = client.read_turn(client.thread_id, retried_id, request_id=client.next_request_id())
+        retried_reason = corrupted_turn_reason(retried_status, retried_turn, phase)
+        if retried_reason:
+            return retried_id, "failed", retried_turn, f"重试后依然无效：{retried_reason}"
+        return retried_id, retried_status, retried_turn, ""
+
     def _follow(
         self,
         identity: tuple[str, int, str],
@@ -10026,6 +10418,7 @@ class ExecutionBridge:
         model: str = "",
         reasoning_effort: str = "",
         fast_mode: bool = False,
+        turn_prompt: str = "",
     ) -> None:
         provider = str((self.active_runs.get(identity) or {}).get("provider") or "codex")
         try:
@@ -10033,6 +10426,10 @@ class ExecutionBridge:
             turn = client.read_turn(client.thread_id, turn_id, request_id=client.next_request_id())
             task_name = str(task.get("title") or item_key)
             phase = str(task.get("phase") or "requirement")
+            turn_id, turn_status, turn, corrupted_reason = self._retry_corrupted_turn(
+                identity, client, turn_id, turn_status, turn, phase, turn_prompt,
+                model, reasoning_effort, fast_mode,
+            )
             thread_id = str(client.thread_id or binding.get("externalSessionId") or "")
             entry = next((item for item in conversation_catalog(binding) if item.get("threadId") == thread_id), {})
             title = str(entry.get("title") or task_name)
@@ -10071,9 +10468,11 @@ class ExecutionBridge:
                     binding,
                     turn_id,
                     turn_status,
-                    execution_output(turn_status, turn),
+                    # 无效回合不入库：那段自称完成的文字既不是产物，也会污染累积的产物文档。
+                    "" if corrupted_reason else execution_output(turn_status, turn),
                     provider,
                     title,
+                    corrupted_reason,
                 )
             # Closing app-server flushes the final turn to the shared Codex session
             # store. Consumers notified before this point can observe 100% progress
@@ -10081,9 +10480,9 @@ class ExecutionBridge:
             client.close()
             self.progress.publish(
                 identity,
-                "status",
+                "error" if corrupted_reason else "status",
                 "任务已完成" if turn_status == "completed" else "任务执行未完成",
-                f"结果已同步到任务面板，状态：{turn_status}",
+                corrupted_reason or f"结果已同步到任务面板，状态：{turn_status}",
                 turn_status,
             )
         except Exception as exc:
@@ -10109,6 +10508,7 @@ class ExecutionBridge:
         execution_output_text: str = "",
         provider: str = "codex",
         conversation_title: str = "",
+        failure_reason: str = "",
     ) -> None:
         session_status = SESSION_STATUS.get(turn_status, "blocked")
         phase = str(task.get("phase") or "requirement")
@@ -10132,6 +10532,7 @@ class ExecutionBridge:
                 "comment": (
                     f"{provider_label(provider)} {phase} 阶段结束，状态：{turn_status}。"
                     + (f"验收判定：{testing_verdict or '缺失'}。" if phase == "testing" else "")
+                    + (f"本轮判定为无效执行：{failure_reason}。" if failure_reason else "")
                 ),
                 "actorName": f"{provider}-http-bridge",
             }
@@ -10246,6 +10647,49 @@ class ExecutionBridge:
 
 
 EXECUTION_OUTPUT_LIMIT = 8 * 1024 * 1024
+
+# 这一轮真正动了工作区的条目类型。只有 agentMessage / reasoning 的回合等于什么都没做。
+TOOL_CALL_ITEM_TYPES = {"commandExecution", "fileChange", "fileEdit", "mcpToolCall", "dynamicToolCall"}
+# 模型没能把工具调用发成调用帧时，会把工具 schema 连同超时毫秒数一起写进正文，
+# 而且开头那个 T 经常被吃掉（实测出现过 `ARGET_TOOL_SCHEMA={...}"120000`），
+# 所以这里故意只匹配后半截，两种写法都能命中。
+LEAKED_TOOL_CALL_MARKER = "ARGET_TOOL_SCHEMA"
+# 这两个阶段的产物就是代码和验证结果，不可能只靠一段文字交付。
+# 梳理需求阶段允许只写文档，不能套用这条判定。
+WORKING_PHASES = {"development", "testing"}
+
+
+def turn_agent_text(turn: dict[str, Any]) -> str:
+    parts = [
+        str(item.get("text") or item.get("content") or "").strip()
+        for item in turn.get("items") or []
+        if str(item.get("type") or "") == "agentMessage"
+    ]
+    return "\n".join(part for part in parts if part)
+
+
+def turn_tool_call_count(turn: dict[str, Any]) -> int:
+    return sum(
+        1 for item in turn.get("items") or []
+        if str(item.get("type") or "") in TOOL_CALL_ITEM_TYPES
+    )
+
+
+def corrupted_turn_reason(turn_status: str, turn: dict[str, Any], phase: str) -> str:
+    """回合自称成功、实际什么都没干时给出原因，否则返回空串。
+
+    这是 gpt-5.6-terra 走自建中转时实测到的失败形态：模型没有发出任何工具调用，
+    把本该是调用的内容写进了最终回复，还顺带自证「本会话没有暴露 shell/exec 工具」。
+    这种回复以前会被当成动作执行产物存进任务，任务直接被判成 done。
+    """
+    if turn_status != "completed":
+        # 非正常结束本来就会被判成 blocked，交给既有路径处理。
+        return ""
+    if LEAKED_TOOL_CALL_MARKER in turn_agent_text(turn):
+        return "最终回复里混进了工具调用的 schema 残片，说明这一轮的工具调用没有真正发出去"
+    if phase in WORKING_PHASES and turn_tool_call_count(turn) == 0:
+        return "整轮没有任何命令执行或文件改动，动作执行/测试阶段不可能只靠一段文字完成"
+    return ""
 
 
 def execution_output(turn_status: str, turn: dict[str, Any]) -> str:
@@ -11086,6 +11530,29 @@ class BridgeHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self.json_response(500, {"error": f"读取 Git 变更失败：{exc}"})
             return
+        if parsed.path == "/v1/codex/git/projects":
+            if not self.allowed_origin():
+                self.json_response(403, {"error": "origin not allowed"})
+                return
+            query = parse_qs(parsed.query)
+            program_id = program_id_of((query.get("programId") or [""])[0])
+            try:
+                self.bridge.request_config(
+                    {"programId": program_id},
+                    self.allowed_origin() or "",
+                    self.headers.get("token", "").strip(),
+                )
+                selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
+                self.json_response(200, git_workspace_projects(
+                    selected_bridge.workspace,
+                    str((query.get("branch") or [""])[0]).strip(),
+                    str((query.get("remoteName") or ["origin"])[0]),
+                ))
+            except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
+                self.json_response(400, {"error": str(exc)})
+            except Exception as exc:
+                self.json_response(500, {"error": f"读取子项目 Git 状态失败：{exc}"})
+            return
         if parsed.path in {"/v1/codex/git/branches", "/v1/codex/git/status"}:
             if not self.allowed_origin():
                 self.json_response(403, {"error": "origin not allowed"})
@@ -11657,10 +12124,13 @@ class BridgeHandler(BaseHTTPRequestHandler):
             elif path == "/v1/codex/git/push":
                 self.json_response(200, selected_bridge.push_requirement_branch(payload, config))
             elif path == "/v1/codex/git/branch":
-                self.json_response(200, git_create_branch(
+                self.json_response(200, git_create_branch_targets(
                     selected_bridge.workspace,
                     str(payload.get("baseBranch") or "").strip(),
                     str(payload.get("branch") or "").strip(),
+                    # 建分支不做「没传就全建」：勾选哪些子项目由创建表单说了算。
+                    git_subproject_targets_of(selected_bridge.workspace, payload.get("targets") or []),
+                    bool(payload.get("skipRoot")),
                 ))
             elif path == "/v1/codex/git/prepare":
                 self.json_response(200, selected_bridge.prepare_requirement_git_branch(payload))
