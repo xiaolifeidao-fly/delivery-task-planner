@@ -4358,8 +4358,25 @@ class GitBranchTest(unittest.TestCase):
     def test_branch_names_reject_shell_and_git_unsafe_values(self):
         self.assertTrue(bridge.valid_git_branch_name("feature/issue_req-1787112353409"))
         self.assertTrue(bridge.valid_git_branch_name("feature/req-1"))
-        for value in ("", "-branch", "feature..1", "feature//1", "feature/", "branch;rm -rf /", "branch name", "a" * 256):
+        # 仓库里真实存在的分支不能被前置过滤挡掉：# 和中文都是 git 允许的。
+        for value in ("feature/issue#duokai", "feature/issue#listening_message_plugin", "feature/中文分支"):
+            self.assertTrue(bridge.valid_git_branch_name(value), value)
+        for value in (
+            "", "-branch", "feature..1", "feature//1", "feature/", "branch;rm -rf /", "branch name", "a" * 256,
+            "feat~1", "feat^2", "feat:x", "feat?", "feat*", "feat[1]", "back\\slash", ".hidden", "x.lock", "@", "a@{0}",
+        ):
             self.assertFalse(bridge.valid_git_branch_name(value), value)
+
+    def test_push_accepts_a_branch_name_with_a_hash(self):
+        self.add_origin()
+        subprocess.run(
+            ["git", "-C", str(self.workspace), "checkout", "-q", "-b", "feature/issue#duokai"],
+            check=True, capture_output=True,
+        )
+        (self.workspace / "README.md").write_text("changed", encoding="utf-8")
+        result = bridge.git_push_branch(self.workspace, "feature/issue#duokai", "feat: 带井号的分支")
+        self.assertTrue(result["pushed"])
+        self.assertTrue(result["committed"])
 
     def test_branch_catalog_lists_local_branches_and_defaults_to_current(self):
         subprocess.run(["git", "-C", str(self.workspace), "branch", "feature/a"], check=True, capture_output=True)

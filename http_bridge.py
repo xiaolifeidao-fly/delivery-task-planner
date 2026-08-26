@@ -2178,7 +2178,10 @@ def ensure_github_ssh_key(home: Path | None = None) -> dict[str, Any]:
 # 命令参数一律固定，不拼接用户输入到 shell；分支名先做白名单校验再交给 Git。
 # ---------------------------------------------------------------------------
 
-GIT_BRANCH_NAME_RE = re.compile(r"[A-Za-z0-9._/-]{1,255}")
+# git check-ref-format 明确禁止的字符，外加空白和 ASCII 控制字符。
+# 别再自己另立一套更窄的白名单：仓库里真实存在 feature/issue#duokai 这种合法分支，
+# 白名单挡掉它们之后，提交推送这些工程会直接失败在「分支名不合法」上。
+GIT_BRANCH_FORBIDDEN_RE = re.compile(r"[\x00-\x20\x7f~^:?*\[\\]")
 GIT_REMOTE_PREFIX = "remotes/"
 GIT_REMOTE_NAME_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
 # 关联远端仓库时只接受这几种常见写法，挡掉以 - 开头会被 git 当成选项的输入。
@@ -2186,9 +2189,15 @@ GIT_REPOSITORY_URL_RE = re.compile(r"(?:[A-Za-z0-9._-]+@[A-Za-z0-9._-]+:[A-Za-z0
 
 
 def valid_git_branch_name(value: str) -> bool:
-    """挡掉明显非法的分支名。最终仍由 git check-ref-format 判定，这里只做前置过滤。"""
+    """挡掉明显非法的分支名。最终仍由 git check-ref-format 判定，这里只做前置过滤。
+
+    规则对齐 git 自己的 check-ref-format：只挡它禁止的字符和形态，不额外收窄。
+    额外挡掉以 - 开头的名字——命令参数是按列表传的，不过 git 会把它当成选项。
+    """
     name = str(value or "").strip()
-    if not name or not GIT_BRANCH_NAME_RE.fullmatch(name):
+    if not name or len(name) > 255 or name == "@":
+        return False
+    if GIT_BRANCH_FORBIDDEN_RE.search(name):
         return False
     if name.startswith(("-", "/", ".")) or name.endswith(("/", ".", ".lock")):
         return False
