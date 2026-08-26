@@ -3828,6 +3828,23 @@ def conversation_references_of(value: Any) -> list[dict[str, str]]:
             continue
         kind = str(entry.get("kind") or "").strip()
         key = str(entry.get("key") or "").strip()
+        if kind == "file":
+            scope = str(entry.get("scope") or "").strip()
+            path = Path(key)
+            if (
+                scope not in {"requirement-outline", "requirement-testing", "requirement-prototype"}
+                or not key
+                or len(key) > 512
+                or "\x00" in key
+                or "\\" in key
+                or path.is_absolute()
+                or ".." in path.parts
+                or (kind, key) in seen
+            ):
+                continue
+            seen.add((kind, key))
+            references.append({"kind": kind, "key": key, "scope": scope})
+            continue
         pattern = r"[A-Za-z0-9_-]{1,64}" if kind == "requirement" else r"[A-Za-z0-9._-]{1,64}"
         if kind not in {"requirement", "task"} or not re.fullmatch(pattern, key) or (kind, key) in seen:
             continue
@@ -6306,10 +6323,12 @@ class ExecutionBridge:
         assert_runtime_project(config, program_id)
         biz_line = config_biz_line(config)
         context = planner.project_context(config, program_id)
-        mention_context = self._conversation_mention_context(config, program_id, chat_references, context)
+        requirement_key = str(requirement.get("requirementKey") or "")
+        mention_context = self._conversation_mention_context(
+            config, program_id, chat_references, context, requirement_key,
+        )
         planner.require_option(selected_stage, context.get("stages") or [], "stageKey", "里程碑")
         planner.require_option(selected_module, context.get("modules") or [], "moduleKey", "模块")
-        requirement_key = str(requirement.get("requirementKey") or "")
         attachments = self.attachments.resolve(program_id, self._planning_item_key(requirement_key), attachment_ids)
         identity = self._planning_identity(program_id, requirement_key)
         session = self._load_planning_session(config, program_id, requirement_key, provider, requested_thread_id)
@@ -10042,6 +10061,7 @@ class ExecutionBridge:
         program_id: int,
         references: list[dict[str, str]],
         project_context: dict[str, Any] | None = None,
+        current_requirement_key: str = "",
     ) -> list[str]:
         """Load authoritative @ references and the requirement/task that connects them."""
         if not references:
@@ -10070,6 +10090,29 @@ class ExecutionBridge:
         for reference in references:
             kind = reference["kind"]
             key = reference["key"]
+            if kind == "file":
+                if not current_requirement_key:
+                    raise BridgeFailure("文件引用只能用于需求编辑聊天")
+                scope = str(reference.get("scope") or "")
+                if scope == "requirement-prototype":
+                    _, prototype_files = requirement_prototype_files(self.workspace, current_requirement_key)
+                    allowed_files = {str(file.get("path") or ""): str(file.get("name") or "") for file in prototype_files}
+                else:
+                    directory, _, recursive = self._document_set_layout(
+                        config, program_id, scope, current_requirement_key,
+                    )
+                    allowed_files = {
+                        str(file.get("path") or ""): str(file.get("name") or "")
+                        for file in document_set_entries(self.workspace, directory, recursive)
+                    }
+                if key not in allowed_files:
+                    raise BridgeFailure("引用文件不存在或不属于当前需求")
+                lines.extend([
+                    f"@文件 {allowed_files[key] or Path(key).name}",
+                    f"文件路径: {key}",
+                    "这是当前需求的相关文档；需要正文时从工作区按上述路径读取。",
+                ])
+                continue
             if kind == "requirement":
                 requirement = requirement_of(key)
                 related_items = [item for item in items if str(item.get("requirementKey") or "") == key]

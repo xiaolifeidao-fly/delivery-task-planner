@@ -2392,12 +2392,46 @@ class HttpBridgeTest(unittest.TestCase):
             {"kind": "requirement", "key": "req-a"},
             {"kind": "unknown", "key": "ignored"},
             {"kind": "requirement", "key": "bad key"},
+            {"kind": "file", "key": "doc/requirements/req-a/需求大纲.md", "scope": "requirement-outline"},
+            {"kind": "file", "key": "../secret", "scope": "requirement-outline"},
+            {"kind": "file", "key": "doc/requirements/req-a/prototype/index.html", "scope": "unknown"},
         ])
 
         self.assertEqual(
-            [{"kind": "requirement", "key": "req-a"}, {"kind": "task", "key": "task.v1"}],
+            [
+                {"kind": "requirement", "key": "req-a"},
+                {"kind": "task", "key": "task.v1"},
+                {
+                    "kind": "file",
+                    "key": "doc/requirements/req-a/需求大纲.md",
+                    "scope": "requirement-outline",
+                },
+            ],
             references,
         )
+
+    def test_conversation_mention_context_accepts_current_requirement_prototype_file(self):
+        executor = bridge.ExecutionBridge(Path.cwd())
+        prototype = [{
+            "path": "doc/requirements/req-a/prototype/index.html",
+            "name": "index.html",
+        }]
+        with patch.object(bridge, "requirement_prototype_files", return_value=("doc/requirements/req-a/prototype", prototype)):
+            lines = executor._conversation_mention_context(
+                {"api_url": "http://test/api", "key": "k"},
+                1,
+                [{
+                    "kind": "file",
+                    "key": "doc/requirements/req-a/prototype/index.html",
+                    "scope": "requirement-prototype",
+                }],
+                {"items": []},
+                "req-a",
+            )
+
+        rendered = "\n".join(lines)
+        self.assertIn("@文件 index.html", rendered)
+        self.assertIn("doc/requirements/req-a/prototype/index.html", rendered)
 
     def test_conversation_mention_context_loads_the_selected_requirement_and_task(self):
         executor = bridge.ExecutionBridge(Path.cwd())
