@@ -3296,6 +3296,28 @@ class HttpBridgeTest(unittest.TestCase):
         self.assertIn("不得输出验收判定", prompt)
         self.assertIn("Use a staging account.", prompt)
 
+    def test_requirement_testing_history_excludes_review_sessions(self):
+        """review 和测试共用一张会话表，两边的目录都只能看见自己那一类。"""
+        rows = [
+            {"threadId": "testing-thread", "title": "总体测试", "executorType": "codex", "metadata": {"kind": "requirement-testing"}},
+            {"threadId": "review-thread", "title": "代码 review", "executorType": "codex", "metadata": {"kind": "requirement-review"}},
+            {"threadId": "legacy-thread", "title": "老数据", "executorType": "codex", "metadata": {}},
+        ]
+
+        with tempfile.TemporaryDirectory() as directory:
+            executor = bridge.ExecutionBridge(Path(directory))
+            with patch.object(bridge.planner, "request_api", return_value=rows):
+                testing = executor._load_requirement_testing_session(self.runtime_config(), 1, "req-a", "codex")
+                review = executor._load_requirement_review_session(self.runtime_config(), 1, "req-a", "codex")
+
+        self.assertEqual(
+            ["testing-thread", "legacy-thread"],
+            [entry["threadId"] for entry in testing["catalog"]],
+        )
+        # 不带 threadId 打开时落到最后一条，不能落到 review 那条上。
+        self.assertEqual("legacy-thread", testing["threadId"])
+        self.assertEqual(["review-thread"], [entry["threadId"] for entry in review["catalog"]])
+
     def test_requirement_testing_starts_session_and_marks_requirement_doing(self):
         with tempfile.TemporaryDirectory() as directory:
             executor = bridge.ExecutionBridge(Path(directory))

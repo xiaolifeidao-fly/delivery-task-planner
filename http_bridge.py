@@ -7529,6 +7529,7 @@ class ExecutionBridge:
         self, config: dict[str, Any], program_id: int, requirement_key: str, provider: str, thread_id: str = "",
     ) -> dict[str, Any] | None:
         # 不按执行器过滤：换工具之后也要能看见此前那批聊天。
+        # 和 review 会话共用一张表，这里要把 kind 是 review 的那些行排掉；老数据没写 kind，按需求测试处理。
         rows = planner.request_api(
             config, "GET", "/delivery/requirement/testing-sessions",
             query={"programId": program_id, "requirementKey": requirement_key},
@@ -7536,6 +7537,7 @@ class ExecutionBridge:
         rows = [
             row for row in (rows or [])
             if isinstance(row, dict) and str(row.get("threadId") or "") and same_executor_purpose(row, "")
+            and session_kind_of(row) != REQUIREMENT_REVIEW_SESSION_KIND
         ]
         if not rows:
             return None
