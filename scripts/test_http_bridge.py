@@ -486,10 +486,25 @@ class HttpBridgeTest(unittest.TestCase):
         chat_only = bridge.build_requirement_review_prompt(1, requirement, "先聊聊", None, scope)
         report = bridge.build_requirement_review_prompt(1, requirement, "出报告", None, scope, generate_report=True)
 
-        self.assertIn("本轮只在聊天里给意见，不要写报告文件", chat_only)
+        self.assertIn("本轮不写报告文件", chat_only)
         self.assertIn("doc/review/req-a/review报告.md", report)
         self.assertIn("review 报告已生成", report)
-        self.assertNotIn("不要写报告文件", report)
+        self.assertNotIn("不写报告文件", report)
+
+    def test_requirement_review_may_change_code_only_when_the_user_asks(self):
+        """review 会话对工作区有写权限：用户要求改就改，没要求的回合只给意见。"""
+        requirement = {"requirementKey": "req-a", "name": "需求一"}
+        scope = bridge.review_scope_of([{"path": "", "name": "根工程", "changed": 1, "files": ["server/a.go"]}])
+
+        first = bridge.build_requirement_review_prompt(1, requirement, "先看看", None, scope)
+        follow_up = bridge.build_requirement_review_prompt(1, requirement, "按意见改", None, scope, follow_up=True)
+
+        for prompt in (first, follow_up):
+            self.assertIn("用户", prompt)
+            self.assertNotIn("不要修改业务实现", prompt)
+            # 提交、推送、切分支始终由面板的 Git 流程负责，review 会话不碰。
+            self.assertIn("不提交", prompt.replace("不要提交", "不提交"))
+        self.assertIn("写权限", first)
 
     def test_requirement_review_scope_rejects_paths_that_escape_the_workspace(self):
         with self.assertRaises(bridge.BridgeFailure):
@@ -5010,6 +5025,50 @@ class GitBranchTest(unittest.TestCase):
         self.assertEqual("feature/issue_req-1", bridge.git_current_branch(server))
         self.assertEqual("main", bridge.git_current_branch(web))
         self.assertEqual(["", "server"], [record["path"] for record in result["results"]])
+
+    def test_prepare_switches_a_detached_subproject_onto_the_remote_branch(self):
+        """子模块的常态就是游离 HEAD：分支只在远端时也要建出本地分支并切过去。"""
+        remote = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(remote, ignore_errors=True))
+        subprocess.run(["git", "init", "--bare", "--initial-branch=main", str(remote)], check=True, capture_output=True)
+
+        server = self.make_subproject("server")
+        subprocess.run(["git", "-C", str(server), "remote", "add", "origin", str(remote)], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(server), "push", "-u", "origin", "main"], check=True, capture_output=True)
+        # 需求分支只存在于远端：本地既没有它，HEAD 也不在任何分支上。
+        subprocess.run(["git", "-C", str(server), "checkout", "-b", "feature/issue_req-1"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(server), "push", "origin", "feature/issue_req-1"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(server), "checkout", "main"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(server), "branch", "-D", "feature/issue_req-1"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(server), "checkout", "--detach", "HEAD"], check=True, capture_output=True)
+        self.assertEqual("", bridge.git_current_branch(server))
+
+        bridge.git_create_branch(self.workspace, "main", "feature/issue_req-1")
+        bridge.git_checkout_branch(self.workspace, "main")
+        targets = bridge.git_subproject_targets_of(self.workspace, None, "feature/issue_req-1")
+        self.assertEqual(["server"], targets)
+
+        result = bridge.git_prepare_branch_targets(
+            self.workspace, "feature/issue_req-1", "switch", "", "", "origin", targets,
+        )
+
+        self.assertEqual("feature/issue_req-1", bridge.git_current_branch(server))
+        child = next(record for record in result["results"] if record["path"] == "server")
+        self.assertTrue(child["switched"])
+        self.assertEqual("", child["error"])
+        # 本地分支必须跟踪远端的那条，之后的推送才有默认上游。
+        upstream = subprocess.run(
+            ["git", "-C", str(server), "rev-parse", "--abbrev-ref", "feature/issue_req-1@{upstream}"],
+            capture_output=True, text=True,
+        )
+        self.assertEqual("origin/feature/issue_req-1", upstream.stdout.strip())
+
+    def test_prepare_still_refuses_a_detached_root_workspace(self):
+        """根目录的游离 HEAD 通常是人工操作的中间态，仍然拦下来交给用户处理。"""
+        subprocess.run(["git", "-C", str(self.workspace), "checkout", "--detach", "HEAD"], check=True, capture_output=True)
+        with self.assertRaises(bridge.BridgeFailure) as raised:
+            bridge.git_prepare_branch(self.workspace, "feature/issue_req-1")
+        self.assertIn("游离 HEAD", str(raised.exception))
 
     def test_task_prompt_pins_changes_to_the_requirement_branch(self):
         prompt = bridge.build_task_prompt({

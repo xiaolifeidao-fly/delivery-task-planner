@@ -1851,6 +1851,7 @@ def build_requirement_testing_prompt(
     test_case_only: bool = False,
     follow_up: bool = False,
     include_detail: bool = False,
+    mention_context: list[str] | None = None,
 ) -> str:
     """Give the requirement-level testing skill one requirement and its real task inventory."""
     requirement_key = str(requirement.get("requirementKey") or "").strip()
@@ -1908,6 +1909,7 @@ def build_requirement_testing_prompt(
                 *(item_lines or ["- 该需求目前没有关联任务；先说明总体测试范围和受阻项，不要假装已覆盖任务链路。"]),
                 final_instruction,
                 "本会话如果被压缩过，先读上面的测试资产目录和任务文档把上下文接回来，不要凭印象往下接。",
+                *(mention_context or []),
                 "本上下文标记闭合之后的内容，是用户本轮补充的测试要求、环境或数据说明。",
             ],
             message,
@@ -1926,6 +1928,7 @@ def build_requirement_testing_prompt(
             "关联任务清单（先按需读对应文档、产物和代码；清单不是完整上下文）：",
             *(item_lines or ["- 该需求目前没有关联任务；先说明总体测试范围和受阻项，不要假装已覆盖任务链路。"]),
             final_instruction,
+            *(mention_context or []),
             "本上下文标记闭合之后的内容，是用户本轮补充的测试要求、环境或数据说明。",
         ],
         message,
@@ -2615,15 +2618,24 @@ def git_prepare_branch(
     commit_message: str = "",
     expected_remote_url: str = "",
     remote: str = "origin",
+    allow_detached: bool = False,
 ) -> dict[str, Any]:
-    """用户确认后才处理未提交改动并切分支；绝不丢弃改动或自动应用 stash。"""
+    """用户确认后才处理未提交改动并切分支；绝不丢弃改动或自动应用 stash。
+
+    allow_detached 只给子项目用。`git submodule update` 本来就是把子模块检出到父仓库
+    记录的那个 commit，游离 HEAD 是子模块的常态而不是异常，一律拒绝会让子项目永远停在
+    「分支不一致」上，切不过去。根工作目录仍然拒绝：那里的游离 HEAD 通常是人工操作的中间态。
+    """
     if strategy not in {"switch", "commit", "stash"}:
         raise BridgeFailure("未知的 Git 分支处理方式")
     status = git_workspace_status(workspace, expected_remote_url, remote)
     if not status["remoteMatches"]:
         raise BridgeFailure("本机 Git 远端与项目配置不一致，请先确认项目仓库地址或工作目录")
-    if status["detached"]:
+    if status["detached"] and not allow_detached:
         raise BridgeFailure("当前工作目录处于游离 HEAD，不能切换需求分支")
+    if status["detached"] and status["dirty"] and strategy == "commit":
+        # 游离 HEAD 上提交会生成一个没有分支指向的提交，切走之后就只能靠 reflog 找回来。
+        raise BridgeFailure("当前项目处于游离 HEAD，改动不能就地提交，请改选暂存后切换")
     local, _ = git_local_branch_for_reference(workspace, reference, remote)
     if status["currentBranch"] == local:
         # 已经在需求分支上：干净的工作区顺手拉一次最新，脏工作区不动它，交给用户先处理改动。
@@ -3288,7 +3300,10 @@ def git_prepare_branch_targets(
             if not git_branch_reference_exists(child, branch, remote):
                 record["skipped"] = True
             else:
-                child_result = git_prepare_branch(child, branch, strategy, commit_message, "", remote)
+                # 子模块常态就是游离 HEAD，这里放行，让它从远端的需求分支建出本地分支。
+                child_result = git_prepare_branch(
+                    child, branch, strategy, commit_message, "", remote, allow_detached=True,
+                )
                 record["branch"] = str(child_result["branch"])
                 record["switched"] = True
         except BridgeFailure as exc:
@@ -3781,6 +3796,7 @@ def build_requirement_review_prompt(
     scope: list[dict[str, Any]],
     follow_up: bool = False,
     generate_report: bool = False,
+    mention_context: list[str] | None = None,
 ) -> str:
     """代码 review 会话的提示词：范围来自用户勾选，规则是固定三条加用户本轮补充。"""
     requirement_key = str(requirement.get("requirementKey") or "").strip()
@@ -3798,17 +3814,23 @@ def build_requirement_review_prompt(
             f"必须写入 `{report_path}`（同一条需求重复生成就覆盖这一份），"
             "报告里先写本轮范围和结论摘要，再按工程和文件列问题：每条写明文件路径、行号或函数、问题、影响、"
             "具体可执行的修改建议，并标注严重级别（阻断 / 建议 / 提示）；最终回复第一行必须是“review 报告已生成”。"
-            "仍然只读业务代码，除这份报告外不要改动任何文件，也不要提交、推送或切换分支。"
+            "本轮的产出是这份报告：用户没有在本轮明确要求改代码，就不要动业务文件；"
+            "无论是否改代码，都不要提交、推送或切换分支。"
         )
         if generate_report else
         "输出要求：先说明本轮实际读过的范围，再按工程和文件给出问题清单；"
         "每条写明文件路径、行号或函数、问题、影响，以及具体可执行的修改建议，并标注严重级别（阻断 / 建议 / 提示）；"
-        "最后给一句总体结论。本轮只在聊天里给意见，不要写报告文件，不要修改业务实现，不要提交、推送或切换分支。"
+        "最后给一句总体结论。本轮不写报告文件。"
+        "用户没有要求动代码时就只给意见；一旦用户要求修改（例如「按上面的意见改」或点名其中几条），"
+        "就直接改工作区里的业务文件，改完逐条说明改了哪些文件、对应哪条意见。"
+        "无论是否改代码，都不要提交、推送或切换分支。"
     )
     if follow_up:
         return wrap_bridge_context(
             [
-                "这是同一条需求 review 会话的追加回合：仍然只读代码给意见，不改实现、不提交、不推送。",
+                "这是同一条需求 review 会话的追加回合：默认只读代码给意见；"
+                "用户要求修改时可以直接改工作区里的业务文件，改完说明改了哪些文件、对应哪条意见。"
+                "始终不提交、不推送、不切换分支。",
                 "首轮已交代过规则和输出格式，这里不再重复；下面是本轮最新的变更范围（可能和上一轮不同，以这份为准）。",
                 output,
                 workspace_instruction(workspace),
@@ -3817,14 +3839,17 @@ def build_requirement_review_prompt(
                 "本轮 review 范围：",
                 *review_scope_lines(scope),
                 f"提醒：{excluded} 目录始终不在 review 范围内。",
+                *(mention_context or []),
                 "本上下文标记闭合之后的内容，是用户本轮补充的 review 规则或检查重点。",
             ],
             message,
         )
     return wrap_bridge_context(
         [
-            "这是交付任务面板的一次代码 review 会话：只读当前工作区里这条需求的未提交改动，给出评审意见。",
-            "不要修改业务实现，不要执行任务拆解、提交、推送或切分支，也不要生成任务或测试用例。",
+            "这是交付任务面板的一次代码 review 会话：读当前工作区里这条需求的未提交改动，给出评审意见。",
+            "这个会话对工作区有写权限：用户要求按 review 意见修改，或在聊天里直接提出改动要求时，就动手改业务文件；"
+            "用户没提修改要求的回合只给意见，不要自作主张改代码。",
+            "任何情况下都不要执行任务拆解、提交、推送或切分支，也不要生成任务或测试用例。",
             workspace_instruction(workspace),
             f"项目 program_id: {program_id}",
             f"需求键 requirement_key: {requirement_key}",
@@ -3835,13 +3860,14 @@ def build_requirement_review_prompt(
             "review 规则：",
             *rules,
             output,
+            *(mention_context or []),
             "本上下文标记闭合之后的内容，是用户本轮补充的 review 规则或检查重点。",
         ],
         message,
     )
 
 
-def validate_requirement_review_payload(value: Any) -> tuple[int, str, str, str, bool, str, str, bool, list[dict[str, Any]], bool]:
+def validate_requirement_review_payload(value: Any) -> tuple[int, str, str, str, bool, str, str, bool, list[dict[str, Any]], list[dict[str, str]], bool]:
     if not isinstance(value, dict):
         raise BridgeFailure("请求体必须是 JSON 对象")
     program_id = program_id_of(value.get("programId"))
@@ -3861,10 +3887,14 @@ def validate_requirement_review_payload(value: Any) -> tuple[int, str, str, str,
         raise BridgeFailure("review 要求不能超过 32KB")
     if len(thread_id) > 255 or len(model) > 128:
         raise BridgeFailure("会话或模型标识无效")
-    return program_id, requirement_key, message, thread_id, bool(value.get("newConversation")), model, reasoning_effort, fast_mode, scope, bool(value.get("generateReport"))
+    return (
+        program_id, requirement_key, message, thread_id, bool(value.get("newConversation")), model,
+        reasoning_effort, fast_mode, scope, conversation_references_of(value.get("chatReferences")),
+        bool(value.get("generateReport")),
+    )
 
 
-def validate_requirement_testing_payload(value: Any) -> tuple[int, str, str, str, bool, str, str, bool, list[str], bool]:
+def validate_requirement_testing_payload(value: Any) -> tuple[int, str, str, str, bool, str, str, bool, list[str], list[dict[str, str]], bool]:
     if not isinstance(value, dict):
         raise BridgeFailure("请求体必须是 JSON 对象")
     program_id = program_id_of(value.get("programId"))
@@ -3887,7 +3917,11 @@ def validate_requirement_testing_payload(value: Any) -> tuple[int, str, str, str
         raise BridgeFailure("测试要求不能超过 32KB")
     if len(thread_id) > 255 or len(model) > 128:
         raise BridgeFailure("会话或模型标识无效")
-    return program_id, requirement_key, message, thread_id, bool(value.get("newConversation")), model, reasoning_effort, fast_mode, attachment_ids, bool(value.get("testCaseOnly"))
+    return (
+        program_id, requirement_key, message, thread_id, bool(value.get("newConversation")), model,
+        reasoning_effort, fast_mode, attachment_ids, conversation_references_of(value.get("chatReferences")),
+        bool(value.get("testCaseOnly")),
+    )
 
 
 def validate_task_testing_cases_payload(value: Any) -> tuple[int, str, str, str, bool, str, str, bool]:
@@ -4010,7 +4044,7 @@ def conversation_references_of(value: Any) -> list[dict[str, str]]:
             scope = str(entry.get("scope") or "").strip()
             path = Path(key)
             if (
-                scope not in {"requirement-outline", "requirement-testing", "requirement-prototype"}
+                scope not in {"requirement-outline", "requirement-testing", "requirement-prototype", "requirement-review"}
                 or not key
                 or len(key) > 512
                 or "\x00" in key
@@ -7650,10 +7684,16 @@ class ExecutionBridge:
 
     def send_requirement_testing(self, raw: Any, config: dict[str, Any]) -> dict[str, Any]:
         provider = ai_provider_of(raw)
-        program_id, requirement_key, message, requested_thread_id, new_conversation, model, reasoning_effort, fast_mode, attachment_ids, test_case_only = validate_requirement_testing_payload(raw)
+        (
+            program_id, requirement_key, message, requested_thread_id, new_conversation, model,
+            reasoning_effort, fast_mode, attachment_ids, chat_references, test_case_only,
+        ) = validate_requirement_testing_payload(raw)
         assert_runtime_project(config, program_id)
         requirement = self._requirement_for_prototype(config, program_id, requirement_key)
         context = planner.project_context(config, program_id)
+        mention_context = self._conversation_mention_context(
+            config, program_id, chat_references, context, requirement_key,
+        )
         item_key = self._requirement_testing_item_key(requirement_key)
         attachments = self.attachments.resolve(program_id, item_key, attachment_ids)
         identity = self._requirement_testing_identity(program_id, requirement_key)
@@ -7664,7 +7704,8 @@ class ExecutionBridge:
             if new_conversation or (requested_thread_id and requested_thread_id != active.get("threadId")):
                 raise BridgeFailure("当前需求已有正在运行的总体测试会话，请先停止或等待完成")
             active["client"].steer_turn(
-                str(active["threadId"]), str(active["turnId"]), message_with_attachments(message, attachments), attachments,
+                str(active["threadId"]), str(active["turnId"]),
+                message_with_attachments(with_mention_context(message, mention_context), attachments), attachments,
                 request_id=active["client"].next_request_id(),
             )
             self.progress.publish(identity, "message", "已追加测试要求", message, "running")
@@ -7688,7 +7729,10 @@ class ExecutionBridge:
             )
             try:
                 thread_id, turn_id = client.start_task(
-                    title, message_with_attachments(build_requirement_testing_prompt(program_id, context, requirement, message, self.workspace, test_case_only), attachments), attachments,
+                    title, message_with_attachments(build_requirement_testing_prompt(
+                        program_id, context, requirement, message, self.workspace, test_case_only,
+                        mention_context=mention_context,
+                    ), attachments), attachments,
                     model=model, reasoning_effort=reasoning_effort, fast_mode=fast_mode,
                 )
             except Exception:
@@ -7717,6 +7761,7 @@ class ExecutionBridge:
                     thread_id, message_with_attachments(build_requirement_testing_prompt(
                         program_id, context, requirement, message, self.workspace, test_case_only,
                         follow_up=True, include_detail=detail_digest != str(session.get("detailDigest") or ""),
+                        mention_context=mention_context,
                     ), attachments), attachments,
                     request_id=client.next_request_id(), model=model, reasoning_effort=reasoning_effort, fast_mode=fast_mode,
                 )
@@ -7972,9 +8017,15 @@ class ExecutionBridge:
 
     def send_requirement_review(self, raw: Any, config: dict[str, Any]) -> dict[str, Any]:
         provider = ai_provider_of(raw)
-        program_id, requirement_key, message, requested_thread_id, new_conversation, model, reasoning_effort, fast_mode, scope, generate_report = validate_requirement_review_payload(raw)
+        (
+            program_id, requirement_key, message, requested_thread_id, new_conversation, model,
+            reasoning_effort, fast_mode, scope, chat_references, generate_report,
+        ) = validate_requirement_review_payload(raw)
         assert_runtime_project(config, program_id)
         requirement = self._requirement_for_prototype(config, program_id, requirement_key)
+        mention_context = self._conversation_mention_context(
+            config, program_id, chat_references, None, requirement_key,
+        )
         identity = self._requirement_review_identity(program_id, requirement_key)
         session = self._load_requirement_review_session(config, program_id, requirement_key, provider, requested_thread_id)
         with self.lock:
@@ -7983,7 +8034,7 @@ class ExecutionBridge:
             if new_conversation or (requested_thread_id and requested_thread_id != active.get("threadId")):
                 raise BridgeFailure("当前需求已有正在运行的 review 会话，请先停止或等待完成")
             active["client"].steer_turn(
-                str(active["threadId"]), str(active["turnId"]), message, [],
+                str(active["threadId"]), str(active["turnId"]), with_mention_context(message, mention_context), [],
                 request_id=active["client"].next_request_id(),
             )
             self.progress.publish(identity, "message", "已追加 review 要求", message, "running")
@@ -8004,7 +8055,10 @@ class ExecutionBridge:
             )
             try:
                 thread_id, turn_id = client.start_task(
-                    title, build_requirement_review_prompt(program_id, requirement, message, self.workspace, scope, generate_report=generate_report), [],
+                    title, build_requirement_review_prompt(
+                        program_id, requirement, message, self.workspace, scope,
+                        generate_report=generate_report, mention_context=mention_context,
+                    ), [],
                     model=model, reasoning_effort=reasoning_effort, fast_mode=fast_mode,
                 )
             except Exception:
@@ -8028,7 +8082,10 @@ class ExecutionBridge:
                 client.resume_thread(thread_id)
                 turn_id = client.start_turn(
                     thread_id,
-                    build_requirement_review_prompt(program_id, requirement, message, self.workspace, scope, follow_up=True, generate_report=generate_report), [],
+                    build_requirement_review_prompt(
+                        program_id, requirement, message, self.workspace, scope,
+                        follow_up=True, generate_report=generate_report, mention_context=mention_context,
+                    ), [],
                     request_id=client.next_request_id(), model=model, reasoning_effort=reasoning_effort, fast_mode=fast_mode,
                 )
             except Exception:
@@ -9906,12 +9963,16 @@ class ExecutionBridge:
         key_value = str(key or "").strip()
         if not key_value:
             raise BridgeFailure("缺少文档栏目标识")
-        if scope_value in {"requirement-outline", "requirement-testing"}:
+        if scope_value in {"requirement-outline", "requirement-testing", "requirement-review"}:
             self._requirement_for_prototype(config, program_id, key_value)
             if scope_value == "requirement-outline":
                 outline = requirement_outline_path_of(key_value)
                 # 需求目录下还挂着 prototype/，大纲栏目只列顶层的文本文档。
                 return outline.parent, outline.as_posix(), False
+            if scope_value == "requirement-review":
+                # review 报告固定写在 doc/review/<需求键>/ 下，同一条需求重复生成就覆盖那一份。
+                report = requirement_review_report_relative_path(key_value)
+                return report.parent, report.as_posix(), False
             testing = testing_asset_directory_of(key_value)
             return testing, (testing / TESTING_CASES_FILE_NAME).as_posix(), True
         if scope_value in {"task-document", "task-design", "task-testing"}:
@@ -10493,6 +10554,47 @@ class ExecutionBridge:
         except OSError as exc:
             raise BridgeFailure(f"打开原型图目录失败：{exc}") from exc
         return directory
+
+    def reveal_workspace_file(self, raw_path: str) -> dict[str, Any]:
+        """在本机文件管理器里定位工作区中的一个文件。
+
+        路径一律按工作区相对路径解析，解析结果必须仍落在工作区内：面板传来的字符串
+        不能成为读取工作区之外任意路径的入口。桥接跑在用户自己的机器上，所以这里只是
+        唤起文件管理器，不读文件内容。
+        """
+        candidate = Path(str(raw_path or "").strip())
+        if not candidate.parts:
+            raise BridgeFailure("缺少文件路径")
+        resolved = candidate.resolve() if candidate.is_absolute() else (self.workspace / candidate).resolve()
+        try:
+            relative = resolved.relative_to(self.workspace)
+        except ValueError as exc:
+            raise BridgeFailure("文件路径超出当前项目") from exc
+        if not resolved.exists():
+            raise BridgeFailure("文件不存在或已被移动")
+        directory = resolved if resolved.is_dir() else resolved.parent
+        if sys.platform == "darwin":
+            opener = shutil.which("open")
+            # -R 是「显示并选中」，只打开目录会让用户在一堆文件里自己找。
+            command = [opener, "-R", str(resolved)] if opener else []
+        elif sys.platform == "win32":
+            explorer = shutil.which("explorer")
+            command = [explorer, f"/select,{resolved}"] if explorer else []
+        else:
+            # Linux 没有统一的「选中某个文件」协议，退一步打开所在目录。
+            opener = shutil.which("xdg-open")
+            command = [opener, str(directory)] if opener else []
+        if not command:
+            raise BridgeFailure("当前系统不支持打开本机文件目录")
+        try:
+            subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError as exc:
+            raise BridgeFailure(f"打开文件所在目录失败：{exc}") from exc
+        return {
+            "path": str(resolved),
+            "directory": str(directory),
+            "relativePath": relative.as_posix(),
+        }
 
     def send_conversation(self, raw: Any, config: dict[str, Any] | None = None) -> dict[str, Any]:
         provider = ai_provider_of(raw)
@@ -12782,6 +12884,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
             "/v1/codex/requirement-review/stop",
             "/v1/codex/attachments",
             "/v1/codex/prototype-directory/open",
+            "/v1/codex/workspace-file/reveal",
             "/v1/codex/git/branch",
             "/v1/codex/git/init",
             "/v1/codex/git/submodules",
@@ -12951,6 +13054,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 ))
             elif path == "/v1/codex/git/prepare":
                 self.json_response(200, selected_bridge.prepare_requirement_git_branch(payload))
+            elif path == "/v1/codex/workspace-file/reveal":
+                self.json_response(202, selected_bridge.reveal_workspace_file(str(payload.get("path") or "")))
             elif path == "/v1/codex/prototype-directory/open":
                 item_key = str(payload.get("itemKey") or "").strip()
                 if not item_key:
