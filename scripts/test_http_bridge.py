@@ -1766,13 +1766,23 @@ class HttpBridgeTest(unittest.TestCase):
         client.start_turn(
             "thread-1",
             "Review this screenshot",
-            [{"path": "/tmp/attachment.png", "isImage": True}, {"path": "/tmp/spec.pdf", "isImage": False}],
+            [
+                {"id": "a" * 16, "name": "attachment.png", "path": "/tmp/attachment.png", "isImage": True},
+                {"id": "b" * 16, "name": "spec.pdf", "path": "/tmp/spec.pdf", "isImage": False},
+            ],
         )
 
-        self.assertEqual(
-            [{"type": "text", "text": "Review this screenshot"}, {"type": "localImage", "path": "/tmp/attachment.png"}],
-            requests[0][2]["input"],
-        )
+        parts = requests[0][2]["input"]
+        # 用户写的字永远是第一段，附件只在它后面补说明：带附件时把正文吃掉，
+        # 执行器收到的就只剩一张图，回过头来问用户「你没写字」。
+        self.assertTrue(parts[0]["text"].startswith("Review this screenshot"))
+        # 图片走图片输入，非图片只剩这段说明，两种附件都要给出可读的路径。
+        self.assertIn("- 图片：attachment.png，路径：/tmp/attachment.png", parts[0]["text"])
+        self.assertIn("- 文件：spec.pdf，路径：/tmp/spec.pdf", parts[0]["text"])
+        self.assertEqual({"type": "localImage", "path": "/tmp/attachment.png"}, parts[1])
+        self.assertEqual(2, len(parts))
+        # 聊天记录里回显的还是用户自己那句话。
+        self.assertEqual("Review this screenshot", bridge.text_without_attachment_context(parts[0]["text"]))
 
     def test_serialize_turns_projects_only_browser_safe_conversation_items(self):
         turns = bridge.serialize_turns(

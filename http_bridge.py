@@ -4470,17 +4470,24 @@ def attachment_marker(attachments: list[dict[str, Any]]) -> str:
 
 
 def message_with_attachments(message: str, attachments: list[dict[str, Any]]) -> str:
-    """Add file references for Codex without leaking bridge-only context into chat history."""
+    """Add file references for Codex without leaking bridge-only context into chat history.
+
+    幂等：各条发送链路里，有的调用方自己先拼过附件段，客户端里还会再统一兜一次。
+    已经带了附件标记的正文原样返回，避免同一批文件被描述两遍。
+    """
+    if ATTACHMENT_MARKER_RE.search(message):
+        return message
     text = message.strip() or "请查看随附文件并继续处理。"
     if not attachments:
         return text
-    lines = ["", "<delivery-task-attachments>", "随附文件已经保存到当前工作区："]
+    lines = [text, "", "<delivery-task-attachments>", "本条消息随附了以下文件，已经保存到当前工作区，上面那段文字才是用户本轮真正的要求："]
     for attachment in attachments:
         name = str(attachment.get("name") or "附件")
-        if attachment.get("isImage"):
-            lines.append(f"- 图片：{name}（已作为图片输入传入）")
-        else:
-            lines.append(f"- 文件：{name}，路径：{attachment.get('relativePath') or attachment.get('path')}")
+        location = attachment.get("relativePath") or attachment.get("path")
+        # 路径对每种附件都要给全：图片虽然可能同时作为图片输入传入，但不是每个执行器都支持，
+        # 只写一句「已作为图片输入传入」而不给路径，执行器就只能自己去猜文件在哪。
+        kind = "图片" if attachment.get("isImage") else "文件"
+        lines.append(f"- {kind}：{name}，路径：{location}")
     lines.extend(["</delivery-task-attachments>", attachment_marker(attachments)])
     return "\n".join(lines)
 
@@ -5304,7 +5311,9 @@ class AppServerClient:
 
     @staticmethod
     def _input_parts(text: str, attachments: list[dict[str, Any]] | None = None) -> list[dict[str, str]]:
-        parts: list[dict[str, str]] = [{"type": "text", "text": text}]
+        # 正文永远是第一段，附件说明统一在这里兜底补齐：不是每条发送链路都自己拼过附件段，
+        # 少了它，非图片附件对 Codex 就等于没传（图片还有 localImage，文件什么都不剩）。
+        parts: list[dict[str, str]] = [{"type": "text", "text": message_with_attachments(text, attachments or [])}]
         for attachment in attachments or []:
             path = str(attachment.get("path") or "")
             if attachment.get("isImage") and path:
