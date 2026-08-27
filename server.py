@@ -896,6 +896,32 @@ def append_prototype_task(
     return refs, [*order, ref]
 
 
+def create_planning_batch(
+    config: dict[str, Any],
+    program_id: int,
+    requirement_key: str,
+    item_count: int,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    """开一条拆解批次。同一条需求可以拆很多轮，批次是「这批任务是哪一轮拆出来的」的唯一凭据。
+
+    创建失败不吞：批次键写不进去，任务就会散着落地，任务进度里再也分不出批次。
+    """
+    body = {
+        "programId": program_id,
+        "requirementKey": requirement_key,
+        "title": str(arguments.get("planning_batch_title") or "").strip(),
+        "summary": str(arguments.get("planning_batch_summary") or "").strip(),
+        "source": "planner",
+        "itemCount": item_count,
+        "actorName": str(arguments.get("actor_name") or "task-executor"),
+    }
+    result = request_api(config, "POST", "/delivery/requirement/planning-batch/create", body=body)
+    if not isinstance(result, dict) or not str(result.get("batchKey") or "").strip():
+        raise ToolFailure("创建拆解批次失败：服务端没有返回批次键。")
+    return result
+
+
 def create_tasks(arguments: dict[str, Any]) -> dict[str, Any]:
     assert_write_allowed("写入任务")
     program_value, used_current_project = program_value_of(arguments)
@@ -937,6 +963,9 @@ def create_tasks(arguments: dict[str, Any]) -> dict[str, Any]:
     created: list[dict[str, Any]] = []
     ref_to_key = {ref: task["item_key"] for ref, task in refs.items()}
     program_id = context["program"]["programId"]
+    # 拆解批次挂在需求上；没有需求键的旧式写入保持原样，任务不归批。
+    planning_batch = create_planning_batch(config, program_id, requirement_key, len(order), arguments) if requirement_key else {}
+    planning_batch_key = str(planning_batch.get("batchKey") or "")
     stage_names = {str(stage.get("stageKey") or ""): str(stage.get("title") or stage.get("tag") or "") for stage in context["stages"]}
     module_names = {str(module.get("moduleKey") or ""): str(module.get("name") or "") for module in context["modules"]}
     for sort_order, ref in enumerate(order, start=1):
@@ -948,6 +977,7 @@ def create_tasks(arguments: dict[str, Any]) -> dict[str, Any]:
             "stageKey": task["stage_key"],
             "moduleKey": task["module_key"],
             "requirementKey": requirement_key,
+            "planningBatchKey": planning_batch_key,
             "phase": phase,
             "kind": task["kind"],
             "prototypeTask": bool(task.get("prototype_task")),
@@ -991,6 +1021,7 @@ def create_tasks(arguments: dict[str, Any]) -> dict[str, Any]:
                 "stageKey": task["stage_key"],
                 "moduleKey": task["module_key"],
                 "requirementKey": requirement_key,
+                "planningBatchKey": planning_batch_key,
                 "prototypeTask": bool(task.get("prototype_task")),
                 "dependsOnItemKeys": dependencies,
                 "requirementDocumentPath": f"doc/{str(task['module_key']).strip() or 'module'}/{created_item_key}/文档.md",
@@ -1000,6 +1031,9 @@ def create_tasks(arguments: dict[str, Any]) -> dict[str, Any]:
         "programId": program_id,
         "projectSource": "current-executor-project" if used_current_project else "explicit",
         "requestedProject": program_value,
+        "planningBatchKey": planning_batch_key,
+        "planningBatchTitle": str(planning_batch.get("title") or ""),
+        "planningBatchSeq": planning_batch.get("seq"),
         "createdCount": len(created),
         "created": created,
         "sessionBindingsPending": [
@@ -1710,7 +1744,7 @@ ACTIONS = [
     {
         "name": "create_task_board_tasks",
         "title": "批量创建任务面板任务",
-        "description": "校验分类和紧凑分层依赖图（每层最多并行 3 项、只连上一层），强制应用用户选择的里程碑/模块，并按拓扑顺序写入；program_id 必须为项目表数值主键，会话已绑定项目时可省略。",
+        "description": "校验分类和紧凑分层依赖图（每层最多并行 3 项、只连上一层），强制应用用户选择的里程碑/模块，并按拓扑顺序写入；写入前会为本次拆解开一条拆解批次，本批任务共享同一个批次键；program_id 必须为项目表数值主键，会话已绑定项目时可省略。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1720,6 +1754,8 @@ ACTIONS = [
                 "requirement_key": {"type": "string", "description": "本次拆解所属需求；由会话提示词给出，必须原样传回"},
                 "phase": {"type": "string", "enum": ["requirement", "development", "testing"], "description": "任务起始阶段；由会话提示词给出，必须原样传回，默认 requirement"},
                 "generate_prototype": {"type": "boolean", "description": "需求已启用原型图时传 true；工具会自动追加一条位于末尾、只依赖上一执行层任务的原型图生成任务"},
+                "planning_batch_title": {"type": "string", "description": "本次拆解批次的标题；不传时服务端按「第 N 次拆解」命名"},
+                "planning_batch_summary": {"type": "string", "description": "本次拆解批次的一句话说明，例如这轮补了哪部分能力"},
                 "actor_name": {"type": "string", "default": "task-executor"},
                 "tasks": {
                     "type": "array",

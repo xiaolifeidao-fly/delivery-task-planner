@@ -457,6 +457,8 @@ class DeliveryTaskPlannerTest(unittest.TestCase):
                         {"id": "owner-2", "name": "第二负责人"},
                     ],
                 }
+            if method == "POST" and path == "/delivery/requirement/planning-batch/create":
+                return {"batchKey": "plan-1", "title": "第 1 次拆解", "seq": 1}
             if method == "POST" and path == "/delivery/item/create":
                 created_bodies.append(kwargs["body"])
                 return {"itemKey": kwargs["body"]["itemKey"]}
@@ -490,6 +492,8 @@ class DeliveryTaskPlannerTest(unittest.TestCase):
         def request(config, method, path, **kwargs):
             if method == "GET" and path == "/delivery/requirement":
                 return {"requirementKey": "req-a", "generatePrototype": True}
+            if method == "POST" and path == "/delivery/requirement/planning-batch/create":
+                return {"batchKey": "plan-1", "title": "第 1 次拆解", "seq": 1}
             if method == "POST" and path == "/delivery/item/create":
                 created_bodies.append(kwargs["body"])
                 return {"itemKey": kwargs["body"]["itemKey"]}
@@ -515,6 +519,68 @@ class DeliveryTaskPlannerTest(unittest.TestCase):
         self.assertTrue(created_bodies[-1]["prototypeTask"])
         self.assertEqual("生成需求原型图", created_bodies[-1]["title"])
         self.assertEqual([created_bodies[1]["itemKey"]], created_bodies[-1]["dependsOnItemKeys"])
+
+    def test_created_tasks_share_one_planning_batch(self):
+        context = {"program": {"programId": 1}, "stages": [], "modules": [], "items": []}
+        created_bodies = []
+        batch_bodies = []
+
+        def request(_config, method, path, **kwargs):
+            if method == "GET" and path == "/delivery/requirement":
+                return {"requirementKey": "req-a"}
+            if method == "POST" and path == "/delivery/requirement/planning-batch/create":
+                batch_bodies.append(kwargs["body"])
+                return {"batchKey": "plan-abc", "title": "第 2 次拆解", "seq": 2}
+            if method == "POST" and path == "/delivery/item/create":
+                created_bodies.append(kwargs["body"])
+                return {"itemKey": kwargs["body"]["itemKey"]}
+            self.fail(f"unexpected request: {method} {path}")
+
+        with (
+            patch.object(server, "load_config", return_value={"api_url": "http://example.test/api", "key": "secret"}),
+            patch.object(server, "project_context", return_value=context),
+            patch.object(server, "request_api", side_effect=request),
+        ):
+            result = server.create_tasks({
+                "program_id": 1,
+                "requirement_key": "req-a",
+                "planning_batch_summary": "补齐进度页",
+                "tasks": [
+                    {"ref": "a", "title": "A", "benefit_tags": ["能力可用"], "depends_on": []},
+                    {"ref": "b", "title": "B", "benefit_tags": ["能力可用"], "depends_on": ["a"]},
+                ],
+            })
+
+        self.assertEqual(1, len(batch_bodies))
+        self.assertEqual("req-a", batch_bodies[0]["requirementKey"])
+        self.assertEqual(2, batch_bodies[0]["itemCount"])
+        self.assertEqual("补齐进度页", batch_bodies[0]["summary"])
+        self.assertEqual(["plan-abc", "plan-abc"], [body["planningBatchKey"] for body in created_bodies])
+        self.assertEqual("plan-abc", result["planningBatchKey"])
+        self.assertEqual(2, result["planningBatchSeq"])
+
+    def test_tasks_without_a_requirement_are_not_grouped_into_a_planning_batch(self):
+        context = {"program": {"programId": 1}, "stages": [], "modules": [], "items": []}
+        created_bodies = []
+
+        def request(_config, method, path, **kwargs):
+            if method == "POST" and path == "/delivery/item/create":
+                created_bodies.append(kwargs["body"])
+                return {"itemKey": kwargs["body"]["itemKey"]}
+            self.fail(f"unexpected request: {method} {path}")
+
+        with (
+            patch.object(server, "load_config", return_value={"api_url": "http://example.test/api", "key": "secret"}),
+            patch.object(server, "project_context", return_value=context),
+            patch.object(server, "request_api", side_effect=request),
+        ):
+            result = server.create_tasks({
+                "program_id": 1,
+                "tasks": [{"ref": "a", "title": "A", "benefit_tags": ["能力可用"], "depends_on": []}],
+            })
+
+        self.assertEqual("", created_bodies[0]["planningBatchKey"])
+        self.assertEqual("", result["planningBatchKey"])
 
     def test_create_tasks_refuses_multiple_tasks_when_the_requirement_disables_splitting(self):
         context = {"program": {"programId": 1}, "stages": [], "modules": [], "items": []}

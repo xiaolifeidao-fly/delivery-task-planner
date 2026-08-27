@@ -272,6 +272,11 @@ SSH_PUBLIC_KEY_RE = re.compile(
     r"^(?:ssh-(?:ed25519|rsa|dss)|ecdsa-sha2-nistp(?:256|384|521)|sk-(?:ssh-ed25519|ecdsa-sha2-nistp256)@openssh\\.com)\s+[A-Za-z0-9+/=]+(?:\s+.*)?$",
 )
 REQUIREMENT_TESTING_ITEM_KEY = "__requirement_testing__"
+REQUIREMENT_REVIEW_ITEM_KEY = "__requirement_review__"
+# 需求的测试会话和 review 会话共用同一张会话表，靠 metadata.kind 分流；旧数据没有这个字段，按测试算。
+REQUIREMENT_REVIEW_SESSION_KIND = "requirement-review"
+# review 永远跳过的目录：文档和聊天归档不是代码，评它们只会稀释真正该看的改动。
+REVIEW_EXCLUDED_DIRECTORIES = ("doc", "chat")
 # 任务生命周期的四个技能都在本插件 skills/ 下；执行时按阶段点名，别让执行器自己猜。
 PLANNING_SKILL = "delivery-task-planner"
 PHASE_SKILLS = {
@@ -3567,6 +3572,8 @@ def build_environment_setup_prompt(
             [
                 f"这是「预设环境」会话的续聊，本机是 {label}，继续按既定顺序把本机全局环境补齐。",
                 "已经装好并且版本达标的环境不要重装、不要升级、不要改用户已有的版本管理器配置。",
+                "每装完一项都要确认它的可执行文件目录已经持久化写进本机 PATH 环境变量（新开终端仍然生效），"
+                "Git、Node.js、Python 尤其要逐个核对；缺了就补写，补完新开终端复检。",
                 f"需要 {privilege} 权限的命令，如果当前拿不到权限，就把命令原样交给用户执行，然后等用户回话。",
                 "本上下文标记闭合之后的内容，是用户本轮说的话。",
             ],
@@ -3597,24 +3604,36 @@ def build_environment_setup_prompt(
         )
     if host == "windows":
         platform_rules = [
-            "6. 命令用 PowerShell 执行；包管理器优先 winget，没有 winget 再退到 scoop / choco 或官网安装包，并把选择理由说清楚。",
-            "7. 装完要开新的 PowerShell 会话或先刷新 PATH（`$env:Path = [System.Environment]::GetEnvironmentVariable('Path','Machine') "
+            "7. 命令用 PowerShell 执行；包管理器优先 winget，没有 winget 再退到 scoop / choco 或官网安装包，并把选择理由说清楚。",
+            "8. 装完要开新的 PowerShell 会话或先刷新 PATH（`$env:Path = [System.Environment]::GetEnvironmentVariable('Path','Machine') "
             "+ ';' + [System.Environment]::GetEnvironmentVariable('Path','User')`）再复检，"
             "否则复检读到的是旧 PATH，会把装好的环境误判成没装上。",
-            "8. Windows 上 Python 的命令是 `py -3` 或 `python`，没有 `python3`；winget 触发 UAC 弹窗时当前会话无法确认，"
-            "直接把命令交给用户以管理员身份运行。",
+            "9. Windows 的 PATH 必须写进持久化的环境变量，不能只用 `set` 或 `$env:Path=`（那只对当前会话有效）："
+            "用 `[System.Environment]::SetEnvironmentVariable('Path', $新值, 'User')` 追加（拿得到管理员权限时才用 'Machine'），"
+            "$新值 由先读出的原值加分号拼上新目录得到，重复的目录不要再加。"
+            "常见目录：Git 是 `C:\\Program Files\\Git\\cmd`，Node.js 是 `C:\\Program Files\\nodejs`（npm 全局包在 `%APPDATA%\\npm`），"
+            "Python 是安装目录本身和它下面的 `Scripts`（用 winget 装的一般在 `%LOCALAPPDATA%\\Programs\\Python\\PythonXXX`）；"
+            "实际目录以 `where.exe git`、`where.exe node`、`py -3 -c \"import sys;print(sys.prefix)\"` 的真实输出为准，不要照抄路径。",
+            "10. Windows 上 Python 的命令是 `py -3` 或 `python`，没有 `python3`；"
+            "如果 `python` 打开的是微软商店占位程序，说明真实 Python 目录没进 PATH 或被商店别名挡住，"
+            "要在「应用执行别名」里关掉 python.exe / python3.exe 的别名并把真实目录加进 PATH。"
+            "winget 触发 UAC 弹窗时当前会话无法确认，直接把命令交给用户以管理员身份运行。",
         ]
     elif host == "macos":
         platform_rules = [
-            "6. 包管理器用 Homebrew；没有 brew 就先把官方安装命令交给用户，或退到官网安装包，并把选择理由说清楚。",
-            "7. Apple Silicon 的 brew 前缀是 /opt/homebrew、Intel 是 /usr/local；装完 `which` 找不到命令时，"
-            "先确认对应的 bin 目录在 PATH 里再判定失败。",
-            "8. 不要用 sudo 跑 brew。",
+            "7. 包管理器用 Homebrew；没有 brew 就先把官方安装命令交给用户，或退到官网安装包，并把选择理由说清楚。",
+            "8. Apple Silicon 的 brew 前缀是 /opt/homebrew、Intel 是 /usr/local；装完 `which` 找不到命令时，"
+            "先确认对应的 bin 目录在 PATH 里再判定失败。"
+            "需要补 PATH 时写进用户默认 shell 的配置文件（zsh 是 `~/.zshrc`，bash 是 `~/.bash_profile`），"
+            "以 `export PATH=\"<新目录>:$PATH\"` 追加，写之前先确认文件里还没有同一行，然后 `source` 或新开终端复检。",
+            "9. 不要用 sudo 跑 brew。",
         ]
     else:
         platform_rules = [
-            "6. 按发行版选包管理器（Debian/Ubuntu 用 apt，RHEL/CentOS 用 yum/dnf）；"
+            "7. 按发行版选包管理器（Debian/Ubuntu 用 apt，RHEL/CentOS 用 yum/dnf）；"
             "官方源版本低于要求时改用官网安装包或版本管理器，并把选择理由说清楚。",
+            "8. 需要补 PATH 时写进用户默认 shell 的配置文件（`~/.bashrc` 或 `~/.zshrc`），"
+            "以 `export PATH=\"<新目录>:$PATH\"` 追加，写之前先确认没有重复行，然后新开终端复检。",
         ]
     return wrap_bridge_context(
         [
@@ -3631,7 +3650,12 @@ def build_environment_setup_prompt(
             "2. 全局安装，不要建项目级虚拟环境。",
             f"3. 需要 {privilege} 权限而当前拿不到时不要硬闯，把命令原样交给用户执行，然后等用户回话。",
             "4. 装完再跑一次检测命令核对版本，用一个表格列出每项环境的「安装前状态 / 处理动作 / 安装后版本」。",
-            "5. 清单以外的环境一律不装。",
+            "5. 每一项装完都必须把它的可执行文件目录持久化写进本机 PATH 环境变量，"
+            "Git、Node.js、Python 三项无论是不是本轮新装的，都要逐个确认 PATH 里有；"
+            "npm 全局 bin、Python 的 Scripts/bin 这类附带目录同样要在 PATH 里。"
+            "只在当前会话里临时设置不算数，必须新开一个终端复检命令仍然可用。"
+            "追加 PATH 前先读出原值，只做追加和去重，绝不整体覆盖用户已有的 PATH。",
+            "6. 清单以外的环境一律不装。",
             *platform_rules,
             "最终回复末尾单独给出「下一步」，写清还需要用户自己动手的事项；全部就绪就明说无需额外操作。",
             "本上下文标记闭合之后的内容，是用户本轮补充的说明。",
@@ -3684,6 +3708,160 @@ def validate_planning_payload(value: Any) -> tuple[int, str, str, bool, str, str
         # 只有面板上的「确认并写入」会带上这个标记，其余轮次一律是只读的预览。
         bool(value.get("confirmWrite")),
     )
+
+
+def session_kind_of(row: Any) -> str:
+    """会话表里这一行属于哪类会话；老数据没写 kind，一律按需求测试处理。"""
+    metadata = row.get("metadata") if isinstance(row, dict) else None
+    if not isinstance(metadata, dict):
+        return "requirement-testing"
+    return str(metadata.get("kind") or "requirement-testing").strip() or "requirement-testing"
+
+
+def review_scope_of(value: Any) -> list[dict[str, Any]]:
+    """前端勾选的 review 范围：一个 Git 工程一条，files 为空表示这个工程整体都要看。"""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise BridgeFailure("review 范围必须是数组")
+    if len(value) > 64:
+        raise BridgeFailure("review 范围最多 64 个工程")
+    scope: list[dict[str, Any]] = []
+    for raw in value:
+        if not isinstance(raw, dict):
+            raise BridgeFailure("review 范围里的工程必须是对象")
+        path = str(raw.get("path") or "").strip().strip("/")
+        name = str(raw.get("name") or "").strip() or (path or "根工程")
+        if len(path) > 255 or ".." in Path(path).parts:
+            raise BridgeFailure("review 范围里的工程路径无效")
+        files = raw.get("files") or []
+        if not isinstance(files, list) or len(files) > 500:
+            raise BridgeFailure("单个工程的 review 文件最多 500 个")
+        cleaned = []
+        for item in files:
+            file_path = str(item or "").strip()
+            if not file_path:
+                continue
+            if len(file_path) > 512 or ".." in Path(file_path).parts:
+                raise BridgeFailure("review 范围里的文件路径无效")
+            cleaned.append(file_path)
+        scope.append({
+            "path": path, "name": name, "files": cleaned,
+            "changed": max(int(raw.get("changed") or 0), len(cleaned)),
+        })
+    return scope
+
+
+def review_scope_lines(scope: list[dict[str, Any]]) -> list[str]:
+    """把勾选范围铺成提示词里的清单：多工程时逐个列，单工程时直接列文件。"""
+    if not scope:
+        return ["- 用户没有勾选任何变更范围；先说明这一点并让用户确认范围，不要自行扩大到整个仓库。"]
+    lines: list[str] = []
+    for project in scope:
+        location = project["path"] or "（根工程）"
+        lines.append(f"- 工程 {project['name']}（相对工作目录路径：{location}）：变更 {project['changed']} 个文件")
+        for file_path in project["files"][:200]:
+            lines.append(f"  - {file_path}")
+        if len(project["files"]) > 200:
+            lines.append(f"  - …… 还有 {len(project['files']) - 200} 个文件，按同一范围自行读取")
+        if not project["files"]:
+            lines.append("  - 用户按工程整体勾选，这个工程里所有未提交改动都在范围内")
+    return lines
+
+
+def requirement_review_report_relative_path(requirement_key: str) -> Path:
+    return Path("doc") / "review" / requirement_key / "review报告.md"
+
+
+def build_requirement_review_prompt(
+    program_id: int,
+    requirement: dict[str, Any],
+    message: str,
+    workspace: Path | None,
+    scope: list[dict[str, Any]],
+    follow_up: bool = False,
+    generate_report: bool = False,
+) -> str:
+    """代码 review 会话的提示词：范围来自用户勾选，规则是固定三条加用户本轮补充。"""
+    requirement_key = str(requirement.get("requirementKey") or "").strip()
+    excluded = "、".join(f"{name}/" for name in REVIEW_EXCLUDED_DIRECTORIES)
+    rules = [
+        f"规则一（范围排除）：{excluded} 目录下的内容一律不 review，即使它们出现在变更清单里也跳过，也不要因为它们没更新而提意见。",
+        "规则二（项目技能）：动手前先加载当前工作目录里项目自己的技能（如 backend-development、web-development 等），"
+        "按技能里写明的分层、依赖方向、命名、封装和接口约定来判断对错；技能没覆盖的地方再看仓库现有实现的通行写法，不要套用通用最佳实践下结论。",
+        "规则三（用户规则）：用户在本轮聊天里写的检查重点和额外规则，优先级最高，与上面两条叠加执行。",
+    ]
+    report_path = requirement_review_report_relative_path(requirement_key).as_posix()
+    output = (
+        (
+            "本轮是「确认生成 review 报告」：按上面的范围和规则把完整评审结论写成报告，"
+            f"必须写入 `{report_path}`（同一条需求重复生成就覆盖这一份），"
+            "报告里先写本轮范围和结论摘要，再按工程和文件列问题：每条写明文件路径、行号或函数、问题、影响、"
+            "具体可执行的修改建议，并标注严重级别（阻断 / 建议 / 提示）；最终回复第一行必须是“review 报告已生成”。"
+            "仍然只读业务代码，除这份报告外不要改动任何文件，也不要提交、推送或切换分支。"
+        )
+        if generate_report else
+        "输出要求：先说明本轮实际读过的范围，再按工程和文件给出问题清单；"
+        "每条写明文件路径、行号或函数、问题、影响，以及具体可执行的修改建议，并标注严重级别（阻断 / 建议 / 提示）；"
+        "最后给一句总体结论。本轮只在聊天里给意见，不要写报告文件，不要修改业务实现，不要提交、推送或切换分支。"
+    )
+    if follow_up:
+        return wrap_bridge_context(
+            [
+                "这是同一条需求 review 会话的追加回合：仍然只读代码给意见，不改实现、不提交、不推送。",
+                "首轮已交代过规则和输出格式，这里不再重复；下面是本轮最新的变更范围（可能和上一轮不同，以这份为准）。",
+                output,
+                workspace_instruction(workspace),
+                f"项目 program_id: {program_id}",
+                f"需求键 requirement_key: {requirement_key}",
+                "本轮 review 范围：",
+                *review_scope_lines(scope),
+                f"提醒：{excluded} 目录始终不在 review 范围内。",
+                "本上下文标记闭合之后的内容，是用户本轮补充的 review 规则或检查重点。",
+            ],
+            message,
+        )
+    return wrap_bridge_context(
+        [
+            "这是交付任务面板的一次代码 review 会话：只读当前工作区里这条需求的未提交改动，给出评审意见。",
+            "不要修改业务实现，不要执行任务拆解、提交、推送或切分支，也不要生成任务或测试用例。",
+            workspace_instruction(workspace),
+            f"项目 program_id: {program_id}",
+            f"需求键 requirement_key: {requirement_key}",
+            f"需求名称: {requirement.get('name') or '未命名'}",
+            "需求详情:", str(requirement.get("detail") or "（未填写）"),
+            "本轮 review 范围（用户在面板上勾选，逐个工程列出）：",
+            *review_scope_lines(scope),
+            "review 规则：",
+            *rules,
+            output,
+            "本上下文标记闭合之后的内容，是用户本轮补充的 review 规则或检查重点。",
+        ],
+        message,
+    )
+
+
+def validate_requirement_review_payload(value: Any) -> tuple[int, str, str, str, bool, str, str, bool, list[dict[str, Any]], bool]:
+    if not isinstance(value, dict):
+        raise BridgeFailure("请求体必须是 JSON 对象")
+    program_id = program_id_of(value.get("programId"))
+    requirement_key = str(value.get("requirementKey") or "").strip()
+    message = str(value.get("message") or "").strip()
+    thread_id = str(value.get("threadId") or "").strip()
+    model = str(value.get("model") or "").strip()
+    provider = ai_provider_of(value)
+    reasoning_effort = reasoning_effort_of(value, provider)
+    fast_mode = fast_mode_of(value, provider)
+    scope = review_scope_of(value.get("scope"))
+    if not program_id or not requirement_key or len(requirement_key) > 64:
+        raise BridgeFailure("缺少或无效的项目、需求标识")
+    if not message:
+        raise BridgeFailure("请输入本轮 review 的重点或规则")
+    if len(message) > 32 * 1024:
+        raise BridgeFailure("review 要求不能超过 32KB")
+    if len(thread_id) > 255 or len(model) > 128:
+        raise BridgeFailure("会话或模型标识无效")
+    return program_id, requirement_key, message, thread_id, bool(value.get("newConversation")), model, reasoning_effort, fast_mode, scope, bool(value.get("generateReport"))
 
 
 def validate_requirement_testing_payload(value: Any) -> tuple[int, str, str, str, bool, str, str, bool, list[str], bool]:
@@ -4293,9 +4471,12 @@ def validate_execute_payload(value: Any) -> dict[str, Any]:
     if any(not task.get(key) for key in required):
         raise BridgeFailure("任务缺少 itemKey、title 或 version")
     status = str(task.get("status") or "")
-    if status == "done":
+    # 「再做一次」不回滚状态，只是给已完成的任务再开一轮执行实例。
+    redo = bool(value.get("redo"))
+    if status == "done" and not redo:
         raise BridgeFailure("已完成任务不能再次执行")
     normalized = dict(value)
+    normalized["redo"] = redo
     normalized.pop("bizLine", None)
     normalized["programId"] = program_id
     normalized["task"] = dict(task)
@@ -6307,6 +6488,7 @@ class ExecutionBridge:
         rows = [
             row for row in (rows or [])
             if isinstance(row, dict) and str(row.get("threadId") or "") and same_executor_purpose(row, "")
+            and session_kind_of(row) != REQUIREMENT_REVIEW_SESSION_KIND
         ]
         if not rows:
             return None
@@ -7651,6 +7833,300 @@ class ExecutionBridge:
                     self.active.discard(identity)
                     self._release_active_run(identity)
 
+    @staticmethod
+    def _requirement_review_item_key(requirement_key: str) -> str:
+        return f"{REQUIREMENT_REVIEW_ITEM_KEY}:{requirement_key}"
+
+    @staticmethod
+    def _requirement_review_identity(program_id: int, requirement_key: str) -> tuple[str, int, str]:
+        return task_identity("", program_id, ExecutionBridge._requirement_review_item_key(requirement_key))
+
+    def _load_requirement_review_session(
+        self, config: dict[str, Any], program_id: int, requirement_key: str, provider: str, thread_id: str = "",
+    ) -> dict[str, Any] | None:
+        # 和测试会话共用一张表，这里只认 metadata.kind 是 review 的那些行。
+        rows = planner.request_api(
+            config, "GET", "/delivery/requirement/testing-sessions",
+            query={"programId": program_id, "requirementKey": requirement_key},
+        )
+        rows = [
+            row for row in (rows or [])
+            if isinstance(row, dict) and str(row.get("threadId") or "")
+            and session_kind_of(row) == REQUIREMENT_REVIEW_SESSION_KIND
+        ]
+        if not rows:
+            return None
+        catalog = [
+            {
+                "threadId": str(row.get("threadId") or ""), "title": str(row.get("title") or ""),
+                "createdAt": str(row.get("createdAt") or ""), "updatedAt": str(row.get("updatedAt") or ""),
+                "status": str(row.get("status") or "completed"),
+                "executorType": executor_provider_of(row, provider), "active": False,
+            }
+            for row in rows
+        ]
+        current = next((row for row in rows if str(row.get("threadId") or "") == thread_id), rows[-1])
+        metadata = current.get("metadata") if isinstance(current.get("metadata"), dict) else {}
+        return {
+            "threadId": str(current.get("threadId") or ""), "turnId": str(metadata.get("turnId") or ""),
+            "executorType": executor_provider_of(current, provider),
+            "requirementKey": requirement_key, "catalog": catalog,
+        }
+
+    def _save_requirement_review_session(
+        self, config: dict[str, Any], program_id: int, requirement_key: str, provider: str, session: dict[str, Any],
+    ) -> None:
+        thread_id = str(session.get("threadId") or "")
+        if not requirement_key or not thread_id:
+            return
+        entry = next((item for item in session.get("catalog") or [] if str(item.get("threadId") or "") == thread_id), {})
+        provider = executor_provider_of(entry, session.get("executorType") or provider)
+        try:
+            planner.request_api(
+                config, "POST", "/delivery/requirement/testing-session/bind",
+                body={
+                    "programId": program_id, "requirementKey": requirement_key, "executorType": provider,
+                    "threadId": thread_id, "title": str(entry.get("title") or "")[:120],
+                    "status": str(entry.get("status") or "running"),
+                    "metadata": {
+                        "turnId": str(session.get("turnId") or ""), "kind": REQUIREMENT_REVIEW_SESSION_KIND,
+                        "workspace": self.workspace.name,
+                    },
+                    "actorName": f"{provider}-http-bridge",
+                },
+            )
+        except Exception as exc:
+            print(f"保存需求 review 会话目录失败：{program_id}/{requirement_key}: {exc}", file=sys.stderr, flush=True)
+
+    def _persist_requirement_review_report(self, requirement_key: str, report: str) -> Path:
+        relative = requirement_review_report_relative_path(requirement_key)
+        destination = (self.workspace / relative).resolve()
+        try:
+            destination.relative_to(self.workspace)
+        except ValueError as exc:
+            raise BridgeFailure("review 报告路径超出当前项目") from exc
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(report.rstrip() + "\n", encoding="utf-8")
+        return destination
+
+    def _requirement_review_report(self, requirement_key: str) -> tuple[str, str]:
+        """报告只落在工作区文件里，没有独立的库表；读不到就当还没生成。"""
+        relative = requirement_review_report_relative_path(requirement_key)
+        destination = self.workspace / relative
+        try:
+            if destination.is_file():
+                return destination.read_text(encoding="utf-8"), relative.as_posix()
+        except Exception as exc:
+            print(f"读取 review 报告失败：{requirement_key}: {exc}", file=sys.stderr, flush=True)
+        return "", relative.as_posix()
+
+    def requirement_review(
+        self, program_id: int, requirement_key: str, thread_id: str = "", provider: str = "codex", config: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        config = request_scoped_config(config, DEFAULT_BIZ_LINE, program_id)
+        provider = ai_provider_of(provider)
+        requirement_key = str(requirement_key or "").strip()
+        if not requirement_key:
+            raise BridgeFailure("缺少需求标识")
+        session = self._load_requirement_review_session(config, program_id, requirement_key, provider, thread_id)
+        catalog = list((session or {}).get("catalog") or [])
+        selected_thread_id = thread_id or str((session or {}).get("threadId") or "")
+        identity = self._requirement_review_identity(program_id, requirement_key)
+        with self.lock:
+            active = self.active_runs.get(identity)
+        report, report_path = self._requirement_review_report(requirement_key)
+        if not selected_thread_id:
+            return {
+                "programId": program_id, "requirementKey": requirement_key, "threadId": "", "executorType": provider,
+                "turns": [], "conversations": catalog, "active": False, "activeTurnId": "",
+                "reviewReport": report, "reviewReportPath": report_path,
+            }
+        provider = executor_provider_of(
+            next((entry for entry in catalog if str(entry.get("threadId") or "") == selected_thread_id), {}),
+            (session or {}).get("executorType") or provider,
+        )
+        live_client = active["client"] if active is not None and active.get("threadId") == selected_thread_id else None
+        thread = self._read_thread_with_workspace_archive(
+            live_client, selected_thread_id, "requirement", requirement_key, config, program_id,
+            provider=provider,
+            environment=codex_environment(config, program_id, write_allowed=True),
+        )
+        item_key = self._requirement_review_item_key(requirement_key)
+        for entry in catalog:
+            entry["active"] = bool(active is not None and entry.get("threadId") == active.get("threadId"))
+            if not entry["active"] and entry.get("status") == "running":
+                entry["status"] = "interrupted"
+        return {
+            "programId": program_id, "requirementKey": requirement_key, "threadId": selected_thread_id,
+            "executorType": provider,
+            "turns": serialize_turns(
+                thread.get("turns") or [],
+                lambda attachment_ids: [ConversationAttachmentStore._public(attachment) for attachment in self.attachments.resolve(program_id, item_key, attachment_ids)],
+                lambda paths: self.artifacts.register(config_biz_line(config), program_id, item_key, paths),
+            ),
+            "conversations": catalog,
+            "active": bool(active is not None and active.get("threadId") == selected_thread_id),
+            "activeTurnId": str((active or {}).get("turnId") or ""),
+            "reviewReport": report, "reviewReportPath": report_path,
+        }
+
+    def send_requirement_review(self, raw: Any, config: dict[str, Any]) -> dict[str, Any]:
+        provider = ai_provider_of(raw)
+        program_id, requirement_key, message, requested_thread_id, new_conversation, model, reasoning_effort, fast_mode, scope, generate_report = validate_requirement_review_payload(raw)
+        assert_runtime_project(config, program_id)
+        requirement = self._requirement_for_prototype(config, program_id, requirement_key)
+        identity = self._requirement_review_identity(program_id, requirement_key)
+        session = self._load_requirement_review_session(config, program_id, requirement_key, provider, requested_thread_id)
+        with self.lock:
+            active = self.active_runs.get(identity)
+        if active is not None:
+            if new_conversation or (requested_thread_id and requested_thread_id != active.get("threadId")):
+                raise BridgeFailure("当前需求已有正在运行的 review 会话，请先停止或等待完成")
+            active["client"].steer_turn(
+                str(active["threadId"]), str(active["turnId"]), message, [],
+                request_id=active["client"].next_request_id(),
+            )
+            self.progress.publish(identity, "message", "已追加 review 要求", message, "running")
+            return {"accepted": True, "programId": program_id, "requirementKey": requirement_key, "threadId": active["threadId"], "turnId": active["turnId"], "active": True}
+        catalog = list((session or {}).get("catalog") or [])
+        known_thread_ids = {str(entry.get("threadId") or "") for entry in catalog}
+        if requested_thread_id and requested_thread_id not in known_thread_ids:
+            raise BridgeFailure("所选 review 会话不存在")
+        if not session or new_conversation or not session.get("threadId"):
+            if len(catalog) >= MAX_PLANNING_CONVERSATIONS:
+                raise BridgeFailure("该需求保留的 review 会话已达上限")
+            title = f"代码 review · {requirement.get('name') or requirement_key}"
+            if catalog:
+                title = f"{title} V{len(catalog) + 1}"
+            client = create_ai_client(
+                provider, self.workspace, lambda event: self._publish_app_server_event(identity, event),
+                codex_environment(config, program_id, write_allowed=True),
+            )
+            try:
+                thread_id, turn_id = client.start_task(
+                    title, build_requirement_review_prompt(program_id, requirement, message, self.workspace, scope, generate_report=generate_report), [],
+                    model=model, reasoning_effort=reasoning_effort, fast_mode=fast_mode,
+                )
+            except Exception:
+                client.close()
+                raise
+            session = {
+                "threadId": thread_id, "turnId": turn_id, "requirementKey": requirement_key,
+                "catalog": [*catalog, {"threadId": thread_id, "title": title, "createdAt": utc_now(), "updatedAt": utc_now(), "status": "running", "active": True}],
+            }
+        else:
+            thread_id = requested_thread_id or str(session.get("threadId") or "")
+            provider = executor_provider_of(
+                next((entry for entry in catalog if str(entry.get("threadId") or "") == thread_id), {}),
+                session.get("executorType") or provider,
+            )
+            client = create_ai_client(
+                provider, self.workspace, lambda event: self._publish_app_server_event(identity, event),
+                codex_environment(config, program_id, write_allowed=True),
+            )
+            try:
+                client.resume_thread(thread_id)
+                turn_id = client.start_turn(
+                    thread_id,
+                    build_requirement_review_prompt(program_id, requirement, message, self.workspace, scope, follow_up=True, generate_report=generate_report), [],
+                    request_id=client.next_request_id(), model=model, reasoning_effort=reasoning_effort, fast_mode=fast_mode,
+                )
+            except Exception:
+                client.close()
+                raise
+            session.update({"threadId": thread_id, "turnId": turn_id})
+            for entry in session.get("catalog") or []:
+                if entry.get("threadId") == thread_id:
+                    entry.update({"status": "running", "active": True, "updatedAt": utc_now()})
+        with self.lock:
+            self.active.add(identity)
+            self.active_runs[identity] = {
+                "client": client, "threadId": thread_id, "turnId": turn_id, "requirementReview": True,
+                "provider": provider, "config": config, "programId": program_id, "requirementKey": requirement_key,
+            }
+        self._save_requirement_review_session(config, program_id, requirement_key, provider, session)
+        self.progress.publish(
+            identity, "status", "正在生成 review 报告" if generate_report else "正在进行代码 review",
+            f"{provider_label(provider)} 正在按勾选范围审查改动。", "running",
+        )
+        threading.Thread(
+            target=self._follow_requirement_review,
+            args=(identity, client, config, program_id, requirement_key, provider, session, thread_id, turn_id, generate_report), daemon=True,
+        ).start()
+        return {"accepted": True, "programId": program_id, "requirementKey": requirement_key, "threadId": thread_id, "turnId": turn_id, "active": True}
+
+    def stop_requirement_review(self, raw: Any, config: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(raw, dict):
+            raise BridgeFailure("请求体必须是 JSON 对象")
+        program_id = program_id_of(raw.get("programId"))
+        requirement_key = str(raw.get("requirementKey") or "").strip()
+        assert_runtime_project(config, program_id)
+        identity = self._requirement_review_identity(program_id, requirement_key)
+        with self.lock:
+            active = self.active_runs.get(identity)
+        if active is None or not active.get("requirementReview"):
+            raise BridgeFailure("该需求当前没有正在运行的 review 会话")
+        requested_thread_id = str(raw.get("threadId") or "").strip()
+        if requested_thread_id and requested_thread_id != active.get("threadId"):
+            raise BridgeFailure("所选 review 会话当前没有正在运行的回合")
+        active["client"].interrupt_turn(str(active["threadId"]), str(active["turnId"]), request_id=active["client"].next_request_id())
+        self.progress.publish(identity, "status", "已请求停止 review", "正在等待 review 回合中断。", "running")
+        return {"accepted": True, "programId": program_id, "requirementKey": requirement_key, "threadId": active["threadId"], "turnId": active["turnId"], "active": True}
+
+    def _follow_requirement_review(
+        self, identity: tuple[str, int, str], client: AppServerClient, config: dict[str, Any], program_id: int,
+        requirement_key: str, provider: str, session: dict[str, Any], thread_id: str, turn_id: str,
+        generate_report: bool = False,
+    ) -> None:
+        try:
+            turn_status = client.wait_turn(turn_id)
+            entry = next(
+                (item for item in session.get("catalog") or [] if str(item.get("threadId") or "") == thread_id),
+                {},
+            )
+            title = str(entry.get("title") or "代码 review")
+            self._archive_terminal_chat(
+                client,
+                config=config,
+                program_id=program_id,
+                resource_kind="requirement",
+                resource_key=requirement_key,
+                resource_name=title,
+                conversation_title=title,
+                thread_id=thread_id,
+                provider=provider,
+                phase="review",
+                terminal_status=turn_status,
+            )
+            if generate_report and turn_status == "completed":
+                # 执行器一般已经自己写过报告；这里按最终回复再落一次，避免它只在聊天里说完就收工。
+                turn = client.read_turn(thread_id, turn_id, request_id=client.next_request_id())
+                report = final_agent_text_from_output(execution_output(turn_status, turn))
+                if report.strip():
+                    self._persist_requirement_review_report(requirement_key, report)
+            for item in session.get("catalog") or []:
+                if item.get("threadId") == thread_id:
+                    item.update({"status": turn_status, "active": False, "updatedAt": utc_now()})
+            session["turnId"] = turn_id
+            self._save_requirement_review_session(config, program_id, requirement_key, provider, session)
+            self.progress.publish(
+                identity, "status",
+                ("review 报告已生成" if generate_report else "代码 review 已完成") if turn_status == "completed"
+                else ("review 报告未生成" if generate_report else "代码 review 未完成"),
+                f"报告已写入 {requirement_review_report_relative_path(requirement_key).as_posix()}。" if generate_report else "评审意见已回到聊天里。",
+                turn_status,
+            )
+        except Exception as exc:
+            self.progress.publish(identity, "error", "同步 review 结果失败", str(exc), "failed")
+            print(f"同步需求 review 结果失败：{program_id}/{requirement_key}: {exc}", file=sys.stderr, flush=True)
+        finally:
+            client.close()
+            with self.lock:
+                current = self.active_runs.get(identity)
+                if current is None or current.get("client") is client:
+                    self.active.discard(identity)
+                    self._release_active_run(identity)
+
     def models(self, config: dict[str, Any], provider: str = "codex") -> dict[str, Any]:
         program_id = program_id_of(config.get("_project_id"))
         assert_runtime_project(config, program_id)
@@ -7821,6 +8297,7 @@ class ExecutionBridge:
         item_keys: list[str],
         mode: str,
         provider: str,
+        redo: bool = False,
     ) -> dict[str, Any]:
         """Create the authoritative server-side record before the local queue starts."""
         batch = planner.request_api(
@@ -7832,6 +8309,8 @@ class ExecutionBridge:
                 "itemKeys": item_keys,
                 "mode": mode,
                 "executorType": provider,
+                # 再做一次：服务端据此放行已完成任务，任务状态不回滚。
+                "redo": bool(redo),
                 "actorName": f"{provider}-http-bridge",
             },
         )
@@ -8597,7 +9076,7 @@ class ExecutionBridge:
             raise BridgeFailure("任务版本已变化，请刷新任务面板")
         phase = str(task.get("phase") or "requirement")
         execution_batch_id = str(payload.get("executionBatchId") or "").strip()
-        if task.get("status") == "done":
+        if task.get("status") == "done" and not bool(payload.get("redo")):
             raise BridgeFailure("已完成任务不能再次执行")
         by_key = {str(item.get("itemKey")): item for item in context["items"]}
         queue_id = str(payload.get("batchId") or payload.get("sequenceId") or "")
@@ -8996,6 +9475,8 @@ class ExecutionBridge:
         provider = ai_provider_of(raw)
         reasoning_effort = reasoning_effort_of(raw, provider)
         fast_mode = fast_mode_of(raw, provider)
+        # 再做一次：允许把已完成任务重新拉进批次，不回滚它们的状态。
+        redo = bool(raw.get("redo"))
         if not program_id:
             raise BridgeFailure("缺少项目标识")
         if not requested_keys:
@@ -9012,7 +9493,7 @@ class ExecutionBridge:
         if missing:
             raise BridgeFailure("任务不存在：" + ", ".join(missing))
         completed = sorted(key for key in requested_keys if str(by_key[key].get("status") or "") == "done")
-        if completed:
+        if completed and not redo:
             raise BridgeFailure("批量启动不能选择已完成任务：" + ", ".join(completed))
         selected = set(requested_keys)
         incomplete_external = {
@@ -9048,7 +9529,7 @@ class ExecutionBridge:
                 raise BridgeFailure("任务正在等待批量启动：" + ", ".join(waiting))
             self.batch_tasks.update(reserved)
         try:
-            persisted_batch = self._create_execution_batch(config, program_id, requested_keys, "parallel", provider)
+            persisted_batch = self._create_execution_batch(config, program_id, requested_keys, "parallel", provider, redo)
             batch_id = str(persisted_batch["batchId"])
         except Exception:
             with self.lock:
@@ -9058,7 +9539,7 @@ class ExecutionBridge:
             self.batch_satisfied[batch_id] = set()
         threading.Thread(
             target=self._run_batch,
-            args=(batch_id, config, program_id, requested_keys, model, provider, execution_constraints, reasoning_effort, fast_mode),
+            args=(batch_id, config, program_id, requested_keys, model, provider, execution_constraints, reasoning_effort, fast_mode, redo),
             daemon=True,
         ).start()
         return {
@@ -9082,6 +9563,7 @@ class ExecutionBridge:
         execution_constraints: str = "",
         reasoning_effort: str = "",
         fast_mode: bool = False,
+        redo: bool = False,
     ) -> None:
         biz_line = config_biz_line(config)
         terminal_status = "completed"
@@ -9101,7 +9583,8 @@ class ExecutionBridge:
                 if missing:
                     raise BridgeFailure("任务不存在：" + ", ".join(missing))
 
-                completed_before_start = {
+                # 平时已完成的任务直接记完成跳过；「再做一次」正是要重跑它们，所以不跳。
+                completed_before_start = set() if redo else {
                     key for key in remaining if str(by_key[key].get("status") or "") == "done"
                 }
                 for item_key in completed_before_start:
@@ -9148,6 +9631,7 @@ class ExecutionBridge:
                             "batchId": batch_id,
                             "executionBatchId": batch_id,
                             "batchMode": True,
+                            **({"redo": True} if redo else {}),
                             **({"executionConstraints": execution_constraints} if execution_constraints else {}),
                             **({"reasoningEffort": reasoning_effort} if reasoning_effort else {}),
                             **({"fastMode": True} if fast_mode else {}),
@@ -12031,6 +12515,30 @@ class BridgeHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self.json_response(500, {"error": f"读取需求总体测试会话失败：{exc}"})
             return
+        if parsed.path == "/v1/codex/requirement-review":
+            if not self.allowed_origin():
+                self.json_response(403, {"error": "origin not allowed"})
+                return
+            query = parse_qs(parsed.query)
+            try:
+                program_id = program_id_of((query.get("programId") or [""])[0])
+                requirement_key = str((query.get("requirementKey") or [""])[0]).strip()
+                thread_id = str((query.get("threadId") or [""])[0]).strip()
+                provider = ai_provider_of((query.get("provider") or ["codex"])[0])
+                if not requirement_key:
+                    raise BridgeFailure("缺少需求标识")
+                selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
+                config = self.bridge.request_config(
+                    {"programId": program_id}, self.allowed_origin() or "", self.headers.get("token", "").strip(),
+                )
+                self.json_response(200, selected_bridge.requirement_review(
+                    program_id, requirement_key, thread_id, provider, config=config,
+                ))
+            except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
+                self.json_response(400, {"error": str(exc)})
+            except Exception as exc:
+                self.json_response(500, {"error": f"读取代码 review 会话失败：{exc}"})
+            return
         if parsed.path == "/v1/codex/task-testing-cases":
             if not self.allowed_origin():
                 self.json_response(403, {"error": "origin not allowed"})
@@ -12270,6 +12778,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
             "/v1/codex/requirement-prototype/conversation",
             "/v1/codex/requirement-testing",
             "/v1/codex/requirement-testing/stop",
+            "/v1/codex/requirement-review",
+            "/v1/codex/requirement-review/stop",
             "/v1/codex/attachments",
             "/v1/codex/prototype-directory/open",
             "/v1/codex/git/branch",
@@ -12383,6 +12893,10 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 self.json_response(202, selected_bridge.send_requirement_testing(payload, config))
             elif path == "/v1/codex/requirement-testing/stop":
                 self.json_response(202, selected_bridge.stop_requirement_testing(payload, config))
+            elif path == "/v1/codex/requirement-review":
+                self.json_response(202, selected_bridge.send_requirement_review(payload, config))
+            elif path == "/v1/codex/requirement-review/stop":
+                self.json_response(202, selected_bridge.stop_requirement_review(payload, config))
             elif path == "/v1/codex/requirement-document":
                 item_key = str(payload.get("itemKey") or "").strip()
                 if not item_key:

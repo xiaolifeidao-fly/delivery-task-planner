@@ -41,9 +41,9 @@ class HttpBridgeTest(unittest.TestCase):
         # 批次本身现在由服务端持久化；队列算法单测不需要真的访问 HTTP 服务。
         self.execution_batches: list[dict[str, object]] = []
 
-        def create_execution_batch(_config, _program_id, item_keys, mode, provider):
+        def create_execution_batch(_config, _program_id, item_keys, mode, provider, redo=False):
             batch_id = f"batch-test-{len(self.execution_batches) + 1}"
-            batch = {"batchId": batch_id, "itemKeys": list(item_keys), "mode": mode, "provider": provider}
+            batch = {"batchId": batch_id, "itemKeys": list(item_keys), "mode": mode, "provider": provider, "redo": bool(redo)}
             self.execution_batches.append(batch)
             return batch
 
@@ -451,6 +451,55 @@ class HttpBridgeTest(unittest.TestCase):
         )
 
         self.assertIn("改过的正文", follow_up)
+
+    def test_requirement_review_prompt_states_the_three_rules_and_the_selected_scope(self):
+        requirement = {"requirementKey": "req-a", "name": "需求一", "detail": "需求正文"}
+        scope = bridge.review_scope_of([
+            {"path": "", "name": "根工程", "changed": 3, "files": ["server/a.go", "client/b.ts"]},
+            {"path": "sub", "name": "子工程", "changed": 5, "files": []},
+        ])
+
+        prompt = bridge.build_requirement_review_prompt(1, requirement, "重点看并发", None, scope)
+
+        self.assertIn("doc/、chat/ 目录下的内容一律不 review", prompt)
+        self.assertIn("backend-development", prompt)
+        self.assertIn("用户在本轮聊天里写的检查重点和额外规则，优先级最高", prompt)
+        self.assertIn("server/a.go", prompt)
+        self.assertIn("子工程", prompt)
+        self.assertIn("这个工程里所有未提交改动都在范围内", prompt)
+        self.assertIn("重点看并发", prompt)
+
+    def test_requirement_review_follow_up_prompt_keeps_the_scope_but_drops_the_boilerplate(self):
+        requirement = {"requirementKey": "req-a", "name": "需求一", "detail": "很长的需求正文"}
+        scope = bridge.review_scope_of([{"path": "", "name": "根工程", "changed": 1, "files": ["server/a.go"]}])
+
+        follow_up = bridge.build_requirement_review_prompt(1, requirement, "再看一遍", None, scope, follow_up=True)
+
+        self.assertIn("server/a.go", follow_up)
+        self.assertIn("doc/、chat/ 目录始终不在 review 范围内", follow_up)
+        self.assertNotIn("很长的需求正文", follow_up)
+
+    def test_requirement_review_report_round_names_the_report_file_and_the_first_line(self):
+        requirement = {"requirementKey": "req-a", "name": "需求一"}
+        scope = bridge.review_scope_of([{"path": "", "name": "根工程", "changed": 1, "files": ["server/a.go"]}])
+
+        chat_only = bridge.build_requirement_review_prompt(1, requirement, "先聊聊", None, scope)
+        report = bridge.build_requirement_review_prompt(1, requirement, "出报告", None, scope, generate_report=True)
+
+        self.assertIn("本轮只在聊天里给意见，不要写报告文件", chat_only)
+        self.assertIn("doc/review/req-a/review报告.md", report)
+        self.assertIn("review 报告已生成", report)
+        self.assertNotIn("不要写报告文件", report)
+
+    def test_requirement_review_scope_rejects_paths_that_escape_the_workspace(self):
+        with self.assertRaises(bridge.BridgeFailure):
+            bridge.review_scope_of([{"path": "../outside", "name": "x", "files": []}])
+        with self.assertRaises(bridge.BridgeFailure):
+            bridge.review_scope_of([{"path": "", "name": "x", "files": ["../../etc/passwd"]}])
+
+    def test_requirement_review_payload_requires_a_message(self):
+        with self.assertRaises(bridge.BridgeFailure):
+            bridge.validate_requirement_review_payload({"programId": 1, "requirementKey": "req-a", "message": "  "})
 
     def test_task_testing_cases_follow_up_prompt_drops_the_sibling_catalog(self):
         task = {"itemKey": "task-a", "title": "接口", "requirementKey": "req-a", "moduleKey": "web", "phase": "testing"}
@@ -2936,6 +2985,41 @@ class HttpBridgeTest(unittest.TestCase):
         self.assertTrue(result["accepted"])
         self.assertEqual(["b", "c"], result["itemKeys"])
         self.assertEqual({("", 1, "b"), ("", 1, "c")}, executor.batch_tasks)
+        thread.return_value.start.assert_called_once()
+
+    def test_execute_batch_refuses_completed_tasks_without_redo(self):
+        context = {"items": [{"itemKey": "a", "status": "done", "dependsOnItemKeys": []}]}
+        executor = bridge.ExecutionBridge(Path.cwd())
+        with (
+            patch.object(bridge.planner, "project_context", return_value=context),
+            patch.object(bridge.threading, "Thread"),
+        ):
+            with self.assertRaises(bridge.BridgeFailure):
+                executor.execute_batch({"bizLine": "whatsapp", "programId": 1, "itemKeys": ["a"]}, config=self.runtime_config())
+
+    def test_execute_batch_redo_reruns_completed_tasks(self):
+        context = {
+            "items": [
+                {"itemKey": "a", "status": "done", "dependsOnItemKeys": []},
+                {"itemKey": "b", "status": "done", "dependsOnItemKeys": ["a"]},
+            ],
+        }
+        executor = bridge.ExecutionBridge(Path.cwd())
+        with (
+            patch.object(bridge.planner, "project_context", return_value=context),
+            patch.object(bridge.threading, "Thread") as thread,
+        ):
+            result = executor.execute_batch(
+                {"bizLine": "whatsapp", "programId": 1, "itemKeys": ["a", "b"], "redo": True},
+                config=self.runtime_config(),
+            )
+
+        self.assertTrue(result["accepted"])
+        self.assertEqual(["a", "b"], result["itemKeys"])
+        # 服务端要知道这是「再做一次」，否则它会挡下已完成任务。
+        self.assertTrue(self.execution_batches[-1]["redo"])
+        # 重跑用的是新的执行实例，任务状态本身不回滚。
+        self.assertTrue(thread.call_args.kwargs["args"][-1])
         thread.return_value.start.assert_called_once()
 
     def test_execute_sequence_accepts_selected_not_started_dependency_chain(self):
