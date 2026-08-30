@@ -469,6 +469,18 @@ class HttpBridgeTest(unittest.TestCase):
         self.assertIn("这个工程里所有未提交改动都在范围内", prompt)
         self.assertIn("重点看并发", prompt)
 
+    def test_requirement_review_prompt_carries_the_general_review_guidelines(self):
+        """通用评审准则是固定下发的第四条规则，首轮必须完整出现。"""
+        requirement = {"requirementKey": "req-a", "name": "需求一", "detail": "需求正文"}
+        scope = bridge.review_scope_of([{"path": "", "name": "根工程", "changed": 1, "files": ["server/a.go"]}])
+
+        prompt = bridge.build_requirement_review_prompt(1, requirement, "先看看", None, scope)
+
+        self.assertIn("规则四（评审准则）", prompt)
+        self.assertIn("You are acting as a reviewer", prompt)
+        self.assertIn("::code-comment{...}", prompt)
+        self.assertIn("Prefer no issues over speculative or low-signal feedback.", prompt)
+
     def test_requirement_review_follow_up_prompt_keeps_the_scope_but_drops_the_boilerplate(self):
         requirement = {"requirementKey": "req-a", "name": "需求一", "detail": "很长的需求正文"}
         scope = bridge.review_scope_of([{"path": "", "name": "根工程", "changed": 1, "files": ["server/a.go"]}])

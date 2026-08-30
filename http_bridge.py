@@ -277,6 +277,37 @@ REQUIREMENT_REVIEW_ITEM_KEY = "__requirement_review__"
 REQUIREMENT_REVIEW_SESSION_KIND = "requirement-review"
 # review 永远跳过的目录：文档和聊天归档不是代码，评它们只会稀释真正该看的改动。
 REVIEW_EXCLUDED_DIRECTORIES = ("doc", "chat")
+# 通用评审准则：面板固定下发给每一次首轮 review，和范围、项目技能那几条规则叠加执行。
+REVIEW_GUIDELINES = """Code review guidelines:
+Review Guidelines
+You are acting as a reviewer for a proposed code change made by another engineer.
+
+Review the change and respond in normal Markdown. Do not return JSON, XML, a findings object, or any structured review schema.
+
+When feedback should be attached directly to a changed line, emit one ::code-comment{...} directive for that issue. The directive creates an inline code comment in the review UI; keep the visible response as normal Markdown. Emit no directives when there are no actionable inline comments.
+
+Required code-comment attributes: title, body, and file. Optional attributes: start, end, and priority. Use the shortest useful line range. file should be an absolute path or include the workspace folder segment.
+
+Focus on discrete, actionable issues the original author would likely fix if they knew about them. Prefer no issues over speculative or low-signal feedback.
+
+General guidelines for whether to call out an issue:
+
+It meaningfully impacts correctness, performance, security, or maintainability.
+It is discrete and actionable.
+It was introduced by the change under review.
+The author would likely fix it once aware.
+It does not rely on unstated assumptions about intent.
+It identifies the affected behavior clearly rather than speculating broadly.
+Repository Rule Attribution
+Use the root and scoped project instruction files applicable to changed files, respecting normal project-document precedence (AGENTS.override.md, AGENTS.md, then configured fallback filenames) and selecting at most one file per directory. Guidance may use headings, checklists, bullets, tables, or concise prose; do not require formal IDs or schemas. More-specific guidance wins on conflict, and user instructions about review scope or style take precedence.
+
+Review the diff independently and deduplicate findings by changed location and defect/remedy. A finding is rule-supported only when applicable guidance materially contributes repository-specific scope, an invariant, remedy, convention, or confirmation behavior beyond generic correctness advice. Preserve and union rule support when candidates merge, then check every final candidate against the applicable rules. Do not omit ordinary findings or invent findings solely because a rule file exists.
+
+When collaboration is available, use at most one focused investigator per applicable rule. For each rule-supported finding, verify the applicable project instruction file that supplies the rule and its smallest supporting line range, then include one compact Markdown or local-file reference in the visible comment body. Do not fabricate citations or add hidden metadata.
+
+When you call out an issue, include the relevant file and line or function in prose, explain the scenario where it matters, and keep the explanation concise. Use priority labels such as [P1] or [P2] only when helpful to communicate severity.
+
+If there are no actionable issues, say that directly and briefly. Review the current code changes (staged, unstaged, and untracked files) and provide concise, actionable feedback in a normal Markdown response."""
 # 任务生命周期的四个技能都在本插件 skills/ 下；执行时按阶段点名，别让执行器自己猜。
 PLANNING_SKILL = "delivery-task-planner"
 PHASE_SKILLS = {
@@ -3806,6 +3837,9 @@ def build_requirement_review_prompt(
         "规则二（项目技能）：动手前先加载当前工作目录里项目自己的技能（如 backend-development、web-development 等），"
         "按技能里写明的分层、依赖方向、命名、封装和接口约定来判断对错；技能没覆盖的地方再看仓库现有实现的通行写法，不要套用通用最佳实践下结论。",
         "规则三（用户规则）：用户在本轮聊天里写的检查重点和额外规则，优先级最高，与上面两条叠加执行。",
+        "规则四（评审准则）：下面这份通用评审准则与上面三条叠加执行；准则里的输出格式要求，"
+        "与本轮「输出要求」冲突时以本轮输出要求为准。",
+        REVIEW_GUIDELINES,
     ]
     report_path = requirement_review_report_relative_path(requirement_key).as_posix()
     output = (
