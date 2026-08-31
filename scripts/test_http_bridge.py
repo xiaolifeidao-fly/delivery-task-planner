@@ -4990,6 +4990,87 @@ class GitBranchTest(unittest.TestCase):
         subprocess.run(["git", "-C", str(self.workspace), "commit", "-m", f"ignore {name}"], check=True, capture_output=True)
         return child
 
+    def make_submodule(self, name: str) -> Path:
+        """把一个独立仓库登记成根仓库的子模组，模拟真实项目里的 submodule 布局。"""
+        module = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(module, ignore_errors=True))
+        for args in (
+            ["init", "--initial-branch=main"],
+            ["config", "user.email", "bridge@test"],
+            ["config", "user.name", "bridge"],
+        ):
+            subprocess.run(["git", "-C", str(module), *args], check=True, capture_output=True)
+        (module / "lib.txt").write_text(name, encoding="utf-8")
+        subprocess.run(["git", "-C", str(module), "add", "."], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(module), "commit", "-m", "init"], check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-C", str(self.workspace), "-c", "protocol.file.allow=always",
+             "submodule", "add", str(module), name],
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(self.workspace), "commit", "-m", f"add submodule {name}"],
+            check=True, capture_output=True,
+        )
+        return self.workspace / name
+
+    def test_branch_creation_survives_a_submodule_that_cannot_be_updated(self):
+        """基准分支记着一个本机取不到的子模组 commit 时，需求分支照样要建出来。"""
+        self.make_submodule("galactus")
+        # 先留一条指针正常的分支，等下切回来把工作区恢复干净。
+        subprocess.run(["git", "-C", str(self.workspace), "branch", "work"], check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-C", str(self.workspace), "update-index", "--cacheinfo",
+             f"160000,{'d' * 40},galactus"],
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(self.workspace), "commit", "-m", "broken submodule pointer"],
+            check=True, capture_output=True,
+        )
+        subprocess.run(["git", "-C", str(self.workspace), "checkout", "work"], check=True, capture_output=True)
+        self.assertFalse(bridge.git_worktree_dirty(self.workspace))
+
+        result = bridge.git_create_branch_targets(self.workspace, "main", "feature/issue_req-1", [])
+
+        self.assertTrue(result["created"])
+        self.assertEqual("feature/issue_req-1", bridge.git_current_branch(self.workspace))
+        broken = next(record for record in result["results"] if record["path"] == "galactus")
+        self.assertIn("galactus", broken["error"])
+        # 根目录这条记录必须是干净的：坏掉的子模组只影响它自己那一行。
+        self.assertEqual("", result["results"][0]["error"])
+
+    def test_branch_creation_syncs_unselected_submodules_to_the_base_branch(self):
+        """没勾的子模组不建自己的分支，但要跟着根仓库的指针走，否则工作区一直是脏的。"""
+        module = self.make_submodule("galactus")
+        first = subprocess.run(
+            ["git", "-C", str(module), "rev-parse", "HEAD"], check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        subprocess.run(["git", "-C", str(self.workspace), "branch", "legacy"], check=True, capture_output=True)
+        (module / "lib.txt").write_text("next", encoding="utf-8")
+        subprocess.run(["git", "-C", str(module), "commit", "-am", "next"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(self.workspace), "commit", "-am", "bump galactus"], check=True, capture_output=True)
+        self.assertFalse(bridge.git_worktree_dirty(self.workspace))
+
+        result = bridge.git_create_branch_targets(self.workspace, "legacy", "feature/issue_req-1", [])
+
+        head = subprocess.run(
+            ["git", "-C", str(module), "rev-parse", "HEAD"], check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        self.assertEqual(first, head)
+        self.assertFalse(bridge.git_worktree_dirty(self.workspace))
+        self.assertTrue(all(not record["error"] for record in result["results"]))
+
+    def test_branch_creation_leaves_a_selected_submodule_on_its_own_branch(self):
+        """勾中的子模组要停在自己的需求分支上，不能被同步成游离 HEAD。"""
+        module = self.make_submodule("galactus")
+
+        result = bridge.git_create_branch_targets(self.workspace, "main", "feature/issue_req-1", ["galactus"])
+
+        self.assertEqual("feature/issue_req-1", bridge.git_current_branch(module))
+        self.assertEqual(["", "galactus"], [record["path"] for record in result["results"]])
+        self.assertTrue(all(not record["error"] for record in result["results"]))
+
     def test_pending_submodules_are_initialized_with_the_workspace(self):
         # 造一个带子模块的远端仓库，模拟「clone 下来但子模块还是空目录」。
         module = Path(tempfile.mkdtemp())

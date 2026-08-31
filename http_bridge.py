@@ -2646,20 +2646,20 @@ def git_local_branch_for_reference(workspace: Path, reference: str, remote: str)
     return local, remote_ref
 
 
-def git_checkout_reference(workspace: Path, reference: str, remote: str) -> str:
-    """切到本地分支；只有远端存在时创建受跟踪的本地分支。"""
+def git_checkout_reference(
+    workspace: Path, reference: str, remote: str, keep_submodules: list[str] | None = None,
+) -> tuple[str, list[dict[str, Any]]]:
+    """切到本地分支；只有远端存在时创建受跟踪的本地分支。返回分支名和子模组同步结果。"""
     local, remote_ref = git_local_branch_for_reference(workspace, reference, remote)
     if git_current_branch(workspace) == local:
-        return local
+        return local, []
     if git_worktree_dirty(workspace):
         raise BridgeFailure(f"工作目录有未提交改动，无法切换到分支 {local}，请先提交或暂存")
-    args = ["checkout", "--recurse-submodules", local] if not remote_ref else [
-        "checkout", "--recurse-submodules", "-b", local, "--track", remote_ref,
-    ]
+    args = ["checkout", local] if not remote_ref else ["checkout", "-b", local, "--track", remote_ref]
     completed = run_git(workspace, args)
     if completed.returncode != 0:
         raise BridgeFailure(f"切换分支 {local} 失败：{(completed.stdout or '').strip() or 'git 退出异常'}")
-    return local
+    return local, git_sync_unselected_submodules(workspace, keep_submodules or [])
 
 
 def git_workspace_status(workspace: Path, expected_remote_url: str = "", remote: str = "origin") -> dict[str, Any]:
@@ -2695,6 +2695,7 @@ def git_prepare_branch(
     expected_remote_url: str = "",
     remote: str = "origin",
     allow_detached: bool = False,
+    keep_submodules: list[str] | None = None,
 ) -> dict[str, Any]:
     """用户确认后才处理未提交改动并切分支；绝不丢弃改动或自动应用 stash。
 
@@ -2722,6 +2723,7 @@ def git_prepare_branch(
             "pulled": pulled_only,
             "committed": False,
             "stashed": False,
+            "submodules": [],
             "status": git_workspace_status(workspace, expected_remote_url, remote) if pulled_only else status,
         }
     # 先把目标分支拉到远端最新，再决定怎么处理当前改动：拉不动就不该先提交一轮。
@@ -2773,12 +2775,13 @@ def git_prepare_branch(
             raise BridgeFailure(
                 f"处理改动后工作目录仍有 {remaining['changed']} 个待提交文件，可能有其它进程正在写入；请停止写入后重试"
             )
-    branch = git_checkout_reference(workspace, reference, remote)
+    branch, submodules = git_checkout_reference(workspace, reference, remote, keep_submodules)
     return {
         "branch": branch,
         "pulled": pulled,
         "committed": committed,
         "stashed": stashed,
+        "submodules": submodules,
         "previousBranch": status["currentBranch"],
         "status": git_workspace_status(workspace, expected_remote_url, remote),
     }
@@ -2831,6 +2834,54 @@ def git_dirty_submodule_workspaces(workspace: Path) -> list[Path]:
 
 def git_submodule_label(workspace: Path, submodule: Path) -> str:
     return submodule.resolve().relative_to(workspace.resolve()).as_posix()
+
+
+def git_sync_unselected_submodules(workspace: Path, targets: list[str]) -> list[dict[str, Any]]:
+    """切完分支后，把没被勾选的子模组同步到父仓库这条分支记录的 commit。
+
+    切分支本身不再带 --recurse-submodules：那是整仓行为，一个对象缺失或有本地改动的子模组
+    就能让整条需求分支都建不出来，而界面上勾没勾它完全不起作用。改成切完再逐个同步之后，
+    同步不动的子模组只留一条结果记录，不连累根工作目录和同一轮里的其它工程。
+
+    勾选中的子模组不在这里同步：它们下一步要建（或切到）自己的需求分支，
+    先 submodule update 会把它们检出成游离 HEAD，把那一步的活儿白做一遍。
+    """
+    selected = {str(name or "").strip().strip("/") for name in targets}
+    records: list[dict[str, Any]] = []
+    try:
+        # git_submodule_workspaces 是最内层在前，这里反过来：先更新外层，嵌套的那层才对得上新指针。
+        submodules = list(reversed(git_submodule_workspaces(workspace)))
+    except BridgeFailure as exc:
+        # 分支已经切好了，读不动子模组配置不该反过来变成整个动作失败。
+        return [{
+            "path": ".gitmodules",
+            "name": ".gitmodules",
+            "branch": "",
+            "baseBranch": "",
+            "created": False,
+            "switched": False,
+            "skipped": True,
+            "error": str(exc),
+        }]
+    for submodule in submodules:
+        label = git_submodule_label(workspace, submodule)
+        if label in selected:
+            continue
+        completed = run_git(
+            submodule.parent, ["submodule", "update", "--init", "--", submodule.name], timeout=600,
+        )
+        if completed.returncode != 0:
+            records.append({
+                "path": label,
+                "name": label,
+                "branch": "",
+                "baseBranch": "",
+                "created": False,
+                "switched": False,
+                "skipped": True,
+                "error": f"同步子模组 {label} 失败：{(completed.stdout or '').strip() or 'git 退出异常'}",
+            })
+    return records
 
 
 # 扫子项目时不进这些目录：依赖和产物目录里也可能躺着 .git，但它们不是这个项目的工程。
@@ -2949,15 +3000,18 @@ def git_subproject_targets_of(workspace: Path, raw: Any, branch: str = "", remot
     return targets
 
 
-def git_checkout_branch(workspace: Path, branch: str) -> None:
+def git_checkout_branch(
+    workspace: Path, branch: str, keep_submodules: list[str] | None = None,
+) -> list[dict[str, Any]]:
     """切换到已存在的本地分支；工作区有未提交改动时不强行切，交回给用户处理。"""
     if git_current_branch(workspace) == branch:
-        return
+        return []
     if git_worktree_dirty(workspace):
         raise BridgeFailure(f"工作目录有未提交改动，无法切换到分支 {branch}，请先提交或暂存")
-    completed = run_git(workspace, ["checkout", "--recurse-submodules", branch])
+    completed = run_git(workspace, ["checkout", branch])
     if completed.returncode != 0:
         raise BridgeFailure(f"切换分支 {branch} 失败：{(completed.stdout or '').strip() or 'git 退出异常'}")
+    return git_sync_unselected_submodules(workspace, keep_submodules or [])
 
 
 def git_default_remote(workspace: Path) -> str:
@@ -3217,7 +3271,9 @@ def git_sync_base_branch(workspace: Path, base_branch: str, remote: str = "origi
     return base_branch
 
 
-def git_create_branch(workspace: Path, base_branch: str, branch: str) -> dict[str, Any]:
+def git_create_branch(
+    workspace: Path, base_branch: str, branch: str, keep_submodules: list[str] | None = None,
+) -> dict[str, Any]:
     """从基准分支创建并切换到需求分支；分支已存在时只切换，不覆盖已有提交。"""
     if not valid_git_branch_name(base_branch):
         raise BridgeFailure("基准分支名不合法")
@@ -3232,19 +3288,22 @@ def git_create_branch(workspace: Path, base_branch: str, branch: str) -> dict[st
         raise BridgeFailure(f"需求分支名不符合 Git 规范：{branch}")
     if git_branch_exists(workspace, local):
         # 本机已有这条分支：切过去并拉到远端最新，不覆盖已有提交。
-        git_checkout_branch(workspace, local)
+        submodules = git_checkout_branch(workspace, local, keep_submodules)
         git_pull_branch(workspace, local)
-        return {"created": False, "baseBranch": base_branch, "branch": local}
+        return {"created": False, "baseBranch": base_branch, "branch": local, "submodules": submodules}
     if git_worktree_dirty(workspace):
         raise BridgeFailure("工作目录有未提交改动，无法创建需求分支，请先提交或暂存")
     if has_remote:
         run_git(workspace, ["fetch", remote, local], timeout=180)
         if run_git(workspace, ["rev-parse", "--verify", "--quiet", f"refs/remotes/{remote}/{local}"]).returncode == 0:
             # 别人已经推过同名分支：必须关联它，从基准分支另起一条会和远端分叉。
-            checkout = run_git(workspace, ["checkout", "--recurse-submodules", "-b", local, "--track", f"{remote}/{local}"])
+            checkout = run_git(workspace, ["checkout", "-b", local, "--track", f"{remote}/{local}"])
             if checkout.returncode != 0:
                 raise BridgeFailure(f"关联远端需求分支 {local} 失败：{(checkout.stdout or '').strip() or 'git 退出异常'}")
-            return {"created": False, "baseBranch": base_branch, "branch": local}
+            return {
+                "created": False, "baseBranch": base_branch, "branch": local,
+                "submodules": git_sync_unselected_submodules(workspace, keep_submodules or []),
+            }
     # 先把基准分支拉到最新，再从它切出去；基准分支是否存在也在这一步确认。
     base_reference = git_sync_base_branch(workspace, base_branch)
     # 从远端引用切出来时不要跟踪基准分支：需求分支后面要推到它自己的远端分支。
@@ -3252,10 +3311,13 @@ def git_create_branch(workspace: Path, base_branch: str, branch: str) -> dict[st
         workspace, ["rev-parse", "--verify", "--quiet", f"refs/remotes/{base_reference}"],
     ).returncode == 0
     track = ["--no-track"] if from_remote_ref else []
-    completed = run_git(workspace, ["checkout", "--recurse-submodules", *track, "-b", local, base_reference])
+    completed = run_git(workspace, ["checkout", *track, "-b", local, base_reference])
     if completed.returncode != 0:
         raise BridgeFailure(f"创建需求分支失败：{(completed.stdout or '').strip() or 'git 退出异常'}")
-    return {"created": True, "baseBranch": base_branch, "branch": local}
+    return {
+        "created": True, "baseBranch": base_branch, "branch": local,
+        "submodules": git_sync_unselected_submodules(workspace, keep_submodules or []),
+    }
 
 
 def git_effective_base_branch(workspace: Path, base_branch: str, remote: str = "origin") -> str:
@@ -3302,7 +3364,7 @@ def git_create_branch_targets(
             raise BridgeFailure(f"根工作目录还没有需求分支 {local}，请先创建需求分支")
         result: dict[str, Any] = {"created": False, "baseBranch": base_branch, "branch": local}
     else:
-        result = git_create_branch(workspace, base_branch, branch)
+        result = git_create_branch(workspace, base_branch, branch, targets)
         local = str(result["branch"])
     records: list[dict[str, Any]] = [{
         "path": "",
@@ -3313,6 +3375,8 @@ def git_create_branch_targets(
         "skipped": skip_root,
         "error": "",
     }]
+    # 勾中的子模组在下面单独建自己的需求分支，这里只带回没勾的那些的同步结果。
+    records.extend(result.pop("submodules", []))
     for relative in targets:
         record: dict[str, Any] = {
             "path": relative,
@@ -3350,7 +3414,9 @@ def git_prepare_branch_targets(
 
     子项目里没有这条分支时跳过：不是每个工程都参与这条需求，缺分支不算失败。
     """
-    result = git_prepare_branch(workspace, reference, strategy, commit_message, expected_remote_url, remote)
+    result = git_prepare_branch(
+        workspace, reference, strategy, commit_message, expected_remote_url, remote, keep_submodules=targets,
+    )
     branch = str(result["branch"])
     records: list[dict[str, Any]] = [{
         "path": "",
@@ -3360,6 +3426,7 @@ def git_prepare_branch_targets(
         "skipped": False,
         "error": "",
     }]
+    records.extend(result.pop("submodules", []))
     for relative in targets:
         record: dict[str, Any] = {
             "path": relative,
