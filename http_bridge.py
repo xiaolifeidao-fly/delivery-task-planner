@@ -2818,7 +2818,9 @@ def git_submodule_workspaces(workspace: Path) -> list[Path]:
                 child.relative_to(root)
             except ValueError as exc:
                 raise BridgeFailure("子模块路径超出项目工作目录") from exc
-            if child in seen or run_git(child, ["rev-parse", "--is-inside-work-tree"]).returncode != 0:
+            # 没初始化的子模组只是个空目录，rev-parse 会一路走到父仓库照样说「在工作树里」。
+            # 只有自带 .git（子模组是一个 gitfile）才算真的检出过，能当成独立工作区来读写。
+            if child in seen or not (child / ".git").exists():
                 continue
             seen.add(child)
             collect(child)
@@ -2867,8 +2869,10 @@ def git_sync_unselected_submodules(workspace: Path, targets: list[str]) -> list[
         label = git_submodule_label(workspace, submodule)
         if label in selected:
             continue
+        # 不带 --init：这里只把已经检出的子模组对齐到新指针，绝不顺手克隆一个新的。
+        # 建分支是个前台动作，超时按分钟算，不能让一次慢 fetch 把整个弹窗挂住。
         completed = run_git(
-            submodule.parent, ["submodule", "update", "--init", "--", submodule.name], timeout=600,
+            submodule.parent, ["submodule", "update", "--", submodule.name], timeout=120,
         )
         if completed.returncode != 0:
             records.append({

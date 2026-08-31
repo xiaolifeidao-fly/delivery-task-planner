@@ -5014,6 +5014,29 @@ class GitBranchTest(unittest.TestCase):
         )
         return self.workspace / name
 
+    def test_branch_creation_never_clones_an_uninitialized_submodule(self):
+        """没检出过的子模组只是个空目录：切分支不该顺手把它整个 clone 下来。"""
+        self.make_submodule("galactus")
+        subprocess.run(
+            ["git", "-C", str(self.workspace), "submodule", "deinit", "-f", "galactus"],
+            check=True, capture_output=True,
+        )
+        self.assertEqual(["galactus"], bridge.git_pending_submodules(self.workspace))
+
+        calls: list[list[str]] = []
+        real_run_git = bridge.run_git
+
+        def record(workspace, args, **kwargs):
+            calls.append(list(args))
+            return real_run_git(workspace, args, **kwargs)
+
+        with patch.object(bridge, "run_git", side_effect=record):
+            bridge.git_create_branch_targets(self.workspace, "main", "feature/issue_req-1", [])
+
+        self.assertEqual([], [args for args in calls if args[:2] == ["submodule", "update"]])
+        self.assertEqual(["galactus"], bridge.git_pending_submodules(self.workspace))
+        self.assertEqual("feature/issue_req-1", bridge.git_current_branch(self.workspace))
+
     def test_branch_creation_survives_a_submodule_that_cannot_be_updated(self):
         """基准分支记着一个本机取不到的子模组 commit 时，需求分支照样要建出来。"""
         self.make_submodule("galactus")
