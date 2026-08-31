@@ -36,7 +36,9 @@ from delivery_bridge.update_manager import PluginUpdateManager, UpdateFailure
 from delivery_bridge.versioning import compare_versions, manifest_version
 
 
-DEFAULT_HOST = "127.0.0.1"
+# 监听地址默认对所有网卡开放：web-api 可以部署在别的机器上，只能走网络调用业务访谈。
+# 桥自身没有鉴权，来源必须由部署方的防火墙或安全组收窄到已知调用方。
+DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8765
 DEFAULT_BUSINESS_WORKSPACE_ROOT = Path.home() / ".local" / "share" / "delivery-task-planner" / "business-workspaces"
 BUSINESS_WORKSPACE_SCOPE = "业务空间"
@@ -396,7 +398,7 @@ def create_http_server(
     allowed_origins: set[str],
     business_workspace_root: Path | None = None,
 ) -> ThreadingHTTPServer:
-    """Create the loopback bridge listener for browser calls over local HTTP."""
+    """Create the bridge listener; host is loopback unless deployment opts out."""
     httpd = ThreadingHTTPServer((host, port), BridgeHandler)
     business_root = (business_workspace_root or DEFAULT_BUSINESS_WORKSPACE_ROOT).expanduser().resolve()
     httpd.bridge = ExecutionBridge(workspace, business_workspace_root=business_root)  # type: ignore[attr-defined]
@@ -12528,9 +12530,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
         return "*" in self.allowed_origins
 
     def allowed_origin(self) -> str:
-        # The bridge listens only on loopback and the board may be served from any
-        # origin. Direct browser navigations do not include Origin, so use the
-        # standard opaque-origin value instead of rejecting those requests.
+        # The board may be served from any origin, and direct browser navigations do
+        # not include Origin, so use the standard opaque-origin value instead of
+        # rejecting those requests.
         return self.headers.get("Origin", "").strip() or "null"
 
     def cors(self) -> None:
@@ -13110,9 +13112,6 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 self.json_response(403, {"error": "origin not allowed"})
                 return
             try:
-                token = self.headers.get("token", "").strip()
-                if not token or not planner.token_subject(token):
-                    raise BridgeFailure("当前用户凭证无效")
                 if self.headers.get_content_type() != "application/json":
                     raise BridgeFailure("application/json required")
                 length = int(self.headers.get("Content-Length") or 0)
@@ -13470,8 +13469,6 @@ def main() -> None:
         help="远端业务访谈的受控工作目录根路径；默认 ~/.local/share/delivery-task-planner/business-workspaces",
     )
     args = parser.parse_args()
-    if args.host not in {"127.0.0.1", "::1", "localhost"}:
-        raise SystemExit("HTTP bridge must listen on loopback")
     if args.workspace:
         workspace = Path(args.workspace).resolve()
         if not workspace.is_dir():

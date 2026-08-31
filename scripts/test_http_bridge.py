@@ -124,6 +124,23 @@ class HttpBridgeTest(unittest.TestCase):
         self.assertEqual({"*"}, server.allowed_origins)
         self.assertEqual(business_root, server.business_workspace_root)
 
+    def test_main_binds_every_interface_without_a_host_argument(self):
+        server = unittest.mock.MagicMock()
+        argv = ["http_bridge.py", "--port", "8765"]
+
+        with (
+            patch.object(bridge.sys, "argv", argv),
+            patch.object(bridge, "placeholder_workspace", return_value=Path("/workspace")),
+            patch.object(bridge, "create_http_server", return_value=server) as create,
+            patch.object(bridge.threading, "Thread"),
+            patch.object(bridge.THREAD_READERS, "shutdown"),
+        ):
+            bridge.main()
+
+        self.assertEqual("0.0.0.0", create.call_args.args[0])
+        self.assertEqual(8765, create.call_args.args[1])
+        server.serve_forever.assert_called_once_with()
+
     def test_http_server_uses_default_business_workspace_root(self):
         server = unittest.mock.MagicMock()
 
@@ -200,6 +217,31 @@ class HttpBridgeTest(unittest.TestCase):
         self.assertEqual((200, {"installed": True, "version": "0.4.0+codex.test"}), responses[0])
         self.assertEqual((200, {"value": "delivery-task-planner-python-runtime-v6"}), responses[1])
         disk_version.assert_not_called()
+
+    def test_plugin_update_install_does_not_require_a_user_token(self):
+        payload = json.dumps({"expectedVersion": "1.2.3"}).encode("utf-8")
+        handler = object.__new__(bridge.BridgeHandler)
+        handler.server = SimpleNamespace(allowed_origins={"*"}, bridge=unittest.mock.MagicMock())
+        handler.server.bridge.active_run_count.return_value = 0
+        handler.headers = Message()
+        handler.headers["Content-Type"] = "application/json"
+        handler.headers["Content-Length"] = str(len(payload))
+        handler.rfile = io.BytesIO(payload)
+        handler.path = "/v1/plugin/update/install"
+        responses = []
+        handler.json_response = lambda status, value: responses.append((status, value))
+
+        job = {"jobId": "job-1", "status": "resolving"}
+        with (
+            patch.object(bridge.PLUGIN_UPDATES, "start", return_value=job) as start,
+            patch.object(bridge, "complete_plugin_update_in_background") as complete,
+        ):
+            handler.do_POST()
+
+        start.assert_called_once_with("1.2.3")
+        handler.server.bridge.active_run_count.assert_called_once_with()
+        complete.assert_called_once_with("job-1", handler.server.bridge)
+        self.assertEqual([(202, {"jobId": "job-1", "status": "resolving", "activeRuns": 0})], responses)
 
     def test_silent_update_waits_for_active_runs_before_restarting(self):
         local_bridge = unittest.mock.MagicMock()

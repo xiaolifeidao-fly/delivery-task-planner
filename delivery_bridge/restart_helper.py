@@ -94,7 +94,8 @@ def bridge_health_url(bridge_args: Sequence[str]) -> str:
             port = int(bridge_args[index + 1])
         elif value.startswith("--port="):
             port = int(value.split("=", 1)[1])
-    if host == "localhost":
+    if host in {"localhost", "0.0.0.0", "::", "*", ""}:
+        # 通配绑定不是一个可拨的地址；健康检查始终走回环。
         host = "127.0.0.1"
     if ":" in host and not host.startswith("["):
         host = f"[{host}]"

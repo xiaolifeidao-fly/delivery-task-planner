@@ -112,6 +112,14 @@ class RestartHelperTest(unittest.TestCase):
             restart_helper.bridge_health_url(["--host", "::1", "--port=9876"]),
         )
 
+    def test_bridge_health_url_dials_loopback_for_a_wildcard_bind(self):
+        for host in ("0.0.0.0", "::", ""):
+            with self.subTest(host=host):
+                self.assertEqual(
+                    "http://127.0.0.1:8765/healthz",
+                    restart_helper.bridge_health_url(["--host", host]),
+                )
+
     def test_windows_service_arguments_preserve_workspace_and_origin(self):
         self.assertEqual(
             ("C:\\work tree", "https://console.example"),
