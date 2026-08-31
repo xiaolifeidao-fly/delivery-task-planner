@@ -2942,7 +2942,10 @@ def git_branch_reference_exists(workspace: Path, branch: str, remote: str = "ori
         return False
     if git_branch_exists(workspace, branch):
         return True
-    return run_git(workspace, ["rev-parse", "--verify", "--quiet", f"refs/remotes/{remote}/{branch}"]).returncode == 0
+    # 分支名本身可能已经带了远端前缀（下拉里选的是 origin/main）；再拼一次会查成 origin/origin/main，
+    # 结果把明明存在的基准分支判成不存在。
+    reference = branch if branch.startswith(f"{remote}/") else f"{remote}/{branch}"
+    return run_git(workspace, ["rev-parse", "--verify", "--quiet", f"refs/remotes/{reference}"]).returncode == 0
 
 
 def git_project_snapshot(workspace: Path, relative: str, branch: str = "", remote: str = "origin") -> dict[str, Any]:
@@ -3329,23 +3332,28 @@ def git_create_branch(
 
 
 def git_effective_base_branch(workspace: Path, base_branch: str, remote: str = "origin") -> str:
-    """子项目不一定有同名基准分支：没有就退回它自己的默认分支，而不是直接建不出来。"""
+    """子项目不一定有同名基准分支：没有就退回它自己的主干，而不是直接建不出来。
+
+    回落只认主干，绝不认「当前分支」：子项目常常还停在上一条需求分支上，从那里切出去
+    会把上一条需求的提交整个带进新需求分支，而且看不出来。宁可报错也不要切错基准。
+    """
     if git_branch_reference_exists(workspace, base_branch, remote):
         return base_branch
-    listed = git_output(
-        workspace,
-        ["for-each-ref", "--format=%(refname:short)", "refs/heads", "refs/remotes"],
-        "读取 Git 分支失败",
+    candidates: list[str] = []
+    # origin/HEAD 是远端自己声明的主干，比猜名字准；没同步过这条符号引用时才轮到下面的常见名。
+    head = run_git(workspace, ["symbolic-ref", "--quiet", "--short", f"refs/remotes/{remote}/HEAD"])
+    if head.returncode == 0:
+        candidates.append((head.stdout or "").strip())
+    # 只认主干名，按常见程度排；develop 排在最后，主干真叫它的仓库才会用到。
+    candidates.extend([
+        f"{remote}/main", f"{remote}/master", f"{remote}/develop", "main", "master", "develop",
+    ])
+    for candidate in candidates:
+        if candidate and git_branch_reference_exists(workspace, candidate, remote):
+            return candidate
+    raise BridgeFailure(
+        f"子项目里没有基准分支 {base_branch}，也找不到 {remote}/main、{remote}/master 这样的主干可以退回"
     )
-    remote_names = set(git_output(workspace, ["remote"], "读取 Git 远端失败").split())
-    branches = [
-        name for name in (line.strip() for line in listed.splitlines())
-        if name and not name.endswith("/HEAD") and name not in remote_names
-    ]
-    fallback = git_default_branch(workspace, branches)
-    if not fallback:
-        raise BridgeFailure(f"子项目里没有基准分支 {base_branch}，也找不到可用的默认分支")
-    return fallback
 
 
 def git_create_branch_targets(

@@ -5123,6 +5123,95 @@ class GitBranchTest(unittest.TestCase):
         self.assertEqual(["", "galactus"], [record["path"] for record in result["results"]])
         self.assertTrue(all(not record["error"] for record in result["results"]))
 
+    def give_origin(self, child: Path) -> Path:
+        """给子工程配一个真实的 origin，并把它当前的主干推上去。"""
+        remote = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(remote, ignore_errors=True))
+        subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(child), "remote", "add", "origin", str(remote)], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(child), "push", "origin", "HEAD"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(child), "fetch", "origin"], check=True, capture_output=True)
+        return remote
+
+    def strand_on_previous_requirement(self, child: Path) -> None:
+        """把子工程留在上一条需求分支上，并带一个只属于那条分支的提交。"""
+        subprocess.run(
+            ["git", "-C", str(child), "checkout", "-b", "feature/issue_req-0"], check=True, capture_output=True,
+        )
+        (child / "leak.txt").write_text("上一条需求的提交", encoding="utf-8")
+        subprocess.run(["git", "-C", str(child), "add", "."], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(child), "commit", "-m", "previous requirement"], check=True, capture_output=True)
+
+    def test_branch_reference_lookup_accepts_a_remote_prefixed_name(self):
+        """origin/main 已经带了远端前缀，不能再拼一次查成 origin/origin/main。"""
+        child = self.make_subproject("galactus")
+        self.give_origin(child)
+
+        self.assertTrue(bridge.git_branch_reference_exists(child, "origin/main"))
+        self.assertTrue(bridge.git_branch_reference_exists(child, "main"))
+        self.assertFalse(bridge.git_branch_reference_exists(child, "origin/nope"))
+
+    def test_subproject_cuts_from_a_remote_prefixed_base_branch(self):
+        """基准分支选 origin/main 时，子项目要从 origin/main 切，而不是从它当前停着的需求分支切。"""
+        child = self.make_subproject("galactus")
+        self.give_origin(child)
+        self.strand_on_previous_requirement(child)
+        self.add_origin()
+        subprocess.run(
+            ["git", "-C", str(self.workspace), "push", "origin", "main"], check=True, capture_output=True,
+        )
+
+        result = bridge.git_create_branch_targets(
+            self.workspace, "origin/main", "feature/issue_req-1", ["galactus"],
+        )
+
+        record = next(item for item in result["results"] if item["path"] == "galactus")
+        self.assertEqual("", record["error"])
+        self.assertEqual("origin/main", record["baseBranch"])
+        self.assertEqual("feature/issue_req-1", bridge.git_current_branch(child))
+        # 上一条需求分支上的提交绝不能被带进新分支。
+        self.assertFalse((child / "leak.txt").exists())
+
+    def test_subproject_base_falls_back_to_the_trunk_instead_of_the_current_branch(self):
+        """子项目没有同名基准分支时退回主干；停在哪条需求分支上都不作数。"""
+        child = self.make_subproject("galactus")
+        self.strand_on_previous_requirement(child)
+        subprocess.run(["git", "-C", str(self.workspace), "branch", "legacy"], check=True, capture_output=True)
+
+        result = bridge.git_create_branch_targets(self.workspace, "legacy", "feature/issue_req-1", ["galactus"])
+
+        record = next(item for item in result["results"] if item["path"] == "galactus")
+        self.assertEqual("", record["error"])
+        self.assertEqual("main", record["baseBranch"])
+        self.assertEqual("feature/issue_req-1", bridge.git_current_branch(child))
+        self.assertFalse((child / "leak.txt").exists())
+
+    def test_subproject_base_falls_back_to_master_when_there_is_no_main(self):
+        """主干叫 master 的子项目要退回 origin/master，不能因为没有 main 就用当前分支。"""
+        child = self.make_subproject("kakrolot", branch="master")
+        self.give_origin(child)
+        self.strand_on_previous_requirement(child)
+        subprocess.run(["git", "-C", str(self.workspace), "branch", "legacy"], check=True, capture_output=True)
+
+        result = bridge.git_create_branch_targets(self.workspace, "legacy", "feature/issue_req-1", ["kakrolot"])
+
+        record = next(item for item in result["results"] if item["path"] == "kakrolot")
+        self.assertEqual("", record["error"])
+        self.assertIn(record["baseBranch"], ("origin/master", "master"))
+        self.assertFalse((child / "leak.txt").exists())
+
+    def test_subproject_without_any_trunk_reports_an_error_instead_of_guessing(self):
+        """连 main / master 都找不到时宁可报错，也不要拿当前分支凑合。"""
+        child = self.make_subproject("surfer", branch="feature/issue_req-0")
+
+        result = bridge.git_create_branch_targets(self.workspace, "main", "feature/issue_req-1", ["surfer"])
+
+        record = next(item for item in result["results"] if item["path"] == "surfer")
+        self.assertIn("master", record["error"])
+        self.assertFalse(record["created"])
+        # 子项目要原地不动，不能被切到半路上。
+        self.assertEqual("feature/issue_req-0", bridge.git_current_branch(child))
+
     def test_pending_submodules_are_initialized_with_the_workspace(self):
         # 造一个带子模块的远端仓库，模拟「clone 下来但子模块还是空目录」。
         module = Path(tempfile.mkdtemp())
