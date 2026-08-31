@@ -3472,6 +3472,206 @@ def git_prepare_branch_targets(
     return result
 
 
+# ---------------------------------------------------------------------------
+# 时间计划的分支合并。三个方向共用同一套「target ← sources」机制：
+#   - 回合基线：target = 计划分支，sources = [基线分支]
+#   - 合并需求：target = 计划分支，sources = [各需求分支]
+#   - 回推基线：target = 基线分支，sources = [计划分支]
+# 每个方向都先出一份预览（哪些工程参与、各改了多少文件），由用户勾选后再真正合并。
+# ---------------------------------------------------------------------------
+
+# 解冲突可能要读不少代码，按一轮完整会话的量级给，和修推送同一个数量级。
+GIT_MERGE_REPAIR_TIMEOUT_SECONDS = 20 * 60
+
+
+def git_merge_resolved_ref(workspace: Path, branch: str, remote: str = "origin") -> str:
+    """把分支名解析成本机此刻可用的引用，优先远端最新。
+
+    合并要合的是「远端上那一版」，不是本机可能落后好几天的同名本地分支；
+    远端没有这条分支时（纯本地分支、还没推过的计划分支）才退回本地引用。
+    """
+    value = str(branch or "").strip()
+    if not valid_git_branch_name(value):
+        raise BridgeFailure(f"分支名不合法：{branch}")
+    remote_prefix = f"{remote}/"
+    remote_side = value[len(remote_prefix):] if value.startswith(remote_prefix) else value
+    remote_ref = f"{remote}/{remote_side}"
+    if run_git(workspace, ["rev-parse", "--verify", "--quiet", f"refs/remotes/{remote_ref}"]).returncode == 0:
+        return remote_ref
+    if git_branch_exists(workspace, value):
+        return value
+    return ""
+
+
+def git_merge_changed_files(workspace: Path, target_ref: str, source_ref: str) -> list[str]:
+    """source 相对合并基准改了哪些文件。
+
+    用三点 diff：只算源分支自己带来的改动，不把目标分支上别人的提交也算进来，
+    否则计划分支越往后走，每条需求显示的文件数都会虚高。
+    """
+    completed = run_git(workspace, ["diff", "--name-only", f"{target_ref}...{source_ref}"], timeout=120)
+    if completed.returncode != 0:
+        return []
+    return [line.strip() for line in (completed.stdout or "").splitlines() if line.strip()]
+
+
+def git_merge_ahead_commits(workspace: Path, target_ref: str, source_ref: str) -> int:
+    """source 上还没进 target 的提交数；为 0 表示这一条已经合过了。"""
+    completed = run_git(workspace, ["rev-list", "--count", f"{target_ref}..{source_ref}"])
+    if completed.returncode != 0:
+        return 0
+    return int((completed.stdout or "0").strip() or 0)
+
+
+def git_merge_project_preview(
+    workspace: Path, relative: str, target: str, sources: list[str], remote: str = "origin",
+) -> dict[str, Any]:
+    """单个工程的合并预览。读不动的工程只带回原因，不连累同级的其它工程。"""
+    record: dict[str, Any] = {
+        "path": relative,
+        "name": relative or workspace.name,
+        "workspace": str(workspace),
+        "hasTarget": False,
+        "targetRef": "",
+        "dirty": False,
+        "currentBranch": "",
+        "changedFiles": 0,
+        "sources": [],
+        "error": "",
+    }
+    try:
+        require_git_workspace(workspace)
+        # 预览必须基于远端最新：拿本机过时的引用算出来的文件数会误导勾选。
+        git_fetch_all(workspace, remote)
+        record["currentBranch"] = git_current_branch(workspace)
+        record["dirty"] = git_worktree_dirty(workspace)
+        target_ref = git_merge_resolved_ref(workspace, target, remote)
+        record["hasTarget"] = bool(target_ref)
+        record["targetRef"] = target_ref
+        changed_paths: set[str] = set()
+        for source in sources:
+            entry: dict[str, Any] = {
+                "branch": source,
+                "exists": False,
+                "sourceRef": "",
+                "changedFiles": 0,
+                "commits": 0,
+            }
+            source_ref = git_merge_resolved_ref(workspace, source, remote)
+            entry["exists"] = bool(source_ref)
+            entry["sourceRef"] = source_ref
+            if source_ref and target_ref:
+                files = git_merge_changed_files(workspace, target_ref, source_ref)
+                entry["changedFiles"] = len(files)
+                entry["commits"] = git_merge_ahead_commits(workspace, target_ref, source_ref)
+                changed_paths.update(files)
+            record["sources"].append(entry)
+        # 工程层面按去重后的文件数报：两条需求改同一个文件，勾选面板上不该显示成两个。
+        record["changedFiles"] = len(changed_paths)
+    except BridgeFailure as exc:
+        record["error"] = str(exc)
+    return record
+
+
+def git_merge_preview(
+    workspace: Path, target: str, sources: list[str], remote: str = "origin",
+) -> dict[str, Any]:
+    """根工作目录加一级子项目的合并预览，供合并弹窗按工程勾选。"""
+    if not str(target or "").strip():
+        raise BridgeFailure("缺少目标分支")
+    branches = [str(value or "").strip() for value in sources if str(value or "").strip()]
+    if not branches:
+        raise BridgeFailure("缺少要合并的来源分支")
+    projects = [git_merge_project_preview(workspace, "", target, branches, remote)]
+    for child in git_subproject_workspaces(workspace):
+        projects.append(git_merge_project_preview(child, child.name, target, branches, remote))
+    return {"workspace": str(workspace), "target": target, "sources": branches, "projects": projects}
+
+
+def build_git_merge_repair_prompt(
+    workspace: Path, target: str, source: str, remote: str, failure: str, conflicts: list[str],
+) -> str:
+    """合并冲突时交给 AI 的提示词。只授权它解决这一次合并的冲突，不允许顺手改别的实现。"""
+    return wrap_bridge_context(
+        [
+            "这是交付任务面板的「时间计划分支合并」回合：面板执行 git merge 时遇到冲突，"
+            "仓库现在停在冲突状态，请你在本机把冲突解决掉并完成这次合并提交。",
+            workspace_instruction(workspace),
+            f"目标分支（当前所在分支）: {target}",
+            f"来源分支: {source}",
+            f"远端: {remote}",
+            "",
+            "冲突文件:",
+            *([f"- {path}" for path in conflicts] or ["- （git 没有列出具体文件，请自行用 git status 确认）"]),
+            "",
+            "git merge 的原始输出:",
+            failure,
+            "",
+            "处理要求:",
+            f"- 仓库正处于 merge 冲突中，目标分支是 {target}，不要 --abort，也不要切到别的分支。",
+            "- 逐个文件解决冲突：两边的真实意图都要保留，不要为了让命令通过就整块采用一侧或删掉别人的改动。",
+            "- 冲突涉及业务逻辑时，先读双方改动所在的上下文再决定合并结果，必要时读相关实现文件。",
+            "- 不要修改与本次冲突无关的文件，不要顺手重构。",
+            "- 解决完执行 git add 与 git commit 完成这次合并提交；不要 push，推送由面板统一负责。",
+            "- 解决不了（需要人工决策的业务取舍）就停下来说明卡在哪个文件、两边分别想做什么，不要瞎猜。",
+            "- 回复里逐条列出：改了哪些文件、每个冲突各自采用了什么结论。面板会把这段说明原样展示给用户。",
+        ],
+        f"合并 {source} 到 {target} 时发生冲突，请解决冲突并完成合并提交。",
+    )
+
+
+def git_merge_conflict_files(workspace: Path) -> list[str]:
+    """当前处于冲突状态的文件清单。"""
+    completed = run_git(workspace, ["diff", "--name-only", "--diff-filter=U"])
+    if completed.returncode != 0:
+        return []
+    return [line.strip() for line in (completed.stdout or "").splitlines() if line.strip()]
+
+
+def git_merge_in_progress(workspace: Path) -> bool:
+    """仓库是不是还停在一次没收尾的合并里。
+
+    用 rev-parse 问 git 而不是看 .git/MERGE_HEAD 这个路径：子模组的 .git 是一个指向别处的
+    文件，按路径拼永远判不出来，会把停在冲突里的子项目当成干净仓库继续往下走。
+    """
+    if run_git(workspace, ["rev-parse", "--verify", "--quiet", "MERGE_HEAD"]).returncode == 0:
+        return True
+    return bool(git_merge_conflict_files(workspace))
+
+
+def git_merge_one(
+    workspace: Path, target: str, source_ref: str, source_label: str,
+) -> dict[str, Any]:
+    """把一条来源分支合进当前已经切好的目标分支。
+
+    返回 conflict=True 时仓库仍停在冲突状态，交给调用方决定是否起 AI 来解；
+    这里不 --abort，abort 掉就没法把冲突现场交给 AI 了。
+    """
+    record: dict[str, Any] = {
+        "branch": source_label,
+        "merged": False,
+        "upToDate": False,
+        "conflict": False,
+        "conflictFiles": [],
+        "output": "",
+    }
+    if git_merge_ahead_commits(workspace, target, source_ref) == 0:
+        record["upToDate"] = True
+        return record
+    message = f"Merge branch '{source_label}' into {target}"
+    completed = run_git(workspace, ["merge", "--no-ff", "-m", message, source_ref], timeout=300)
+    output = (completed.stdout or "").strip()
+    record["output"] = output[-2000:]
+    if completed.returncode == 0:
+        record["merged"] = True
+        return record
+    conflicts = git_merge_conflict_files(workspace)
+    if not conflicts and not git_merge_in_progress(workspace):
+        raise BridgeFailure(f"合并 {source_label} 到 {target} 失败：{output or 'git 退出异常'}")
+    record["conflict"] = True
+    record["conflictFiles"] = conflicts
+    return record
+
 def git_repository_url_of(value: Any) -> str:
     """关联远端只接受完整的仓库地址；带空白、换行或以 - 开头的输入直接拒绝。"""
     url = str(value or "").strip()
@@ -9312,6 +9512,209 @@ class ExecutionBridge:
             "error": "",
         }, *children]
 
+    def merge_time_plan_branches(self, raw: Any, config: dict[str, Any] | None = None) -> dict[str, Any]:
+        """时间计划的分支合并：把若干来源分支合进目标分支，冲突交给 AI 解，最后推送。
+
+        三个方向（回合基线 / 合并需求分支 / 回推基线）都走这里，只是 target 和 sources 不同。
+        执行顺序是「先子项目、最后根工作目录」：子模组的新提交在根仓库里表现为 gitlink，
+        根仓库最后推才能把指针一并带上。单个工程失败只记在结果里，不回滚已经合好的工程 ——
+        把已完成的部分撤掉比留着更难收拾。
+        """
+        if not isinstance(raw, dict):
+            raise BridgeFailure("请求体必须是 JSON 对象")
+        program_id = program_id_of(raw.get("programId"))
+        if not program_id:
+            raise BridgeFailure("缺少项目标识")
+        target = str(raw.get("target") or "").strip()
+        if not target:
+            raise BridgeFailure("缺少目标分支")
+        sources = [str(value or "").strip() for value in (raw.get("sources") or []) if str(value or "").strip()]
+        if not sources:
+            raise BridgeFailure("缺少要合并的来源分支")
+        remote = str(raw.get("remoteName") or "origin").strip() or "origin"
+        push = raw.get("push") is not False
+        provider = ai_provider_of(raw)
+        model = str(raw.get("model") or "").strip()
+        reasoning_effort = reasoning_effort_of(raw, provider)
+        fast_mode = fast_mode_of(raw, provider)
+        # 合并会切分支、改工作区文件，本机还有任务在跑时不能动。
+        with self.lock:
+            busy = sorted(key for _, _, key in self.active)
+        if busy:
+            raise BridgeFailure(f"本机仍有任务在执行（{', '.join(busy)}），不能合并计划分支")
+        # 勾选哪些子项目由合并弹窗说了算，不做「没传就全合」的猜测。
+        targets = git_subproject_targets_of(self.workspace, raw.get("targets") or [])
+        skip_root = bool(raw.get("skipRoot"))
+        config = request_scoped_config(config, "", program_id)
+
+        records: list[dict[str, Any]] = []
+        for relative in targets:
+            child = git_subproject_workspace_of(self.workspace, relative)
+            if child == self.workspace.resolve():
+                continue
+            records.append(self._merge_one_project(
+                child, relative, target, sources, remote, push,
+                config, program_id, provider, model, reasoning_effort, fast_mode,
+            ))
+        if not skip_root:
+            records.insert(0, self._merge_one_project(
+                self.workspace, "", target, sources, remote, push,
+                config, program_id, provider, model, reasoning_effort, fast_mode,
+            ))
+        return {
+            "target": target,
+            "sources": sources,
+            "remote": remote,
+            "pushed": push and all(record["pushed"] or record["skipped"] for record in records),
+            # 只要有一个工程没成，面板就要把它标出来，不能因为整体 200 就当作全合上了。
+            "failed": [record["name"] for record in records if record["error"]],
+            "results": records,
+        }
+
+    def _merge_one_project(
+        self,
+        workspace: Path,
+        relative: str,
+        target: str,
+        sources: list[str],
+        remote: str,
+        push: bool,
+        config: dict[str, Any],
+        program_id: int,
+        provider: str,
+        model: str,
+        reasoning_effort: str,
+        fast_mode: bool,
+    ) -> dict[str, Any]:
+        """一个工程里的完整合并：切目标分支 → 逐条合来源 → 冲突交 AI → 推送。"""
+        record: dict[str, Any] = {
+            "path": relative,
+            "name": relative or workspace.name,
+            "branch": target,
+            "merged": [],
+            "resolutions": [],
+            "pushed": False,
+            "skipped": False,
+            "error": "",
+        }
+        try:
+            require_git_workspace(workspace)
+            if git_merge_in_progress(workspace):
+                raise BridgeFailure("上一次合并还没收尾（仓库仍处于 merge 状态），请先在本机处理完再重试")
+            if git_worktree_dirty(workspace):
+                raise BridgeFailure("工作目录有未提交改动，无法合并，请先提交或暂存")
+            target_ref = git_merge_resolved_ref(workspace, target, remote)
+            if not target_ref:
+                # 这个工程没有目标分支：多工程工作目录里不是每个工程都参与这条计划。
+                record["skipped"] = True
+                return record
+            # 切到目标分支并拉到远端最新，再往上合，避免合到过时的基础上。
+            local, _ = git_checkout_reference(workspace, target, remote)
+            record["branch"] = local
+            git_pull_branch(workspace, local, remote)
+            merged_any = False
+            for source in sources:
+                source_ref = git_merge_resolved_ref(workspace, source, remote)
+                if not source_ref:
+                    # 这个工程里没有这条来源分支：不是每个工程都参与每条需求，不算失败。
+                    record["merged"].append({
+                        "branch": source, "merged": False, "upToDate": False,
+                        "conflict": False, "missing": True, "conflictFiles": [], "output": "",
+                    })
+                    continue
+                outcome = git_merge_one(workspace, local, source_ref, source)
+                outcome["missing"] = False
+                if outcome["conflict"]:
+                    summary, status = self._resolve_git_merge_conflict(
+                        workspace, config, program_id, local, source, remote,
+                        outcome["output"], outcome["conflictFiles"],
+                        provider, model, reasoning_effort, fast_mode,
+                    )
+                    record["resolutions"].append({
+                        "project": record["name"],
+                        "branch": source,
+                        "files": outcome["conflictFiles"],
+                        "status": status,
+                        "summary": summary,
+                    })
+                    # 以仓库的真实状态判定，不采信 AI 的自述：合并没收尾就是没解决。
+                    if git_merge_in_progress(workspace):
+                        run_git(workspace, ["merge", "--abort"], timeout=120)
+                        raise BridgeFailure(
+                            f"合并 {source} 到 {local} 的冲突，{provider_label(provider)} 也没能解决，"
+                            f"已回滚这次合并。冲突文件：{', '.join(outcome['conflictFiles']) or '未知'}。"
+                            f"处理说明：{summary or '无'}"
+                        )
+                    outcome["conflict"] = False
+                    outcome["resolved"] = True
+                    outcome["merged"] = True
+                if outcome["merged"]:
+                    merged_any = True
+                record["merged"].append(outcome)
+            if not push:
+                return record
+            if not merged_any and git_branch_synced(workspace, local, remote):
+                # 没有新提交，也没有落后远端：这个工程本来就是最新的，不必再推一次。
+                record["pushed"] = True
+                return record
+            completed = run_git(workspace, ["push", "--set-upstream", remote, f"{local}:{local}"], timeout=300)
+            if completed.returncode != 0:
+                raise BridgeFailure(
+                    f"推送分支 {local} 失败：{(completed.stdout or '').strip() or 'git 退出异常'}"
+                )
+            record["pushed"] = True
+        except BridgeFailure as exc:
+            record["error"] = str(exc)
+        return record
+
+    def _resolve_git_merge_conflict(
+        self,
+        workspace: Path,
+        config: dict[str, Any],
+        program_id: int,
+        target: str,
+        source: str,
+        remote: str,
+        failure: str,
+        conflicts: list[str],
+        provider: str,
+        model: str,
+        reasoning_effort: str,
+        fast_mode: bool,
+    ) -> tuple[str, str]:
+        """起一轮 AI 会话专门解这一次合并冲突，返回它对「解决了什么」的说明。
+
+        超时就掐掉进程，不让 HTTP 请求无限期挂着；调用方随后用仓库状态复核结果。
+        """
+        client = create_ai_client(provider, workspace, None, codex_environment(config, program_id))
+        try:
+            thread_id, turn_id = client.start_task(
+                f"解决 {source} 合并到 {target} 的冲突",
+                build_git_merge_repair_prompt(workspace, target, source, remote, failure, conflicts),
+                None,
+                model,
+                reasoning_effort=reasoning_effort,
+                fast_mode=fast_mode,
+            )
+            outcome: dict[str, str] = {}
+
+            def wait() -> None:
+                try:
+                    outcome["status"] = client.wait_turn(turn_id)
+                except Exception as exc:
+                    print(f"解合并冲突等待失败：{exc}", file=sys.stderr, flush=True)
+
+            waiter = threading.Thread(target=wait, daemon=True)
+            waiter.start()
+            waiter.join(GIT_MERGE_REPAIR_TIMEOUT_SECONDS)
+            if waiter.is_alive():
+                return "", "timeout"
+            status = outcome.get("status") or "failed"
+            turn = client.read_turn(thread_id, turn_id, client.next_request_id())
+            return final_agent_text_from_output(execution_output(status, turn)), status
+        finally:
+            client.close()
+
     def _repair_git_push(
         self,
         config: dict[str, Any],
@@ -12818,6 +13221,31 @@ class BridgeHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self.json_response(500, {"error": f"读取子项目 Git 状态失败：{exc}"})
             return
+        if parsed.path == "/v1/codex/git/merge-preview":
+            if not self.allowed_origin():
+                self.json_response(403, {"error": "origin not allowed"})
+                return
+            query = parse_qs(parsed.query)
+            program_id = program_id_of((query.get("programId") or [""])[0])
+            try:
+                self.bridge.request_config(
+                    {"programId": program_id},
+                    self.allowed_origin() or "",
+                    self.headers.get("token", "").strip(),
+                )
+                selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
+                # sources 可能是多条需求分支，用重复参数传，不拿逗号拼串 —— 分支名本身允许带逗号。
+                self.json_response(200, git_merge_preview(
+                    selected_bridge.workspace,
+                    str((query.get("target") or [""])[0]).strip(),
+                    [str(value or "").strip() for value in (query.get("sources") or [])],
+                    str((query.get("remoteName") or ["origin"])[0]),
+                ))
+            except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
+                self.json_response(400, {"error": str(exc)})
+            except Exception as exc:
+                self.json_response(500, {"error": f"读取分支合并预览失败：{exc}"})
+            return
         if parsed.path in {"/v1/codex/git/branches", "/v1/codex/git/status"}:
             if not self.allowed_origin():
                 self.json_response(403, {"error": "origin not allowed"})
@@ -13307,6 +13735,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
             "/v1/codex/git/submodules",
             "/v1/codex/git/prepare",
             "/v1/codex/git/push",
+            "/v1/codex/git/merge",
             "/v1/codex/cloud-sync",
             "/v1/codex/requirement-document",
             "/v1/codex/requirement-outline",
@@ -13476,6 +13905,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     git_subproject_targets_of(selected_bridge.workspace, payload.get("targets") or []),
                     bool(payload.get("skipRoot")),
                 ))
+            elif path == "/v1/codex/git/merge":
+                self.json_response(200, selected_bridge.merge_time_plan_branches(payload, config))
             elif path == "/v1/codex/git/prepare":
                 self.json_response(200, selected_bridge.prepare_requirement_git_branch(payload))
             elif path == "/v1/codex/workspace-file/reveal":
