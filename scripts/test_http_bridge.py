@@ -4369,6 +4369,35 @@ class HttpBridgeTest(unittest.TestCase):
         self.assertEqual("interrupted", status)
         self.assertEqual(2, client.read_turn_status.call_count)
 
+    def test_wait_turn_rides_out_a_freshly_created_thread_that_reads_empty(self):
+        """会话刚建好时 rollout 还没落盘，thread/read 会直接报错；这不该让整轮等待作废。"""
+        client = bridge.AppServerClient.__new__(bridge.AppServerClient)
+        client.thread_id = "thread-1"
+        client.process = unittest.mock.MagicMock()
+        client.process.poll.return_value = None
+        client.messages = bridge.queue.Queue()
+        client.read_turn_status = unittest.mock.MagicMock(side_effect=[
+            bridge.BridgeFailure("failed to read thread: rollout at ... is empty"),
+            bridge.BridgeFailure("failed to read thread: rollout at ... is empty"),
+            "completed",
+        ])
+
+        self.assertEqual("completed", client.wait_turn("turn-1", poll_interval=0))
+        self.assertEqual(3, client.read_turn_status.call_count)
+
+    def test_wait_turn_gives_up_when_the_thread_never_becomes_readable(self):
+        """一直读不出来就不是瞬时问题了：过了宽限期要把错抛出去，不能空转。"""
+        client = bridge.AppServerClient.__new__(bridge.AppServerClient)
+        client.thread_id = "thread-1"
+        client.process = unittest.mock.MagicMock()
+        client.process.poll.return_value = None
+        client.messages = bridge.queue.Queue()
+        client.read_turn_status = unittest.mock.MagicMock(side_effect=bridge.BridgeFailure("broken"))
+
+        with patch.object(bridge, "THREAD_READ_GRACE_SECONDS", 0):
+            with self.assertRaises(bridge.BridgeFailure):
+                client.wait_turn("turn-1", poll_interval=0)
+
     def test_follow_flushes_codex_thread_before_publishing_terminal_event(self):
         executor = bridge.ExecutionBridge(Path.cwd())
         client = unittest.mock.MagicMock()

@@ -62,6 +62,10 @@ PLUGIN_RUNTIME_TEST_VALUE = "delivery-task-planner-python-runtime-v6"
 SESSION_STATUS = {"completed": "completed", "failed": "blocked", "interrupted": "blocked"}
 TERMINAL_TURN_STATUSES = set(SESSION_STATUS)
 
+# 刚起的会话有一小段时间读不出来：Codex 的 rollout 文件还没落盘，thread/read 直接报
+# 「rollout ... is empty」。这类失败是瞬时的，容忍这么久之后仍然读不到才当成真的失败。
+THREAD_READ_GRACE_SECONDS = 30.0
+
 PLUGIN_UPDATES: PluginUpdateManager
 
 
@@ -5538,10 +5542,21 @@ class AppServerClient:
 
     def wait_turn(self, turn_id: str, poll_interval: float = 2) -> str:
         next_poll = 0.0
+        # 第一次读失败的时刻。读不出来不代表这一轮废了：turn/completed 通知照样会到，
+        # 会话刚建好的那几秒尤其容易读空，所以先忍一段时间，久读不到才把错抛出去。
+        first_failure = 0.0
         while self.process.poll() is None:
             now = time.monotonic()
             if now >= next_poll:
-                status = self.read_turn_status(self.thread_id, turn_id, self.next_request_id())
+                try:
+                    status = self.read_turn_status(self.thread_id, turn_id, self.next_request_id())
+                    first_failure = 0.0
+                except BridgeFailure:
+                    if not first_failure:
+                        first_failure = now
+                    elif now - first_failure >= THREAD_READ_GRACE_SECONDS:
+                        raise
+                    status = ""
                 if status in TERMINAL_TURN_STATUSES:
                     return status
                 next_poll = time.monotonic() + poll_interval
@@ -7163,7 +7178,11 @@ class ExecutionBridge:
             outcome: dict[str, str] = {}
 
             def wait() -> None:
-                outcome["status"] = client.wait_turn(turn_id)
+                try:
+                    outcome["status"] = client.wait_turn(turn_id)
+                except Exception as exc:
+                    # 起名失败只该丢掉这个标题，不该在日志里留一串没人接的线程异常。
+                    print(f"聊天自动命名等待失败：{exc}", file=sys.stderr, flush=True)
 
             waiter = threading.Thread(target=wait, daemon=True)
             waiter.start()
@@ -9312,7 +9331,10 @@ class ExecutionBridge:
             outcome: dict[str, str] = {}
 
             def wait() -> None:
-                outcome["status"] = client.wait_turn(turn_id)
+                try:
+                    outcome["status"] = client.wait_turn(turn_id)
+                except Exception as exc:
+                    print(f"修推送等待失败：{exc}", file=sys.stderr, flush=True)
 
             waiter = threading.Thread(target=wait, daemon=True)
             waiter.start()
