@@ -7,7 +7,6 @@ import argparse
 import base64
 import binascii
 import hashlib
-import hmac
 import json
 import mimetypes
 import os
@@ -396,7 +395,6 @@ def create_http_server(
     workspace: Path,
     allowed_origins: set[str],
     business_workspace_root: Path | None = None,
-    business_token: str = "",
 ) -> ThreadingHTTPServer:
     """Create the loopback bridge listener for browser calls over local HTTP."""
     httpd = ThreadingHTTPServer((host, port), BridgeHandler)
@@ -404,7 +402,6 @@ def create_http_server(
     httpd.bridge = ExecutionBridge(workspace, business_workspace_root=business_root)  # type: ignore[attr-defined]
     httpd.allowed_origins = allowed_origins  # type: ignore[attr-defined]
     httpd.business_workspace_root = business_root  # type: ignore[attr-defined]
-    httpd.business_token = business_token.strip()  # type: ignore[attr-defined]
     return httpd
 
 
@@ -12527,18 +12524,6 @@ class BridgeHandler(BaseHTTPRequestHandler):
     def allowed_origins(self) -> set[str]:
         return self.server.allowed_origins  # type: ignore[attr-defined]
 
-    @property
-    def business_token(self) -> str:
-        return str(getattr(self.server, "business_token", "") or "")
-
-    def require_business_token(self) -> None:
-        expected = self.business_token
-        received = self.headers.get("token", "").strip()
-        if not expected:
-            raise BridgeFailure("远端业务访谈服务尚未配置 token")
-        if not received or not hmac.compare_digest(received, expected):
-            raise BridgeFailure("远端业务访谈 token 无效")
-
     def allows_all_origins(self) -> bool:
         return "*" in self.allowed_origins
 
@@ -13024,7 +13009,6 @@ class BridgeHandler(BaseHTTPRequestHandler):
             query = parse_qs(parsed.query)
             if business_intake_of((query.get("businessIntake") or [""])[0]):
                 try:
-                    self.require_business_token()
                     program_id = program_id_of((query.get("programId") or [""])[0])
                     item_key = business_item_key_of((query.get("itemKey") or [""])[0])
                     thread_id = str((query.get("threadId") or [""])[0]).strip()
@@ -13223,7 +13207,6 @@ class BridgeHandler(BaseHTTPRequestHandler):
             if not isinstance(payload, dict):
                 raise BridgeFailure("请求体必须是 JSON 对象")
             if path == "/v1/codex/conversation" and business_intake_of(payload.get("businessIntake")):
-                self.require_business_token()
                 selected_bridge = self.bridge.for_business_workspace(payload.get("workspace"))
                 self.json_response(202, selected_bridge.send_business_conversation(payload))
                 return
@@ -13484,12 +13467,7 @@ def main() -> None:
     parser.add_argument(
         "--business-workspace-root",
         default=os.environ.get("BUSINESS_KODES_WORKSPACE_ROOT", str(DEFAULT_BUSINESS_WORKSPACE_ROOT)),
-        help="远端业务访谈的受控工作目录根路径",
-    )
-    parser.add_argument(
-        "--business-token",
-        default=os.environ.get("BUSINESS_KODES_TOKEN", ""),
-        help="远端业务访谈服务凭证；业务会话必须携带同一 token 请求头",
+        help="远端业务访谈的受控工作目录根路径；默认 ~/.local/share/delivery-task-planner/business-workspaces",
     )
     args = parser.parse_args()
     if args.host not in {"127.0.0.1", "::1", "localhost"}:
@@ -13508,7 +13486,6 @@ def main() -> None:
         workspace,
         origins,
         business_workspace_root=business_workspace_root,
-        business_token=args.business_token,
     )
     threading.Thread(target=httpd.bridge.reconcile_forever, daemon=True).start()  # type: ignore[attr-defined]
     try:

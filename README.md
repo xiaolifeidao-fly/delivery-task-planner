@@ -39,15 +39,15 @@ Installation starts a loopback HTTP bridge at `http://127.0.0.1:8765`; no local 
 
 ## Remote business interview mode
 
-The same conversation endpoint also supports the server-to-server business interview flow when the request has `businessIntake: true`. Configure the remote bridge with a token and a dedicated root, for example:
+The same conversation endpoint also supports the server-to-server business interview flow when the request has `businessIntake: true`:
 
 ```bash
-BUSINESS_KODES_TOKEN='<shared-service-token>' \
-BUSINESS_KODES_WORKSPACE_ROOT=/srv/universe/business-workspaces \
 python3 http_bridge.py --host 127.0.0.1 --port 8765
 ```
 
-The Go service sends only a logical workspace name in the form `{username}/业务空间/{projectName}`. The bridge validates it, resolves it beneath `BUSINESS_KODES_WORKSPACE_ROOT`, and creates the directory on first use. It never accepts an arbitrary absolute path for a business interview. This mode does not call delivery-item APIs or use a browser token; it accepts only the configured `BUSINESS_KODES_TOKEN` in the `token` request header.
+By default, the business workspace root is `~/.local/share/delivery-task-planner/business-workspaces`. Set `BUSINESS_KODES_WORKSPACE_ROOT` only when it needs to use a dedicated volume, for example `BUSINESS_KODES_WORKSPACE_ROOT=/srv/universe/business-workspaces python3 http_bridge.py --host 127.0.0.1 --port 8765`.
+
+The Go service sends only a logical workspace name in the form `{username}/业务空间/{projectName}`. The bridge validates it, resolves it beneath that root, and creates the directory on first use. It never accepts an arbitrary absolute path for a business interview. This mode does not call delivery-item APIs and does not require an additional business token; protect the loopback listener with network or reverse-proxy access controls when exposing it to the Go service.
 
 ## Runtime layout and updates
 

@@ -115,7 +115,7 @@ class HttpBridgeTest(unittest.TestCase):
 
         with patch.object(bridge, "ThreadingHTTPServer", return_value=server) as http_server:
             result = bridge.create_http_server(
-                "127.0.0.1", 8765, workspace, {"*"}, business_root, "business-service-token",
+                "127.0.0.1", 8765, workspace, {"*"}, business_root,
             )
 
         self.assertIs(server, result)
@@ -123,7 +123,14 @@ class HttpBridgeTest(unittest.TestCase):
         self.assertEqual(workspace, server.bridge.workspace)
         self.assertEqual({"*"}, server.allowed_origins)
         self.assertEqual(business_root, server.business_workspace_root)
-        self.assertEqual("business-service-token", server.business_token)
+
+    def test_http_server_uses_default_business_workspace_root(self):
+        server = unittest.mock.MagicMock()
+
+        with patch.object(bridge, "ThreadingHTTPServer", return_value=server):
+            bridge.create_http_server("127.0.0.1", 8765, Path("/workspace"), {"*"})
+
+        self.assertEqual(bridge.DEFAULT_BUSINESS_WORKSPACE_ROOT.resolve(), server.business_workspace_root)
 
     def test_business_workspace_is_created_under_its_configured_root(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -137,16 +144,6 @@ class HttpBridgeTest(unittest.TestCase):
             self.assertTrue(chinese_owner_workspace.is_dir())
             with self.assertRaises(bridge.BridgeFailure):
                 bridge.business_workspace_path_of("../../etc", root)
-
-    def test_business_token_requires_the_configured_service_credential(self):
-        handler = object.__new__(bridge.BridgeHandler)
-        handler.server = SimpleNamespace(business_token="remote-business-token")
-        handler.headers = {"token": "remote-business-token"}
-        handler.require_business_token()
-
-        handler.headers = {"token": "browser-user-token"}
-        with self.assertRaises(bridge.BridgeFailure):
-            handler.require_business_token()
 
     def test_plugin_version_comparison_ignores_cachebuster_and_uses_semver_order(self):
         self.assertEqual(0, bridge.compare_plugin_versions("0.2.0+codex.1", "0.2.0+codex.2"))
