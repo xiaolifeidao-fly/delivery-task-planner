@@ -111,14 +111,42 @@ class HttpBridgeTest(unittest.TestCase):
     def test_http_server_uses_the_loopback_listener_without_tls(self):
         server = unittest.mock.MagicMock()
         workspace = Path("/workspace")
+        business_root = Path("/business-workspaces")
 
         with patch.object(bridge, "ThreadingHTTPServer", return_value=server) as http_server:
-            result = bridge.create_http_server("127.0.0.1", 8765, workspace, {"*"})
+            result = bridge.create_http_server(
+                "127.0.0.1", 8765, workspace, {"*"}, business_root, "business-service-token",
+            )
 
         self.assertIs(server, result)
         http_server.assert_called_once_with(("127.0.0.1", 8765), bridge.BridgeHandler)
         self.assertEqual(workspace, server.bridge.workspace)
         self.assertEqual({"*"}, server.allowed_origins)
+        self.assertEqual(business_root, server.business_workspace_root)
+        self.assertEqual("business-service-token", server.business_token)
+
+    def test_business_workspace_is_created_under_its_configured_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "business-root"
+            workspace = bridge.business_workspace_path_of("alice/业务空间/客户运营平台", root)
+
+            self.assertEqual((root / "alice" / "业务空间" / "客户运营平台").resolve(), workspace)
+            self.assertTrue(workspace.is_dir())
+            chinese_owner_workspace = bridge.business_workspace_path_of("业务用户/业务空间/客户运营平台", root)
+            self.assertEqual((root / "业务用户" / "业务空间" / "客户运营平台").resolve(), chinese_owner_workspace)
+            self.assertTrue(chinese_owner_workspace.is_dir())
+            with self.assertRaises(bridge.BridgeFailure):
+                bridge.business_workspace_path_of("../../etc", root)
+
+    def test_business_token_requires_the_configured_service_credential(self):
+        handler = object.__new__(bridge.BridgeHandler)
+        handler.server = SimpleNamespace(business_token="remote-business-token")
+        handler.headers = {"token": "remote-business-token"}
+        handler.require_business_token()
+
+        handler.headers = {"token": "browser-user-token"}
+        with self.assertRaises(bridge.BridgeFailure):
+            handler.require_business_token()
 
     def test_plugin_version_comparison_ignores_cachebuster_and_uses_semver_order(self):
         self.assertEqual(0, bridge.compare_plugin_versions("0.2.0+codex.1", "0.2.0+codex.2"))

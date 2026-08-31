@@ -37,6 +37,18 @@ The CLI does not expose queue, claim, session-binding, status-transition, or fin
 
 Installation starts a loopback HTTP bridge at `http://127.0.0.1:8765`; no local certificate is required. The bridge sends `Access-Control-Allow-Origin: *`, so the delivery board may be served from any browser origin. This bridge is private infrastructure for the delivery board's execution buttons and session views; it is not a Codex chat command. Every board request carries the selected numeric project primary key `programId`, the browser-local confirmed `workspace`, `bizLine`, and the current login `token` header. The bridge verifies that token can access the selected project, validates the workspace as an existing absolute directory, creates a temporary project-scoped API context, and starts or resumes Codex in that workspace. It never persists the board token or accepts another project ID for that child process. The project management page can discover Codex Desktop's local projects through `GET /v1/codex/workspaces`; the selected path remains browser-local. Project discovery is the only endpoint that does not require `workspace`; every Codex interaction rejects a missing workspace instead of falling back to the bridge installation or startup directory. The board can call `POST /v1/codex/execute` for one task, `POST /v1/codex/execute-batch` to run selected incomplete tasks by dependency layer (parallel within each layer, then automatically release successors), or `POST /v1/codex/execute-sequence` for selected incomplete tasks in dependency order. Every mode validates task completion, dependencies, local queue conflicts, creates persisted Codex threads, and synchronizes readable output. Runtime state and logs live under `~/.local/state/delivery-task-planner/`.
 
+## Remote business interview mode
+
+The same conversation endpoint also supports the server-to-server business interview flow when the request has `businessIntake: true`. Configure the remote bridge with a token and a dedicated root, for example:
+
+```bash
+BUSINESS_KODES_TOKEN='<shared-service-token>' \
+BUSINESS_KODES_WORKSPACE_ROOT=/srv/universe/business-workspaces \
+python3 http_bridge.py --host 127.0.0.1 --port 8765
+```
+
+The Go service sends only a logical workspace name in the form `{username}/业务空间/{projectName}`. The bridge validates it, resolves it beneath `BUSINESS_KODES_WORKSPACE_ROOT`, and creates the directory on first use. It never accepts an arbitrary absolute path for a business interview. This mode does not call delivery-item APIs or use a browser token; it accepts only the configured `BUSINESS_KODES_TOKEN` in the `token` request header.
+
 ## Runtime layout and updates
 
 The bridge entry point remains `http_bridge.py`, but reusable runtime concerns live under `delivery_bridge/`:

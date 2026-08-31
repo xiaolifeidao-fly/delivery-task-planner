@@ -7,6 +7,7 @@ import argparse
 import base64
 import binascii
 import hashlib
+import hmac
 import json
 import mimetypes
 import os
@@ -38,6 +39,8 @@ from delivery_bridge.versioning import compare_versions, manifest_version
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
+DEFAULT_BUSINESS_WORKSPACE_ROOT = Path.home() / ".local" / "share" / "delivery-task-planner" / "business-workspaces"
+BUSINESS_WORKSPACE_SCOPE = "业务空间"
 PLUGIN_MANIFEST_PATH = Path(__file__).resolve().parent / ".codex-plugin" / "plugin.json"
 PLUGIN_ROOT = Path(__file__).resolve().parent
 # 执行器一律走这个命令行入口写任务面板。
@@ -392,11 +395,16 @@ def create_http_server(
     port: int,
     workspace: Path,
     allowed_origins: set[str],
+    business_workspace_root: Path | None = None,
+    business_token: str = "",
 ) -> ThreadingHTTPServer:
     """Create the loopback bridge listener for browser calls over local HTTP."""
     httpd = ThreadingHTTPServer((host, port), BridgeHandler)
-    httpd.bridge = ExecutionBridge(workspace)  # type: ignore[attr-defined]
+    business_root = (business_workspace_root or DEFAULT_BUSINESS_WORKSPACE_ROOT).expanduser().resolve()
+    httpd.bridge = ExecutionBridge(workspace, business_workspace_root=business_root)  # type: ignore[attr-defined]
     httpd.allowed_origins = allowed_origins  # type: ignore[attr-defined]
+    httpd.business_workspace_root = business_root  # type: ignore[attr-defined]
+    httpd.business_token = business_token.strip()  # type: ignore[attr-defined]
     return httpd
 
 
@@ -732,6 +740,44 @@ def workspace_path_of(value: Any) -> Path:
     if not resolved.is_dir():
         raise BridgeFailure(f"Codex 工作目录不是目录：{resolved}")
     return resolved
+
+
+def business_workspace_path_of(value: Any, root: Path) -> Path:
+    """Resolve and create one server-owned business conversation directory.
+
+    The API carries a logical path only: ``{username}/业务空间/{projectName}``.
+    It is never treated as an arbitrary path supplied by a browser or upstream
+    server, so a business conversation cannot escape the configured root.
+    """
+    raw = str(value or "").strip().replace("\\", "/")
+    parts = [part.strip() for part in raw.split("/")]
+    if len(parts) != 3 or parts[1] != BUSINESS_WORKSPACE_SCOPE:
+        raise BridgeFailure("业务工作目录必须是 用户名/业务空间/项目名称")
+    owner, _scope, project_name = parts
+    # The authenticated account name can be Chinese or another Unicode name.
+    # It only needs to be a single safe directory segment; the Go service uses
+    # the same rule when it builds the logical workspace path.
+    if not owner or owner in {".", ".."} or len(owner) > 120:
+        raise BridgeFailure("业务工作目录中的用户名无效")
+    if any(ord(character) < 0x20 or character in {"/", "\\"} for character in owner):
+        raise BridgeFailure("业务工作目录中的用户名无效")
+    if not project_name or project_name in {".", ".."} or len(project_name) > 120:
+        raise BridgeFailure("业务工作目录中的项目名称无效")
+    if any(ord(character) < 0x20 or character in {"/", "\\"} for character in project_name):
+        raise BridgeFailure("业务工作目录中的项目名称无效")
+
+    try:
+        root = root.expanduser()
+        root.mkdir(parents=True, exist_ok=True)
+        resolved_root = root.resolve(strict=True)
+        workspace = (resolved_root / owner / BUSINESS_WORKSPACE_SCOPE / project_name).resolve()
+        workspace.relative_to(resolved_root)
+        workspace.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise BridgeFailure(f"无法创建业务工作目录：{exc}") from exc
+    except ValueError as exc:
+        raise BridgeFailure("业务工作目录超出允许范围") from exc
+    return workspace
 
 
 def codex_local_projects() -> list[dict[str, Any]]:
@@ -4622,6 +4668,43 @@ def validate_conversation_payload(value: Any) -> tuple[int, str, str, str, bool,
     )
 
 
+def business_item_key_of(value: Any) -> str:
+    item_key = str(value or "").strip()
+    if not re.fullmatch(r"business-requirement-[1-9][0-9]*", item_key):
+        raise BridgeFailure("业务诉求标识无效")
+    return item_key
+
+
+def business_intake_of(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes"}
+    return False
+
+
+def validate_business_conversation_payload(value: Any) -> tuple[int, str, str, str, str, str]:
+    if not isinstance(value, dict) or not business_intake_of(value.get("businessIntake")):
+        raise BridgeFailure("业务访谈请求标识无效")
+    program_id = program_id_of(value.get("programId"))
+    item_key = business_item_key_of(value.get("itemKey"))
+    message = str(value.get("message") or "").strip()
+    if not message:
+        raise BridgeFailure("请输入业务诉求")
+    if len(message) > 32 * 1024:
+        raise BridgeFailure("业务诉求不能超过 32KB")
+    thread_id = str(value.get("threadId") or "").strip()
+    if len(thread_id) > 255:
+        raise BridgeFailure("会话标识无效")
+    provider = ai_provider_of(value)
+    if provider != "codex":
+        raise BridgeFailure("业务访谈仅支持 Codex")
+    model = str(value.get("model") or "").strip()
+    if len(model) > 128:
+        raise BridgeFailure("模型标识不能超过 128 个字符")
+    return program_id, item_key, message, thread_id, model, reasoning_effort_of(value, provider)
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -6259,6 +6342,7 @@ class ExecutionBridge:
         workspace: Path,
         progress: ProgressStore | None = None,
         pending_session_syncs: PendingSessionSyncStore | None = None,
+        business_workspace_root: Path | None = None,
     ):
         self.workspace = workspace.resolve()
         self.active: set[tuple[str, int, str]] = set()
@@ -6278,6 +6362,7 @@ class ExecutionBridge:
         self.lock = threading.Lock()
         self.progress = progress or ProgressStore()
         self.pending_session_syncs = pending_session_syncs or PendingSessionSyncStore()
+        self.business_workspace_root = (business_workspace_root or DEFAULT_BUSINESS_WORKSPACE_ROOT).expanduser().resolve()
         self.attachments = ConversationAttachmentStore(self.workspace)
         self.artifacts = WorkspaceArtifactStore(self.workspace)
         self.workspace_bridges: dict[str, ExecutionBridge] = {str(self.workspace): self}
@@ -6290,7 +6375,18 @@ class ExecutionBridge:
             existing = self.workspace_bridges.get(key)
             if existing is not None:
                 return existing
-            bridge = ExecutionBridge(workspace, self.progress, self.pending_session_syncs)
+            bridge = ExecutionBridge(workspace, self.progress, self.pending_session_syncs, self.business_workspace_root)
+            self.workspace_bridges[key] = bridge
+            return bridge
+
+    def for_business_workspace(self, value: Any) -> ExecutionBridge:
+        workspace = business_workspace_path_of(value, self.business_workspace_root)
+        key = str(workspace)
+        with self.workspace_bridges_lock:
+            existing = self.workspace_bridges.get(key)
+            if existing is not None:
+                return existing
+            bridge = ExecutionBridge(workspace, self.progress, self.pending_session_syncs, self.business_workspace_root)
             self.workspace_bridges[key] = bridge
             return bridge
 
@@ -9907,6 +10003,131 @@ class ExecutionBridge:
             "sessionProgress": int((binding or {}).get("progress") or 0),
         }
 
+    @staticmethod
+    def _business_conversation_identity(program_id: int, item_key: str) -> tuple[str, int, str]:
+        return task_identity("", program_id, f"__business_intake__:{item_key}")
+
+    def business_conversation(
+        self,
+        program_id: int,
+        item_key: str,
+        thread_id: str = "",
+        provider: str = "codex",
+    ) -> dict[str, Any]:
+        """Return a business-side conversation without touching delivery APIs.
+
+        Business intake is deliberately independent from a delivery item. Its
+        server has already supplied the project context and prompt, while this
+        bridge only owns the persisted Codex thread in the business workspace.
+        """
+        provider = ai_provider_of(provider)
+        if provider != "codex":
+            raise BridgeFailure("业务访谈仅支持 Codex")
+        program_id = program_id_of(program_id)
+        item_key = business_item_key_of(item_key)
+        thread_id = str(thread_id or "").strip()
+        identity = self._business_conversation_identity(program_id, item_key)
+        with self.lock:
+            active = self.active_runs.get(identity)
+        active_for_thread = active if active is not None and str(active.get("threadId") or "") == thread_id else None
+        turns: list[dict[str, Any]] = []
+        if thread_id:
+            if active_for_thread is not None:
+                thread = read_thread_or_empty(active_for_thread["client"], thread_id, ACTIVE_THREAD_READ_TIMEOUT_SECONDS)
+            else:
+                try:
+                    thread = THREAD_READERS.read(provider, self.workspace, None, thread_id)
+                except (BridgeFailure, OSError, ValueError) as exc:
+                    print(f"读取业务访谈会话失败，按空会话处理：{thread_id}: {exc}", file=sys.stderr, flush=True)
+                    thread = {}
+            turns = serialize_turns(thread.get("turns") if isinstance(thread, dict) else [])
+        return {
+            "programId": program_id,
+            "itemKey": item_key,
+            "threadId": thread_id,
+            "executorType": provider,
+            "turns": turns,
+            "conversations": [],
+            "active": active_for_thread is not None,
+            "activeTurnId": str((active_for_thread or {}).get("turnId") or ""),
+        }
+
+    def send_business_conversation(self, raw: Any) -> dict[str, Any]:
+        """Start or continue an AI interview in a server-created workspace."""
+        program_id, item_key, message, thread_id, model, reasoning_effort = validate_business_conversation_payload(raw)
+        identity = self._business_conversation_identity(program_id, item_key)
+        with self.lock:
+            active = self.active_runs.get(identity)
+        if active is not None:
+            if thread_id and thread_id != str(active.get("threadId") or ""):
+                raise BridgeFailure("该业务诉求已有正在运行的访谈会话")
+            active["client"].steer_turn(
+                str(active["threadId"]), str(active["turnId"]), message,
+                request_id=active["client"].next_request_id(),
+            )
+            return {
+                "accepted": True, "programId": program_id, "itemKey": item_key,
+                "threadId": active["threadId"], "turnId": active["turnId"], "active": True,
+            }
+
+        with self.lock:
+            if identity in self.active:
+                raise BridgeFailure("该业务诉求正在创建访谈会话，请稍后重试")
+            self.active.add(identity)
+        client = create_ai_client("codex", self.workspace)
+        try:
+            if thread_id:
+                client.resume_thread(thread_id)
+                turn_id = client.start_turn(
+                    thread_id, message, request_id=client.next_request_id(),
+                    model=model, reasoning_effort=reasoning_effort,
+                )
+            else:
+                thread_id, turn_id = client.start_task(
+                    f"业务诉求 · {item_key}", message, model=model, reasoning_effort=reasoning_effort,
+                )
+            with self.lock:
+                self.active_runs[identity] = {
+                    "client": client,
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                    "businessIntake": True,
+                    "provider": "codex",
+                }
+        except Exception:
+            client.close()
+            with self.lock:
+                self.active.discard(identity)
+                self._release_active_run(identity)
+            raise
+        threading.Thread(
+            target=self._follow_business_conversation,
+            args=(identity, client, turn_id),
+            daemon=True,
+        ).start()
+        return {
+            "accepted": True, "programId": program_id, "itemKey": item_key,
+            "threadId": thread_id, "turnId": turn_id, "active": True,
+        }
+
+    def _follow_business_conversation(
+        self,
+        identity: tuple[str, int, str],
+        client: AppServerClient,
+        turn_id: str,
+    ) -> None:
+        try:
+            client.wait_turn(turn_id)
+        except Exception as exc:
+            print(f"业务访谈执行失败：{identity[1]}/{identity[2]}: {exc}", file=sys.stderr, flush=True)
+        finally:
+            client.close()
+            with self.lock:
+                current = self.active_runs.get(identity)
+                if current is None or current.get("client") is client:
+                    self.active.discard(identity)
+                    self._release_active_run(identity)
+
     def upload_conversation_attachments(
         self,
         biz_line: str,
@@ -12306,6 +12527,18 @@ class BridgeHandler(BaseHTTPRequestHandler):
     def allowed_origins(self) -> set[str]:
         return self.server.allowed_origins  # type: ignore[attr-defined]
 
+    @property
+    def business_token(self) -> str:
+        return str(getattr(self.server, "business_token", "") or "")
+
+    def require_business_token(self) -> None:
+        expected = self.business_token
+        received = self.headers.get("token", "").strip()
+        if not expected:
+            raise BridgeFailure("远端业务访谈服务尚未配置 token")
+        if not received or not hmac.compare_digest(received, expected):
+            raise BridgeFailure("远端业务访谈 token 无效")
+
     def allows_all_origins(self) -> bool:
         return "*" in self.allowed_origins
 
@@ -12789,6 +13022,20 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 self.json_response(403, {"error": "origin not allowed"})
                 return
             query = parse_qs(parsed.query)
+            if business_intake_of((query.get("businessIntake") or [""])[0]):
+                try:
+                    self.require_business_token()
+                    program_id = program_id_of((query.get("programId") or [""])[0])
+                    item_key = business_item_key_of((query.get("itemKey") or [""])[0])
+                    thread_id = str((query.get("threadId") or [""])[0]).strip()
+                    provider = ai_provider_of((query.get("provider") or ["codex"])[0])
+                    selected_bridge = self.bridge.for_business_workspace((query.get("workspace") or [""])[0])
+                    self.json_response(200, selected_bridge.business_conversation(program_id, item_key, thread_id, provider))
+                except (BridgeFailure, ValueError) as exc:
+                    self.json_response(400, {"error": str(exc)})
+                except Exception as exc:
+                    self.json_response(500, {"error": f"读取业务访谈会话失败：{exc}"})
+                return
             program_id = program_id_of((query.get("programId") or [""])[0])
             item_key = str((query.get("itemKey") or [""])[0]).strip()
             thread_id = str((query.get("threadId") or [""])[0]).strip()
@@ -12975,6 +13222,11 @@ class BridgeHandler(BaseHTTPRequestHandler):
             payload = json.loads(self.rfile.read(length))
             if not isinstance(payload, dict):
                 raise BridgeFailure("请求体必须是 JSON 对象")
+            if path == "/v1/codex/conversation" and business_intake_of(payload.get("businessIntake")):
+                self.require_business_token()
+                selected_bridge = self.bridge.for_business_workspace(payload.get("workspace"))
+                self.json_response(202, selected_bridge.send_business_conversation(payload))
+                return
             if path == "/v1/codex/git/submodules":
                 # 目录早就是仓库、只是子模块没拉下来：单独补这一步，不碰主仓库的分支和改动。
                 self.bridge.request_config(
@@ -13229,6 +13481,16 @@ def main() -> None:
     # 不给就落到一个空的中性占位目录，绝不拿安装目录或启动目录冒充某个项目的仓库。
     parser.add_argument("--workspace", default="")
     parser.add_argument("--allow-origin", action="append", default=[])
+    parser.add_argument(
+        "--business-workspace-root",
+        default=os.environ.get("BUSINESS_KODES_WORKSPACE_ROOT", str(DEFAULT_BUSINESS_WORKSPACE_ROOT)),
+        help="远端业务访谈的受控工作目录根路径",
+    )
+    parser.add_argument(
+        "--business-token",
+        default=os.environ.get("BUSINESS_KODES_TOKEN", ""),
+        help="远端业务访谈服务凭证；业务会话必须携带同一 token 请求头",
+    )
     args = parser.parse_args()
     if args.host not in {"127.0.0.1", "::1", "localhost"}:
         raise SystemExit("HTTP bridge must listen on loopback")
@@ -13238,8 +13500,16 @@ def main() -> None:
             raise SystemExit(f"workspace does not exist: {workspace}")
     else:
         workspace = placeholder_workspace()
+    business_workspace_root = Path(args.business_workspace_root).expanduser().resolve()
     origins = set(args.allow_origin or ["*"])
-    httpd = create_http_server(args.host, args.port, workspace, origins)
+    httpd = create_http_server(
+        args.host,
+        args.port,
+        workspace,
+        origins,
+        business_workspace_root=business_workspace_root,
+        business_token=args.business_token,
+    )
     threading.Thread(target=httpd.bridge.reconcile_forever, daemon=True).start()  # type: ignore[attr-defined]
     try:
         httpd.serve_forever()
