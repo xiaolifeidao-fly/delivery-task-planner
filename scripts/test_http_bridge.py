@@ -162,6 +162,46 @@ class HttpBridgeTest(unittest.TestCase):
             with self.assertRaises(bridge.BridgeFailure):
                 bridge.business_workspace_path_of("../../etc", root)
 
+    def test_business_attachments_round_trip_inside_the_business_workspace(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "business-root"
+            workspace = bridge.business_workspace_path_of("alice/业务空间/客户运营平台", root)
+            execution = bridge.ExecutionBridge(workspace, business_workspace_root=root)
+
+            saved = execution.save_business_attachments(
+                7, "business-requirement-12", [{"name": "背景.png", "data": b"png-bytes", "contentType": "image/png"}],
+            )
+            attachment = saved["attachments"][0]
+            self.assertEqual("背景.png", attachment["name"])
+            self.assertTrue(attachment["isImage"])
+
+            manifest, path = execution.business_attachment(7, "business-requirement-12", attachment["id"])
+            self.assertEqual(b"png-bytes", path.read_bytes())
+            self.assertEqual("背景.png", manifest["name"])
+            # 附件必须落在这条业务诉求自己的工作目录里，不能漏到受控根目录之外。
+            self.assertTrue(str(path).startswith(str(workspace)))
+            with self.assertRaises(bridge.BridgeFailure):
+                execution.business_attachment(8, "business-requirement-12", attachment["id"])
+
+            # 会话请求按 id 取回附件时要拿到可读的绝对路径，Codex 才能把图片当输入读进去。
+            resolved = execution.attachments.resolve(7, "business-requirement-12", [attachment["id"]])
+            self.assertEqual([str(path)], [item["path"] for item in resolved])
+            with self.assertRaises(bridge.BridgeFailure):
+                execution.attachments.resolve(7, "business-requirement-13", [attachment["id"]])
+
+    def test_business_conversation_payload_keeps_attachment_ids(self):
+        payload = {
+            "programId": 7, "itemKey": "business-requirement-12", "message": "看看这张图",
+            "businessIntake": True, "provider": "codex", "attachmentIds": ["  first  ", "", "second"],
+        }
+        self.assertEqual(
+            ["first", "second"],
+            bridge.validate_business_conversation_payload(payload)[6],
+        )
+        payload["attachmentIds"] = ["id"] * (bridge.MAX_CONVERSATION_ATTACHMENTS + 1)
+        with self.assertRaises(bridge.BridgeFailure):
+            bridge.validate_business_conversation_payload(payload)
+
     def test_plugin_version_comparison_ignores_cachebuster_and_uses_semver_order(self):
         self.assertEqual(0, bridge.compare_plugin_versions("0.2.0+codex.1", "0.2.0+codex.2"))
         self.assertGreater(bridge.compare_plugin_versions("1.0.0", "0.9.9"), 0)

@@ -4682,7 +4682,7 @@ def business_intake_of(value: Any) -> bool:
     return False
 
 
-def validate_business_conversation_payload(value: Any) -> tuple[int, str, str, str, str, str]:
+def validate_business_conversation_payload(value: Any) -> tuple[int, str, str, str, str, str, list[str]]:
     if not isinstance(value, dict) or not business_intake_of(value.get("businessIntake")):
         raise BridgeFailure("业务访谈请求标识无效")
     program_id = program_id_of(value.get("programId"))
@@ -4701,7 +4701,11 @@ def validate_business_conversation_payload(value: Any) -> tuple[int, str, str, s
     model = str(value.get("model") or "").strip()
     if len(model) > 128:
         raise BridgeFailure("模型标识不能超过 128 个字符")
-    return program_id, item_key, message, thread_id, model, reasoning_effort_of(value, provider)
+    attachment_ids = value.get("attachmentIds") or []
+    if not isinstance(attachment_ids, list) or len(attachment_ids) > MAX_CONVERSATION_ATTACHMENTS:
+        raise BridgeFailure(f"一条消息最多携带 {MAX_CONVERSATION_ATTACHMENTS} 个附件")
+    attachment_ids = [str(item).strip() for item in attachment_ids if str(item).strip()]
+    return program_id, item_key, message, thread_id, model, reasoning_effort_of(value, provider), attachment_ids
 
 
 def utc_now() -> str:
@@ -10051,9 +10055,29 @@ class ExecutionBridge:
             "activeTurnId": str((active_for_thread or {}).get("turnId") or ""),
         }
 
+    def save_business_attachments(self, program_id: int, item_key: str, uploads: list[dict[str, Any]]) -> dict[str, Any]:
+        """Store business-side uploads inside the business workspace.
+
+        业务访谈不挂在交付任务上，没有面板凭证可验；能约束的是工作目录本身：
+        目录由 for_business_workspace 在受控根目录下解析，附件只会落在里面。
+        """
+        program_id = program_id_of(program_id)
+        item_key = business_item_key_of(item_key)
+        return {"attachments": self.attachments.save(DEFAULT_BIZ_LINE, program_id, item_key, uploads)}
+
+    def business_attachment(self, program_id: int, item_key: str, attachment_id: str) -> tuple[dict[str, Any], Path]:
+        """Read one stored business attachment back for the console preview."""
+        program_id = program_id_of(program_id)
+        item_key = business_item_key_of(item_key)
+        manifest, path = self.attachments.download(attachment_id)
+        if manifest.get("programId") != program_id or manifest.get("itemKey") != item_key:
+            raise BridgeFailure("附件不属于当前业务诉求")
+        return manifest, path
+
     def send_business_conversation(self, raw: Any) -> dict[str, Any]:
         """Start or continue an AI interview in a server-created workspace."""
-        program_id, item_key, message, thread_id, model, reasoning_effort = validate_business_conversation_payload(raw)
+        program_id, item_key, message, thread_id, model, reasoning_effort, attachment_ids = validate_business_conversation_payload(raw)
+        attachments = self.attachments.resolve(program_id, item_key, attachment_ids) if attachment_ids else []
         identity = self._business_conversation_identity(program_id, item_key)
         with self.lock:
             active = self.active_runs.get(identity)
@@ -10061,7 +10085,7 @@ class ExecutionBridge:
             if thread_id and thread_id != str(active.get("threadId") or ""):
                 raise BridgeFailure("该业务诉求已有正在运行的访谈会话")
             active["client"].steer_turn(
-                str(active["threadId"]), str(active["turnId"]), message,
+                str(active["threadId"]), str(active["turnId"]), message, attachments,
                 request_id=active["client"].next_request_id(),
             )
             return {
@@ -10078,12 +10102,13 @@ class ExecutionBridge:
             if thread_id:
                 client.resume_thread(thread_id)
                 turn_id = client.start_turn(
-                    thread_id, message, request_id=client.next_request_id(),
+                    thread_id, message, attachments, request_id=client.next_request_id(),
                     model=model, reasoning_effort=reasoning_effort,
                 )
             else:
                 thread_id, turn_id = client.start_task(
-                    f"业务诉求 · {item_key}", message, model=model, reasoning_effort=reasoning_effort,
+                    f"业务诉求 · {item_key}", message, attachments,
+                    model=model, reasoning_effort=reasoning_effort,
                 )
             with self.lock:
                 self.active_runs[identity] = {
@@ -13004,6 +13029,21 @@ class BridgeHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self.json_response(500, {"error": f"读取原型图目录失败：{exc}"})
             return
+        if parsed.path == "/v1/codex/business-attachment":
+            query = parse_qs(parsed.query)
+            try:
+                selected_bridge = self.bridge.for_business_workspace((query.get("workspace") or [""])[0])
+                manifest, path = selected_bridge.business_attachment(
+                    (query.get("programId") or [""])[0],
+                    (query.get("itemKey") or [""])[0],
+                    str((query.get("attachmentId") or [""])[0]).strip(),
+                )
+                self.attachment_response(manifest, path)
+            except (BridgeFailure, ValueError) as exc:
+                self.json_response(400, {"error": str(exc)})
+            except OSError as exc:
+                self.json_response(500, {"error": f"读取业务访谈附件失败：{exc}"})
+            return
         if parsed.path == "/v1/codex/conversation":
             if not self.allowed_origin():
                 self.json_response(403, {"error": "origin not allowed"})
@@ -13158,6 +13198,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
             "/v1/codex/requirement-review",
             "/v1/codex/requirement-review/stop",
             "/v1/codex/attachments",
+            "/v1/codex/business-attachments",
             "/v1/codex/prototype-directory/open",
             "/v1/codex/workspace-file/reveal",
             "/v1/codex/git/branch",
@@ -13182,6 +13223,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
         try:
             if path == "/v1/codex/attachments":
                 self.handle_attachment_upload()
+                return
+            if path == "/v1/codex/business-attachments":
+                self.handle_business_attachment_upload()
                 return
             if path == "/v1/codex/document-upload":
                 self.handle_document_upload()
@@ -13425,6 +13469,24 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 continue
             uploads.append({"name": filename, "contentType": part.get_content_type(), "data": data})
         return fields, uploads
+
+    def handle_business_attachment_upload(self) -> None:
+        """业务方在访谈里贴的图片和文档：不走任务面板凭证，只认业务工作目录。"""
+        content_length = int(self.headers.get("Content-Length") or 0)
+        if content_length <= 0 or content_length > MAX_CONVERSATION_UPLOAD_BYTES:
+            raise BridgeFailure("附件请求体大小无效")
+        if self.headers.get_content_type() != "multipart/form-data":
+            raise BridgeFailure("附件必须使用 multipart/form-data 上传")
+        fields, uploads = self.read_multipart(content_length)
+        selected_bridge = self.bridge.for_business_workspace(fields.get("workspace"))
+        self.json_response(
+            201,
+            selected_bridge.save_business_attachments(
+                fields.get("programId"),
+                fields.get("itemKey", ""),
+                uploads,
+            ),
+        )
 
     def handle_attachment_upload(self) -> None:
         content_length = int(self.headers.get("Content-Length") or 0)
