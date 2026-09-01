@@ -10,6 +10,10 @@ http_bridge.py 正在按领域拆进 delivery_bridge/。搬迁过程中最容易
 """
 
 import ast
+import importlib.util
+import os
+import sys
+import tempfile
 import unittest
 from collections import defaultdict
 from pathlib import Path
@@ -49,6 +53,63 @@ class ModuleLayoutTest(unittest.TestCase):
                 for name, places in sorted(duplicates.items())
             ),
         )
+
+
+class GetRouteTableTest(unittest.TestCase):
+    """do_GET 由 if 链改成了路由表，表和方法必须对得上。
+
+    表里写错方法名不会有任何静态报错，只有真的请求那条路径时才 AttributeError；
+    反过来，写了处理方法却忘了登记路由，那个接口就静悄悄地 404。
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        os.environ.setdefault("DELIVERY_TASK_PLANNER_RUNTIME_DIR", tempfile.mkdtemp())
+        if str(PLUGIN_ROOT) not in sys.path:
+            sys.path.insert(0, str(PLUGIN_ROOT))
+        spec = importlib.util.spec_from_file_location(
+            "delivery_task_http_bridge_layout", PLUGIN_ROOT / "http_bridge.py"
+        )
+        cls.bridge = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.bridge)
+
+    def test_every_route_points_at_an_existing_handler(self):
+        handler = self.bridge.BridgeHandler
+        missing = sorted(
+            f"{path} -> {name}"
+            for path, name in handler.GET_ROUTES.items()
+            if not callable(getattr(handler, name, None))
+        )
+        self.assertEqual([], missing, "路由表指向了不存在的处理方法")
+
+    def test_every_get_handler_is_reachable(self):
+        handler = self.bridge.BridgeHandler
+        registered = set(handler.GET_ROUTES.values())
+        # 这两条路径带参数，匹配不出常量表，由 do_GET 单独调用。
+        registered.update({"_get_attachment", "_get_artifact"})
+        defined = {name for name in vars(handler) if name.startswith("_get_")}
+        self.assertEqual(set(), defined - registered, "处理方法没有登记进路由表，接口会静默 404")
+
+
+class PostRouteTableTest(unittest.TestCase):
+    """do_POST 的统一形状接口也收进了路由表，表里的方法名必须真的存在。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.bridge = GetRouteTableTest.bridge
+
+    def test_every_route_points_at_an_existing_bridge_method(self):
+        executor = self.bridge.ExecutionBridge
+        missing = sorted(
+            f"{path} -> {method}"
+            for path, (_status, _target, method, _kw) in self.bridge.BridgeHandler.POST_ROUTES.items()
+            if not callable(getattr(executor, method, None))
+        )
+        self.assertEqual([], missing, "POST 路由表指向了 ExecutionBridge 上不存在的方法")
+
+    def test_targets_are_known(self):
+        targets = {target for _s, target, _m, _k in self.bridge.BridgeHandler.POST_ROUTES.values()}
+        self.assertEqual(set(), targets - {"workspace", "process"}, "只认识这两种桥")
 
 
 if __name__ == "__main__":

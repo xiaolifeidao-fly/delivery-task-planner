@@ -28,7 +28,7 @@ from email.parser import BytesParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, quote, unquote, urlparse
+from urllib.parse import ParseResult, parse_qs, quote, unquote, urlparse
 from urllib.request import Request, urlopen
 
 import server as planner
@@ -1352,615 +1352,719 @@ class BridgeHandler(BaseHTTPRequestHandler):
         self.cors()
         self.end_headers()
 
+    # 路径 -> 处理方法。加接口就在这里加一行，不必再往 if 链里插。
+    GET_ROUTES = {
+        "/healthz": "_get_healthz",
+        "/v1/ai/health": "_get_health",
+        "/v1/ai/models": "_get_health",
+        "/v1/codex/business-attachment": "_get_business_attachment",
+        "/v1/codex/conversation": "_get_conversation",
+        "/v1/codex/document-file": "_get_document_set",
+        "/v1/codex/document-set": "_get_document_set",
+        "/v1/codex/environment-setup": "_get_environment_setup",
+        "/v1/codex/git/branches": "_get_git_branches",
+        "/v1/codex/git/change": "_get_git_changes",
+        "/v1/codex/git/changes": "_get_git_changes",
+        "/v1/codex/git/merge-preview": "_get_git_merge_preview",
+        "/v1/codex/git/projects": "_get_git_projects",
+        "/v1/codex/git/status": "_get_git_branches",
+        "/v1/codex/git/workspace-check": "_get_git_workspace_check",
+        "/v1/codex/health": "_get_health",
+        "/v1/codex/models": "_get_health",
+        "/v1/codex/planning": "_get_planning",
+        "/v1/codex/prototype-directory": "_get_prototype_directory",
+        "/v1/codex/requirement-document": "_get_requirement_document",
+        "/v1/codex/requirement-fine-tuning": "_get_requirement_fine_tuning",
+        "/v1/codex/requirement-outline": "_get_requirement_outline",
+        "/v1/codex/requirement-prototype": "_get_requirement_prototype",
+        "/v1/codex/requirement-prototype/conversation": "_get_requirement_prototype_conversation",
+        "/v1/codex/requirement-review": "_get_requirement_review",
+        "/v1/codex/requirement-testing": "_get_requirement_testing",
+        "/v1/codex/task-fine-tuning": "_get_task_fine_tuning",
+        "/v1/codex/task-testing-cases": "_get_task_testing_cases",
+        "/v1/codex/workspace/validate": "_get_workspaces",
+        "/v1/codex/workspaces": "_get_workspaces",
+        "/v1/plugin/info": "_get_plugin_info",
+        "/v1/plugin/runtime-test": "_get_plugin_runtime_test",
+        "/v1/plugin/update": "_get_plugin_update",
+    }
+
+    # 「收下 payload 就交给执行桥」的接口：路径 -> (HTTP 状态, 用哪个桥, 方法, config 是否按关键字传)。
+    # workspace 表示请求里指定工作目录的那个桥，process 表示进程级的桥
+    # （预设环境装的是本机全局环境，不挂在任何业务仓库上）。
+    POST_ROUTES = {
+        "/v1/codex/conversation": (202, "workspace", "send_conversation", True),
+        "/v1/codex/environment-setup": (202, "process", "send_environment_setup", False),
+        "/v1/codex/environment-setup/stop": (202, "process", "stop_environment_setup", False),
+        "/v1/codex/execute": (202, "workspace", "execute", True),
+        "/v1/codex/execute-batch": (202, "workspace", "execute_batch", True),
+        "/v1/codex/execute-sequence": (202, "workspace", "execute_sequence", True),
+        "/v1/codex/git/merge": (200, "workspace", "merge_time_plan_branches", False),
+        "/v1/codex/git/push": (200, "workspace", "push_requirement_branch", False),
+        "/v1/codex/planning": (202, "workspace", "send_planning", False),
+        "/v1/codex/planning/stop": (202, "workspace", "stop_planning", False),
+        "/v1/codex/requirement-fine-tuning": (202, "workspace", "send_requirement_fine_tuning", False),
+        "/v1/codex/requirement-fine-tuning/stop": (202, "workspace", "stop_requirement_fine_tuning", False),
+        "/v1/codex/requirement-prototype/conversation": (202, "workspace", "send_requirement_prototype_message", False),
+        "/v1/codex/requirement-prototype/generate": (202, "workspace", "generate_requirement_prototype", False),
+        "/v1/codex/requirement-review": (202, "workspace", "send_requirement_review", False),
+        "/v1/codex/requirement-review/stop": (202, "workspace", "stop_requirement_review", False),
+        "/v1/codex/requirement-testing": (202, "workspace", "send_requirement_testing", False),
+        "/v1/codex/requirement-testing/stop": (202, "workspace", "stop_requirement_testing", False),
+        "/v1/codex/stop": (202, "workspace", "stop_conversation", True),
+        "/v1/codex/stop-all": (202, "workspace", "stop_all_executions", True),
+        "/v1/codex/task-fine-tuning": (202, "workspace", "send_task_fine_tuning", False),
+        "/v1/codex/task-fine-tuning/stop": (202, "workspace", "stop_task_fine_tuning", False),
+        "/v1/codex/task-testing-cases": (202, "workspace", "generate_task_testing_cases", False),
+        "/v1/codex/task-testing-cases/stop": (202, "workspace", "stop_task_testing_cases", False),
+    }
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
-        if parsed.path == "/healthz":
-            self.json_response(200, self.bridge.health())
+        route = self.GET_ROUTES.get(parsed.path)
+        if route is not None:
+            getattr(self, route)(parsed)
             return
-        if parsed.path == "/v1/plugin/info":
-            self.json_response(200, {
-                "installed": bool(PLUGIN_RUNTIME_VERSION),
-                "version": PLUGIN_RUNTIME_VERSION,
-            })
+        # 这两条带路径参数，匹配不出常量表，只能单独判。
+        if self._get_attachment(parsed) or self._get_artifact(parsed):
             return
-        if parsed.path == "/v1/plugin/runtime-test":
-            self.json_response(200, {"value": PLUGIN_RUNTIME_TEST_VALUE})
-            return
-        if parsed.path == "/v1/plugin/update":
-            force = str((parse_qs(parsed.query).get("force") or [""])[0]).lower() in {"1", "true", "yes"}
-            status = PLUGIN_UPDATES.status(force=force)
-            if isinstance(status.get("installation"), dict):
-                status["installation"]["activeRuns"] = self.bridge.active_run_count()
-            self.json_response(200, status)
-            return
-        if parsed.path in {"/v1/codex/workspaces", "/v1/codex/workspace/validate"}:
-            if not self.allowed_origin():
-                self.json_response(403, {"error": "origin not allowed"})
-                return
-            query = parse_qs(parsed.query)
-            program_id = program_id_of((query.get("programId") or [""])[0])
-            try:
-                self.bridge.request_config(
-                    {"programId": program_id},
-                    self.allowed_origin() or "",
-                    self.headers.get("token", "").strip(),
-                )
-                if parsed.path.endswith("/validate"):
-                    selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
-                    self.json_response(200, {
-                        "valid": True,
-                        "workspace": str(selected_bridge.workspace),
-                        "name": selected_bridge.workspace.name,
-                    })
-                    return
-                self.json_response(200, {
-                    "projects": codex_local_projects(),
-                })
-            except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
-                self.json_response(400, {"error": str(exc)})
-            except Exception as exc:
-                self.json_response(500, {"error": f"读取 Codex 工作目录失败：{exc}"})
-            return
-        if parsed.path == "/v1/codex/git/workspace-check":
-            if not self.allowed_origin():
-                self.json_response(403, {"error": "origin not allowed"})
-                return
-            query = parse_qs(parsed.query)
-            program_id = program_id_of((query.get("programId") or [""])[0])
-            try:
-                self.bridge.request_config(
-                    {"programId": program_id},
-                    self.allowed_origin() or "",
-                    self.headers.get("token", "").strip(),
-                )
-                self.json_response(200, git_workspace_check((query.get("workspace") or [""])[0]))
-            except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
-                self.json_response(400, {"error": str(exc)})
-            except Exception as exc:
-                self.json_response(500, {"error": f"检查工作目录 Git 状态失败：{exc}"})
-            return
-        if parsed.path in {"/v1/codex/git/changes", "/v1/codex/git/change"}:
-            if not self.allowed_origin():
-                self.json_response(403, {"error": "origin not allowed"})
-                return
-            query = parse_qs(parsed.query)
-            program_id = program_id_of((query.get("programId") or [""])[0])
-            try:
-                self.bridge.request_config(
-                    {"programId": program_id},
-                    self.allowed_origin() or "",
-                    self.headers.get("token", "").strip(),
-                )
-                selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
-                if parsed.path.endswith("/changes"):
-                    self.json_response(200, git_change_files(selected_bridge.workspace))
-                else:
-                    self.json_response(200, git_change_detail(
-                        selected_bridge.workspace,
-                        str((query.get("path") or [""])[0]),
-                    ))
-            except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
-                self.json_response(400, {"error": str(exc)})
-            except Exception as exc:
-                self.json_response(500, {"error": f"读取 Git 变更失败：{exc}"})
-            return
-        if parsed.path == "/v1/codex/git/projects":
-            if not self.allowed_origin():
-                self.json_response(403, {"error": "origin not allowed"})
-                return
-            query = parse_qs(parsed.query)
-            program_id = program_id_of((query.get("programId") or [""])[0])
-            try:
-                self.bridge.request_config(
-                    {"programId": program_id},
-                    self.allowed_origin() or "",
-                    self.headers.get("token", "").strip(),
-                )
-                selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
-                self.json_response(200, git_workspace_projects(
-                    selected_bridge.workspace,
-                    str((query.get("branch") or [""])[0]).strip(),
-                    str((query.get("remoteName") or ["origin"])[0]),
-                ))
-            except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
-                self.json_response(400, {"error": str(exc)})
-            except Exception as exc:
-                self.json_response(500, {"error": f"读取子项目 Git 状态失败：{exc}"})
-            return
-        if parsed.path == "/v1/codex/git/merge-preview":
-            if not self.allowed_origin():
-                self.json_response(403, {"error": "origin not allowed"})
-                return
-            query = parse_qs(parsed.query)
-            program_id = program_id_of((query.get("programId") or [""])[0])
-            try:
-                self.bridge.request_config(
-                    {"programId": program_id},
-                    self.allowed_origin() or "",
-                    self.headers.get("token", "").strip(),
-                )
-                selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
-                # sources 可能是多条需求分支，用重复参数传，不拿逗号拼串 —— 分支名本身允许带逗号。
-                self.json_response(200, git_merge_preview(
-                    selected_bridge.workspace,
-                    str((query.get("target") or [""])[0]).strip(),
-                    [str(value or "").strip() for value in (query.get("sources") or [])],
-                    str((query.get("remoteName") or ["origin"])[0]),
-                ))
-            except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
-                self.json_response(400, {"error": str(exc)})
-            except Exception as exc:
-                self.json_response(500, {"error": f"读取分支合并预览失败：{exc}"})
-            return
-        if parsed.path in {"/v1/codex/git/branches", "/v1/codex/git/status"}:
-            if not self.allowed_origin():
-                self.json_response(403, {"error": "origin not allowed"})
-                return
-            query = parse_qs(parsed.query)
-            program_id = program_id_of((query.get("programId") or [""])[0])
-            try:
-                self.bridge.request_config(
-                    {"programId": program_id},
-                    self.allowed_origin() or "",
-                    self.headers.get("token", "").strip(),
-                )
-                selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
-                if parsed.path.endswith("/status"):
-                    self.json_response(200, git_workspace_status(
-                        selected_bridge.workspace,
-                        str((query.get("expectedRemoteUrl") or [""])[0]),
-                        str((query.get("remoteName") or ["origin"])[0]),
-                    ))
-                else:
-                    self.json_response(200, git_branch_catalog(selected_bridge.workspace))
-            except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
-                self.json_response(400, {"error": str(exc)})
-            except Exception as exc:
-                self.json_response(500, {"error": f"读取 Git 分支失败：{exc}"})
-            return
-        if parsed.path in {"/v1/codex/health", "/v1/codex/models", "/v1/ai/health", "/v1/ai/models"}:
-            if not self.allowed_origin():
-                self.json_response(403, {"error": "origin not allowed"})
-                return
-            query = parse_qs(parsed.query)
-            provider = ai_provider_of((query.get("provider") or ["codex"])[0])
-            program_id_value = (query.get("programId") or [""])[0]
-            if parsed.path.endswith("/health") and not str(program_id_value).strip():
-                self.json_response(200, self.bridge.health(provider))
-                return
-            try:
-                program_id = program_id_of(program_id_value)
-            except BridgeFailure as exc:
-                self.json_response(400, {"error": str(exc)})
-                return
-            try:
-                config = self.bridge.request_config(
-                    {"programId": program_id},
-                    self.allowed_origin() or "",
-                    self.headers.get("token", "").strip(),
-                )
-                selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
-                if parsed.path.endswith("/health"):
-                    self.json_response(200, selected_bridge.health(provider))
-                    return
-                self.json_response(200, selected_bridge.models(config, provider))
-            except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
-                self.json_response(400, {"error": str(exc)})
-            except Exception as exc:
-                action = f"读取 {provider_label(provider)} 模型" if parsed.path.endswith("/models") else f"检查 {provider_label(provider)} 环境"
-                self.json_response(500, {"error": f"{action}失败：{exc}"})
-            return
+        self.json_response(404, {"error": "not found"})
+
+    def _get_attachment(self, parsed: ParseResult) -> bool:
         attachment_match = re.fullmatch(r"/v1/codex/attachments/([A-Za-z0-9_-]{16,80})", parsed.path)
-        if attachment_match:
-            if not self.allowed_origin():
-                self.json_response(403, {"error": "origin not allowed"})
-                return
-            try:
-                query = parse_qs(parsed.query)
-                selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
-                manifest, attachment_path = selected_bridge.attachments.download(attachment_match.group(1))
-                program_id = program_id_of((query.get("programId") or [""])[0])
-                if program_id != program_id_of(manifest.get("programId")):
-                    raise BridgeFailure("附件项目上下文不一致")
-                config = self.bridge.request_config(
-                    {"programId": program_id},
-                    self.allowed_origin() or "",
-                    self.headers.get("token", "").strip(),
-                )
-                assert_runtime_project(config, program_id_of(manifest.get("programId")))
-                self.attachment_response(manifest, attachment_path)
-            except BridgeFailure as exc:
-                self.json_response(404, {"error": str(exc)})
-            return
+        if not attachment_match:
+            return False
+        if not self.allowed_origin():
+            self.json_response(403, {"error": "origin not allowed"})
+            return True
+        try:
+            query = parse_qs(parsed.query)
+            selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
+            manifest, attachment_path = selected_bridge.attachments.download(attachment_match.group(1))
+            program_id = program_id_of((query.get("programId") or [""])[0])
+            if program_id != program_id_of(manifest.get("programId")):
+                raise BridgeFailure("附件项目上下文不一致")
+            config = self.bridge.request_config(
+                {"programId": program_id},
+                self.allowed_origin() or "",
+                self.headers.get("token", "").strip(),
+            )
+            assert_runtime_project(config, program_id_of(manifest.get("programId")))
+            self.attachment_response(manifest, attachment_path)
+        except BridgeFailure as exc:
+            self.json_response(404, {"error": str(exc)})
+        return True
+
+    def _get_artifact(self, parsed: ParseResult) -> bool:
         artifact_match = re.fullmatch(r"/v1/codex/artifacts/([a-f0-9]{40})", parsed.path)
-        if artifact_match:
-            if not self.allowed_origin():
-                self.json_response(403, {"error": "origin not allowed"})
-                return
-            try:
-                query = parse_qs(parsed.query)
-                selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
-                manifest, artifact_path = selected_bridge.artifacts.download(artifact_match.group(1))
-                program_id = program_id_of((query.get("programId") or [""])[0])
-                if program_id != program_id_of(manifest.get("programId")):
-                    raise BridgeFailure("产物项目上下文不一致")
-                config = self.bridge.request_config(
-                    {"programId": program_id},
-                    self.allowed_origin() or "",
-                    self.headers.get("token", "").strip(),
-                )
-                assert_runtime_project(config, program_id_of(manifest.get("programId")))
-                self.attachment_response(manifest, artifact_path)
-            except BridgeFailure as exc:
-                self.json_response(404, {"error": str(exc)})
-            return
-        if parsed.path == "/v1/codex/requirement-outline":
-            if not self.allowed_origin():
-                self.json_response(403, {"error": "origin not allowed"})
-                return
+        if not artifact_match:
+            return False
+        if not self.allowed_origin():
+            self.json_response(403, {"error": "origin not allowed"})
+            return True
+        try:
             query = parse_qs(parsed.query)
-            try:
-                program_id = program_id_of((query.get("programId") or [""])[0])
-                requirement_key = str((query.get("requirementKey") or [""])[0]).strip()
-                if not requirement_key:
-                    raise BridgeFailure("缺少需求标识")
-                selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
-                config = self.bridge.request_config(
-                    {"programId": program_id}, self.allowed_origin() or "", self.headers.get("token", "").strip(),
-                )
-                self.json_response(200, selected_bridge.requirement_outline(program_id, requirement_key, config=config))
-            except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
-                self.json_response(400, {"error": str(exc)})
-            except Exception as exc:
-                self.json_response(500, {"error": f"读取需求大纲失败：{exc}"})
+            selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
+            manifest, artifact_path = selected_bridge.artifacts.download(artifact_match.group(1))
+            program_id = program_id_of((query.get("programId") or [""])[0])
+            if program_id != program_id_of(manifest.get("programId")):
+                raise BridgeFailure("产物项目上下文不一致")
+            config = self.bridge.request_config(
+                {"programId": program_id},
+                self.allowed_origin() or "",
+                self.headers.get("token", "").strip(),
+            )
+            assert_runtime_project(config, program_id_of(manifest.get("programId")))
+            self.attachment_response(manifest, artifact_path)
+        except BridgeFailure as exc:
+            self.json_response(404, {"error": str(exc)})
+        return True
+
+    def _get_healthz(self, parsed: ParseResult) -> None:
+        self.json_response(200, self.bridge.health())
+        return
+
+    def _get_plugin_info(self, parsed: ParseResult) -> None:
+        self.json_response(200, {
+            "installed": bool(PLUGIN_RUNTIME_VERSION),
+            "version": PLUGIN_RUNTIME_VERSION,
+        })
+        return
+
+    def _get_plugin_runtime_test(self, parsed: ParseResult) -> None:
+        self.json_response(200, {"value": PLUGIN_RUNTIME_TEST_VALUE})
+        return
+
+    def _get_plugin_update(self, parsed: ParseResult) -> None:
+        force = str((parse_qs(parsed.query).get("force") or [""])[0]).lower() in {"1", "true", "yes"}
+        status = PLUGIN_UPDATES.status(force=force)
+        if isinstance(status.get("installation"), dict):
+            status["installation"]["activeRuns"] = self.bridge.active_run_count()
+        self.json_response(200, status)
+        return
+
+    def _get_workspaces(self, parsed: ParseResult) -> None:
+        if not self.allowed_origin():
+            self.json_response(403, {"error": "origin not allowed"})
             return
-        if parsed.path == "/v1/codex/requirement-prototype":
-            if not self.allowed_origin():
-                self.json_response(403, {"error": "origin not allowed"})
-                return
-            query = parse_qs(parsed.query)
-            try:
-                program_id = program_id_of((query.get("programId") or [""])[0])
-                requirement_key = str((query.get("requirementKey") or [""])[0]).strip()
-                if not requirement_key:
-                    raise BridgeFailure("缺少需求标识")
+        query = parse_qs(parsed.query)
+        program_id = program_id_of((query.get("programId") or [""])[0])
+        try:
+            self.bridge.request_config(
+                {"programId": program_id},
+                self.allowed_origin() or "",
+                self.headers.get("token", "").strip(),
+            )
+            if parsed.path.endswith("/validate"):
                 selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
-                config = self.bridge.request_config(
-                    {"programId": program_id}, self.allowed_origin() or "", self.headers.get("token", "").strip(),
-                )
-                self.json_response(200, selected_bridge.requirement_prototype(program_id, requirement_key, config=config))
-            except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
-                self.json_response(400, {"error": str(exc)})
-            except Exception as exc:
-                self.json_response(500, {"error": f"读取需求 HTML 原型失败：{exc}"})
+                self.json_response(200, {
+                    "valid": True,
+                    "workspace": str(selected_bridge.workspace),
+                    "name": selected_bridge.workspace.name,
+                })
+                return
+            self.json_response(200, {
+                "projects": codex_local_projects(),
+            })
+        except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
+            self.json_response(400, {"error": str(exc)})
+        except Exception as exc:
+            self.json_response(500, {"error": f"读取 Codex 工作目录失败：{exc}"})
+        return
+
+    def _get_git_workspace_check(self, parsed: ParseResult) -> None:
+        if not self.allowed_origin():
+            self.json_response(403, {"error": "origin not allowed"})
             return
-        if parsed.path == "/v1/codex/requirement-prototype/conversation":
-            if not self.allowed_origin():
-                self.json_response(403, {"error": "origin not allowed"})
-                return
-            query = parse_qs(parsed.query)
-            try:
-                program_id = program_id_of((query.get("programId") or [""])[0])
-                requirement_key = str((query.get("requirementKey") or [""])[0]).strip()
-                thread_id = str((query.get("threadId") or [""])[0]).strip()
-                provider = ai_provider_of((query.get("provider") or ["codex"])[0])
-                if not requirement_key:
-                    raise BridgeFailure("缺少需求标识")
-                selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
-                config = self.bridge.request_config(
-                    {"programId": program_id}, self.allowed_origin() or "", self.headers.get("token", "").strip(),
-                )
-                self.json_response(200, selected_bridge.requirement_prototype_conversation(
-                    program_id, requirement_key, thread_id, provider, config=config,
+        query = parse_qs(parsed.query)
+        program_id = program_id_of((query.get("programId") or [""])[0])
+        try:
+            self.bridge.request_config(
+                {"programId": program_id},
+                self.allowed_origin() or "",
+                self.headers.get("token", "").strip(),
+            )
+            self.json_response(200, git_workspace_check((query.get("workspace") or [""])[0]))
+        except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
+            self.json_response(400, {"error": str(exc)})
+        except Exception as exc:
+            self.json_response(500, {"error": f"检查工作目录 Git 状态失败：{exc}"})
+        return
+
+    def _get_git_changes(self, parsed: ParseResult) -> None:
+        if not self.allowed_origin():
+            self.json_response(403, {"error": "origin not allowed"})
+            return
+        query = parse_qs(parsed.query)
+        program_id = program_id_of((query.get("programId") or [""])[0])
+        try:
+            self.bridge.request_config(
+                {"programId": program_id},
+                self.allowed_origin() or "",
+                self.headers.get("token", "").strip(),
+            )
+            selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
+            if parsed.path.endswith("/changes"):
+                self.json_response(200, git_change_files(selected_bridge.workspace))
+            else:
+                self.json_response(200, git_change_detail(
+                    selected_bridge.workspace,
+                    str((query.get("path") or [""])[0]),
                 ))
-            except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
-                self.json_response(400, {"error": str(exc)})
-            except Exception as exc:
-                self.json_response(500, {"error": f"读取原型编辑会话失败：{exc}"})
+        except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
+            self.json_response(400, {"error": str(exc)})
+        except Exception as exc:
+            self.json_response(500, {"error": f"读取 Git 变更失败：{exc}"})
+        return
+
+    def _get_git_projects(self, parsed: ParseResult) -> None:
+        if not self.allowed_origin():
+            self.json_response(403, {"error": "origin not allowed"})
             return
-        if parsed.path == "/v1/codex/requirement-testing":
-            if not self.allowed_origin():
-                self.json_response(403, {"error": "origin not allowed"})
-                return
-            query = parse_qs(parsed.query)
-            try:
-                program_id = program_id_of((query.get("programId") or [""])[0])
-                requirement_key = str((query.get("requirementKey") or [""])[0]).strip()
-                thread_id = str((query.get("threadId") or [""])[0]).strip()
-                provider = ai_provider_of((query.get("provider") or ["codex"])[0])
-                if not requirement_key:
-                    raise BridgeFailure("缺少需求标识")
-                selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
-                config = self.bridge.request_config(
-                    {"programId": program_id}, self.allowed_origin() or "", self.headers.get("token", "").strip(),
-                )
-                self.json_response(200, selected_bridge.requirement_testing(
-                    program_id, requirement_key, thread_id, provider, config=config,
+        query = parse_qs(parsed.query)
+        program_id = program_id_of((query.get("programId") or [""])[0])
+        try:
+            self.bridge.request_config(
+                {"programId": program_id},
+                self.allowed_origin() or "",
+                self.headers.get("token", "").strip(),
+            )
+            selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
+            self.json_response(200, git_workspace_projects(
+                selected_bridge.workspace,
+                str((query.get("branch") or [""])[0]).strip(),
+                str((query.get("remoteName") or ["origin"])[0]),
+            ))
+        except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
+            self.json_response(400, {"error": str(exc)})
+        except Exception as exc:
+            self.json_response(500, {"error": f"读取子项目 Git 状态失败：{exc}"})
+        return
+
+    def _get_git_merge_preview(self, parsed: ParseResult) -> None:
+        if not self.allowed_origin():
+            self.json_response(403, {"error": "origin not allowed"})
+            return
+        query = parse_qs(parsed.query)
+        program_id = program_id_of((query.get("programId") or [""])[0])
+        try:
+            self.bridge.request_config(
+                {"programId": program_id},
+                self.allowed_origin() or "",
+                self.headers.get("token", "").strip(),
+            )
+            selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
+            # sources 可能是多条需求分支，用重复参数传，不拿逗号拼串 —— 分支名本身允许带逗号。
+            self.json_response(200, git_merge_preview(
+                selected_bridge.workspace,
+                str((query.get("target") or [""])[0]).strip(),
+                [str(value or "").strip() for value in (query.get("sources") or [])],
+                str((query.get("remoteName") or ["origin"])[0]),
+            ))
+        except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
+            self.json_response(400, {"error": str(exc)})
+        except Exception as exc:
+            self.json_response(500, {"error": f"读取分支合并预览失败：{exc}"})
+        return
+
+    def _get_git_branches(self, parsed: ParseResult) -> None:
+        if not self.allowed_origin():
+            self.json_response(403, {"error": "origin not allowed"})
+            return
+        query = parse_qs(parsed.query)
+        program_id = program_id_of((query.get("programId") or [""])[0])
+        try:
+            self.bridge.request_config(
+                {"programId": program_id},
+                self.allowed_origin() or "",
+                self.headers.get("token", "").strip(),
+            )
+            selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
+            if parsed.path.endswith("/status"):
+                self.json_response(200, git_workspace_status(
+                    selected_bridge.workspace,
+                    str((query.get("expectedRemoteUrl") or [""])[0]),
+                    str((query.get("remoteName") or ["origin"])[0]),
                 ))
-            except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
-                self.json_response(400, {"error": str(exc)})
-            except Exception as exc:
-                self.json_response(500, {"error": f"读取需求总体测试会话失败：{exc}"})
+            else:
+                self.json_response(200, git_branch_catalog(selected_bridge.workspace))
+        except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
+            self.json_response(400, {"error": str(exc)})
+        except Exception as exc:
+            self.json_response(500, {"error": f"读取 Git 分支失败：{exc}"})
+        return
+
+    def _get_health(self, parsed: ParseResult) -> None:
+        if not self.allowed_origin():
+            self.json_response(403, {"error": "origin not allowed"})
             return
-        if parsed.path == "/v1/codex/requirement-review":
-            if not self.allowed_origin():
-                self.json_response(403, {"error": "origin not allowed"})
-                return
-            query = parse_qs(parsed.query)
-            try:
-                program_id = program_id_of((query.get("programId") or [""])[0])
-                requirement_key = str((query.get("requirementKey") or [""])[0]).strip()
-                thread_id = str((query.get("threadId") or [""])[0]).strip()
-                provider = ai_provider_of((query.get("provider") or ["codex"])[0])
-                if not requirement_key:
-                    raise BridgeFailure("缺少需求标识")
-                selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
-                config = self.bridge.request_config(
-                    {"programId": program_id}, self.allowed_origin() or "", self.headers.get("token", "").strip(),
-                )
-                self.json_response(200, selected_bridge.requirement_review(
-                    program_id, requirement_key, thread_id, provider, config=config,
-                ))
-            except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
-                self.json_response(400, {"error": str(exc)})
-            except Exception as exc:
-                self.json_response(500, {"error": f"读取代码 review 会话失败：{exc}"})
+        query = parse_qs(parsed.query)
+        provider = ai_provider_of((query.get("provider") or ["codex"])[0])
+        program_id_value = (query.get("programId") or [""])[0]
+        if parsed.path.endswith("/health") and not str(program_id_value).strip():
+            self.json_response(200, self.bridge.health(provider))
             return
-        if parsed.path == "/v1/codex/requirement-fine-tuning":
-            if not self.allowed_origin():
-                self.json_response(403, {"error": "origin not allowed"})
-                return
-            query = parse_qs(parsed.query)
-            try:
-                program_id = program_id_of((query.get("programId") or [""])[0])
-                requirement_key = str((query.get("requirementKey") or [""])[0]).strip()
-                thread_id = str((query.get("threadId") or [""])[0]).strip()
-                provider = ai_provider_of((query.get("provider") or ["codex"])[0])
-                if not requirement_key:
-                    raise BridgeFailure("缺少需求标识")
-                selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
-                config = self.bridge.request_config(
-                    {"programId": program_id}, self.allowed_origin() or "", self.headers.get("token", "").strip(),
-                )
-                self.json_response(200, selected_bridge.requirement_fine_tuning(
-                    program_id, requirement_key, thread_id, provider, config=config,
-                ))
-            except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
-                self.json_response(400, {"error": str(exc)})
-            except Exception as exc:
-                self.json_response(500, {"error": f"读取需求微调会话失败：{exc}"})
+        try:
+            program_id = program_id_of(program_id_value)
+        except BridgeFailure as exc:
+            self.json_response(400, {"error": str(exc)})
             return
-        if parsed.path == "/v1/codex/task-testing-cases":
-            if not self.allowed_origin():
-                self.json_response(403, {"error": "origin not allowed"})
+        try:
+            config = self.bridge.request_config(
+                {"programId": program_id},
+                self.allowed_origin() or "",
+                self.headers.get("token", "").strip(),
+            )
+            selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
+            if parsed.path.endswith("/health"):
+                self.json_response(200, selected_bridge.health(provider))
                 return
-            query = parse_qs(parsed.query)
-            try:
-                program_id = program_id_of((query.get("programId") or [""])[0])
-                item_key = str((query.get("itemKey") or [""])[0]).strip()
-                thread_id = str((query.get("threadId") or [""])[0]).strip()
-                provider = ai_provider_of((query.get("provider") or ["codex"])[0])
-                if not item_key:
-                    raise BridgeFailure("缺少任务标识")
-                selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
-                config = self.bridge.request_config(
-                    {"programId": program_id}, self.allowed_origin() or "", self.headers.get("token", "").strip(),
-                )
-                self.json_response(200, selected_bridge.task_testing_cases_conversation(
-                    program_id, item_key, thread_id, provider, config=config,
-                ))
-            except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
-                self.json_response(400, {"error": str(exc)})
-            except Exception as exc:
-                self.json_response(500, {"error": f"读取任务测试用例会话失败：{exc}"})
+            self.json_response(200, selected_bridge.models(config, provider))
+        except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
+            self.json_response(400, {"error": str(exc)})
+        except Exception as exc:
+            action = f"读取 {provider_label(provider)} 模型" if parsed.path.endswith("/models") else f"检查 {provider_label(provider)} 环境"
+            self.json_response(500, {"error": f"{action}失败：{exc}"})
+        return
+
+    def _get_requirement_outline(self, parsed: ParseResult) -> None:
+        if not self.allowed_origin():
+            self.json_response(403, {"error": "origin not allowed"})
             return
-        if parsed.path == "/v1/codex/task-fine-tuning":
-            if not self.allowed_origin():
-                self.json_response(403, {"error": "origin not allowed"})
-                return
-            query = parse_qs(parsed.query)
-            try:
-                program_id = program_id_of((query.get("programId") or [""])[0])
-                item_key = str((query.get("itemKey") or [""])[0]).strip()
-                thread_id = str((query.get("threadId") or [""])[0]).strip()
-                provider = ai_provider_of((query.get("provider") or ["codex"])[0])
-                if not item_key:
-                    raise BridgeFailure("缺少任务标识")
-                selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
-                config = self.bridge.request_config(
-                    {"programId": program_id}, self.allowed_origin() or "", self.headers.get("token", "").strip(),
-                )
-                self.json_response(200, selected_bridge.task_fine_tuning_conversation(
-                    program_id, item_key, thread_id, provider, config=config,
-                ))
-            except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
-                self.json_response(400, {"error": str(exc)})
-            except Exception as exc:
-                self.json_response(500, {"error": f"读取任务微调会话失败：{exc}"})
+        query = parse_qs(parsed.query)
+        try:
+            program_id = program_id_of((query.get("programId") or [""])[0])
+            requirement_key = str((query.get("requirementKey") or [""])[0]).strip()
+            if not requirement_key:
+                raise BridgeFailure("缺少需求标识")
+            selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
+            config = self.bridge.request_config(
+                {"programId": program_id}, self.allowed_origin() or "", self.headers.get("token", "").strip(),
+            )
+            self.json_response(200, selected_bridge.requirement_outline(program_id, requirement_key, config=config))
+        except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
+            self.json_response(400, {"error": str(exc)})
+        except Exception as exc:
+            self.json_response(500, {"error": f"读取需求大纲失败：{exc}"})
+        return
+
+    def _get_requirement_prototype(self, parsed: ParseResult) -> None:
+        if not self.allowed_origin():
+            self.json_response(403, {"error": "origin not allowed"})
             return
-        if parsed.path in {"/v1/codex/document-set", "/v1/codex/document-file"}:
-            if not self.allowed_origin():
-                self.json_response(403, {"error": "origin not allowed"})
-                return
-            query = parse_qs(parsed.query)
-            try:
-                program_id = program_id_of((query.get("programId") or [""])[0])
-                scope = str((query.get("scope") or [""])[0]).strip()
-                key = str((query.get("key") or [""])[0]).strip()
-                if not program_id or not scope or not key:
-                    raise BridgeFailure("programId、scope 和 key 都是必填项")
-                selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
-                config = self.bridge.request_config(
-                    {"programId": program_id},
-                    self.allowed_origin() or "",
-                    self.headers.get("token", "").strip(),
-                )
-                if parsed.path == "/v1/codex/document-set":
-                    self.json_response(200, selected_bridge.document_set(program_id, scope, key, config=config))
-                else:
-                    self.json_response(200, selected_bridge.document_file(
-                        program_id, scope, key, str((query.get("path") or [""])[0]), config=config,
-                    ))
-            except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
-                self.json_response(400, {"error": str(exc)})
-            except Exception as exc:
-                self.json_response(500, {"error": f"读取文档失败：{exc}"})
+        query = parse_qs(parsed.query)
+        try:
+            program_id = program_id_of((query.get("programId") or [""])[0])
+            requirement_key = str((query.get("requirementKey") or [""])[0]).strip()
+            if not requirement_key:
+                raise BridgeFailure("缺少需求标识")
+            selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
+            config = self.bridge.request_config(
+                {"programId": program_id}, self.allowed_origin() or "", self.headers.get("token", "").strip(),
+            )
+            self.json_response(200, selected_bridge.requirement_prototype(program_id, requirement_key, config=config))
+        except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
+            self.json_response(400, {"error": str(exc)})
+        except Exception as exc:
+            self.json_response(500, {"error": f"读取需求 HTML 原型失败：{exc}"})
+        return
+
+    def _get_requirement_prototype_conversation(self, parsed: ParseResult) -> None:
+        if not self.allowed_origin():
+            self.json_response(403, {"error": "origin not allowed"})
             return
-        if parsed.path == "/v1/codex/requirement-document":
-            if not self.allowed_origin():
-                self.json_response(403, {"error": "origin not allowed"})
-                return
-            query = parse_qs(parsed.query)
+        query = parse_qs(parsed.query)
+        try:
+            program_id = program_id_of((query.get("programId") or [""])[0])
+            requirement_key = str((query.get("requirementKey") or [""])[0]).strip()
+            thread_id = str((query.get("threadId") or [""])[0]).strip()
+            provider = ai_provider_of((query.get("provider") or ["codex"])[0])
+            if not requirement_key:
+                raise BridgeFailure("缺少需求标识")
+            selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
+            config = self.bridge.request_config(
+                {"programId": program_id}, self.allowed_origin() or "", self.headers.get("token", "").strip(),
+            )
+            self.json_response(200, selected_bridge.requirement_prototype_conversation(
+                program_id, requirement_key, thread_id, provider, config=config,
+            ))
+        except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
+            self.json_response(400, {"error": str(exc)})
+        except Exception as exc:
+            self.json_response(500, {"error": f"读取原型编辑会话失败：{exc}"})
+        return
+
+    def _get_requirement_testing(self, parsed: ParseResult) -> None:
+        if not self.allowed_origin():
+            self.json_response(403, {"error": "origin not allowed"})
+            return
+        query = parse_qs(parsed.query)
+        try:
+            program_id = program_id_of((query.get("programId") or [""])[0])
+            requirement_key = str((query.get("requirementKey") or [""])[0]).strip()
+            thread_id = str((query.get("threadId") or [""])[0]).strip()
+            provider = ai_provider_of((query.get("provider") or ["codex"])[0])
+            if not requirement_key:
+                raise BridgeFailure("缺少需求标识")
+            selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
+            config = self.bridge.request_config(
+                {"programId": program_id}, self.allowed_origin() or "", self.headers.get("token", "").strip(),
+            )
+            self.json_response(200, selected_bridge.requirement_testing(
+                program_id, requirement_key, thread_id, provider, config=config,
+            ))
+        except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
+            self.json_response(400, {"error": str(exc)})
+        except Exception as exc:
+            self.json_response(500, {"error": f"读取需求总体测试会话失败：{exc}"})
+        return
+
+    def _get_requirement_review(self, parsed: ParseResult) -> None:
+        if not self.allowed_origin():
+            self.json_response(403, {"error": "origin not allowed"})
+            return
+        query = parse_qs(parsed.query)
+        try:
+            program_id = program_id_of((query.get("programId") or [""])[0])
+            requirement_key = str((query.get("requirementKey") or [""])[0]).strip()
+            thread_id = str((query.get("threadId") or [""])[0]).strip()
+            provider = ai_provider_of((query.get("provider") or ["codex"])[0])
+            if not requirement_key:
+                raise BridgeFailure("缺少需求标识")
+            selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
+            config = self.bridge.request_config(
+                {"programId": program_id}, self.allowed_origin() or "", self.headers.get("token", "").strip(),
+            )
+            self.json_response(200, selected_bridge.requirement_review(
+                program_id, requirement_key, thread_id, provider, config=config,
+            ))
+        except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
+            self.json_response(400, {"error": str(exc)})
+        except Exception as exc:
+            self.json_response(500, {"error": f"读取代码 review 会话失败：{exc}"})
+        return
+
+    def _get_requirement_fine_tuning(self, parsed: ParseResult) -> None:
+        if not self.allowed_origin():
+            self.json_response(403, {"error": "origin not allowed"})
+            return
+        query = parse_qs(parsed.query)
+        try:
+            program_id = program_id_of((query.get("programId") or [""])[0])
+            requirement_key = str((query.get("requirementKey") or [""])[0]).strip()
+            thread_id = str((query.get("threadId") or [""])[0]).strip()
+            provider = ai_provider_of((query.get("provider") or ["codex"])[0])
+            if not requirement_key:
+                raise BridgeFailure("缺少需求标识")
+            selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
+            config = self.bridge.request_config(
+                {"programId": program_id}, self.allowed_origin() or "", self.headers.get("token", "").strip(),
+            )
+            self.json_response(200, selected_bridge.requirement_fine_tuning(
+                program_id, requirement_key, thread_id, provider, config=config,
+            ))
+        except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
+            self.json_response(400, {"error": str(exc)})
+        except Exception as exc:
+            self.json_response(500, {"error": f"读取需求微调会话失败：{exc}"})
+        return
+
+    def _get_task_testing_cases(self, parsed: ParseResult) -> None:
+        if not self.allowed_origin():
+            self.json_response(403, {"error": "origin not allowed"})
+            return
+        query = parse_qs(parsed.query)
+        try:
             program_id = program_id_of((query.get("programId") or [""])[0])
             item_key = str((query.get("itemKey") or [""])[0]).strip()
-            if not program_id or not item_key:
-                self.json_response(400, {"error": "programId and itemKey are required"})
-                return
-            try:
-                selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
-                config = self.bridge.request_config(
-                    {"programId": program_id},
-                    self.allowed_origin() or "",
-                    self.headers.get("token", "").strip(),
-                )
-                self.json_response(200, selected_bridge.requirement_document(program_id, item_key, config=config))
-            except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
-                self.json_response(400, {"error": str(exc)})
-            except Exception as exc:
-                self.json_response(500, {"error": f"读取需求文档失败：{exc}"})
+            thread_id = str((query.get("threadId") or [""])[0]).strip()
+            provider = ai_provider_of((query.get("provider") or ["codex"])[0])
+            if not item_key:
+                raise BridgeFailure("缺少任务标识")
+            selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
+            config = self.bridge.request_config(
+                {"programId": program_id}, self.allowed_origin() or "", self.headers.get("token", "").strip(),
+            )
+            self.json_response(200, selected_bridge.task_testing_cases_conversation(
+                program_id, item_key, thread_id, provider, config=config,
+            ))
+        except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
+            self.json_response(400, {"error": str(exc)})
+        except Exception as exc:
+            self.json_response(500, {"error": f"读取任务测试用例会话失败：{exc}"})
+        return
+
+    def _get_task_fine_tuning(self, parsed: ParseResult) -> None:
+        if not self.allowed_origin():
+            self.json_response(403, {"error": "origin not allowed"})
             return
-        if parsed.path == "/v1/codex/prototype-directory":
-            if not self.allowed_origin():
-                self.json_response(403, {"error": "origin not allowed"})
-                return
-            query = parse_qs(parsed.query)
+        query = parse_qs(parsed.query)
+        try:
             program_id = program_id_of((query.get("programId") or [""])[0])
             item_key = str((query.get("itemKey") or [""])[0]).strip()
-            if not program_id or not item_key:
-                self.json_response(400, {"error": "programId and itemKey are required"})
-                return
-            try:
-                selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
-                config = self.bridge.request_config(
-                    {"programId": program_id},
-                    self.allowed_origin() or "",
-                    self.headers.get("token", "").strip(),
-                )
-                self.json_response(200, selected_bridge.prototype_directory(program_id, item_key, config=config))
-            except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
-                self.json_response(400, {"error": str(exc)})
-            except Exception as exc:
-                self.json_response(500, {"error": f"读取原型图目录失败：{exc}"})
+            thread_id = str((query.get("threadId") or [""])[0]).strip()
+            provider = ai_provider_of((query.get("provider") or ["codex"])[0])
+            if not item_key:
+                raise BridgeFailure("缺少任务标识")
+            selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
+            config = self.bridge.request_config(
+                {"programId": program_id}, self.allowed_origin() or "", self.headers.get("token", "").strip(),
+            )
+            self.json_response(200, selected_bridge.task_fine_tuning_conversation(
+                program_id, item_key, thread_id, provider, config=config,
+            ))
+        except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
+            self.json_response(400, {"error": str(exc)})
+        except Exception as exc:
+            self.json_response(500, {"error": f"读取任务微调会话失败：{exc}"})
+        return
+
+    def _get_document_set(self, parsed: ParseResult) -> None:
+        if not self.allowed_origin():
+            self.json_response(403, {"error": "origin not allowed"})
             return
-        if parsed.path == "/v1/codex/business-attachment":
-            query = parse_qs(parsed.query)
+        query = parse_qs(parsed.query)
+        try:
+            program_id = program_id_of((query.get("programId") or [""])[0])
+            scope = str((query.get("scope") or [""])[0]).strip()
+            key = str((query.get("key") or [""])[0]).strip()
+            if not program_id or not scope or not key:
+                raise BridgeFailure("programId、scope 和 key 都是必填项")
+            selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
+            config = self.bridge.request_config(
+                {"programId": program_id},
+                self.allowed_origin() or "",
+                self.headers.get("token", "").strip(),
+            )
+            if parsed.path == "/v1/codex/document-set":
+                self.json_response(200, selected_bridge.document_set(program_id, scope, key, config=config))
+            else:
+                self.json_response(200, selected_bridge.document_file(
+                    program_id, scope, key, str((query.get("path") or [""])[0]), config=config,
+                ))
+        except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
+            self.json_response(400, {"error": str(exc)})
+        except Exception as exc:
+            self.json_response(500, {"error": f"读取文档失败：{exc}"})
+        return
+
+    def _get_requirement_document(self, parsed: ParseResult) -> None:
+        if not self.allowed_origin():
+            self.json_response(403, {"error": "origin not allowed"})
+            return
+        query = parse_qs(parsed.query)
+        program_id = program_id_of((query.get("programId") or [""])[0])
+        item_key = str((query.get("itemKey") or [""])[0]).strip()
+        if not program_id or not item_key:
+            self.json_response(400, {"error": "programId and itemKey are required"})
+            return
+        try:
+            selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
+            config = self.bridge.request_config(
+                {"programId": program_id},
+                self.allowed_origin() or "",
+                self.headers.get("token", "").strip(),
+            )
+            self.json_response(200, selected_bridge.requirement_document(program_id, item_key, config=config))
+        except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
+            self.json_response(400, {"error": str(exc)})
+        except Exception as exc:
+            self.json_response(500, {"error": f"读取需求文档失败：{exc}"})
+        return
+
+    def _get_prototype_directory(self, parsed: ParseResult) -> None:
+        if not self.allowed_origin():
+            self.json_response(403, {"error": "origin not allowed"})
+            return
+        query = parse_qs(parsed.query)
+        program_id = program_id_of((query.get("programId") or [""])[0])
+        item_key = str((query.get("itemKey") or [""])[0]).strip()
+        if not program_id or not item_key:
+            self.json_response(400, {"error": "programId and itemKey are required"})
+            return
+        try:
+            selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
+            config = self.bridge.request_config(
+                {"programId": program_id},
+                self.allowed_origin() or "",
+                self.headers.get("token", "").strip(),
+            )
+            self.json_response(200, selected_bridge.prototype_directory(program_id, item_key, config=config))
+        except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
+            self.json_response(400, {"error": str(exc)})
+        except Exception as exc:
+            self.json_response(500, {"error": f"读取原型图目录失败：{exc}"})
+        return
+
+    def _get_business_attachment(self, parsed: ParseResult) -> None:
+        query = parse_qs(parsed.query)
+        try:
+            selected_bridge = self.bridge.for_business_workspace((query.get("workspace") or [""])[0])
+            manifest, path = selected_bridge.business_attachment(
+                (query.get("programId") or [""])[0],
+                (query.get("itemKey") or [""])[0],
+                str((query.get("attachmentId") or [""])[0]).strip(),
+            )
+            self.attachment_response(manifest, path)
+        except (BridgeFailure, ValueError) as exc:
+            self.json_response(400, {"error": str(exc)})
+        except OSError as exc:
+            self.json_response(500, {"error": f"读取业务访谈附件失败：{exc}"})
+        return
+
+    def _get_conversation(self, parsed: ParseResult) -> None:
+        if not self.allowed_origin():
+            self.json_response(403, {"error": "origin not allowed"})
+            return
+        query = parse_qs(parsed.query)
+        if business_intake_of((query.get("businessIntake") or [""])[0]):
             try:
+                program_id = program_id_of((query.get("programId") or [""])[0])
+                item_key = business_item_key_of((query.get("itemKey") or [""])[0])
+                thread_id = str((query.get("threadId") or [""])[0]).strip()
+                provider = ai_provider_of((query.get("provider") or ["codex"])[0])
                 selected_bridge = self.bridge.for_business_workspace((query.get("workspace") or [""])[0])
-                manifest, path = selected_bridge.business_attachment(
-                    (query.get("programId") or [""])[0],
-                    (query.get("itemKey") or [""])[0],
-                    str((query.get("attachmentId") or [""])[0]).strip(),
-                )
-                self.attachment_response(manifest, path)
+                self.json_response(200, selected_bridge.business_conversation(program_id, item_key, thread_id, provider))
             except (BridgeFailure, ValueError) as exc:
                 self.json_response(400, {"error": str(exc)})
-            except OSError as exc:
-                self.json_response(500, {"error": f"读取业务访谈附件失败：{exc}"})
+            except Exception as exc:
+                self.json_response(500, {"error": f"读取业务访谈会话失败：{exc}"})
             return
-        if parsed.path == "/v1/codex/conversation":
-            if not self.allowed_origin():
-                self.json_response(403, {"error": "origin not allowed"})
-                return
-            query = parse_qs(parsed.query)
-            if business_intake_of((query.get("businessIntake") or [""])[0]):
-                try:
-                    program_id = program_id_of((query.get("programId") or [""])[0])
-                    item_key = business_item_key_of((query.get("itemKey") or [""])[0])
-                    thread_id = str((query.get("threadId") or [""])[0]).strip()
-                    provider = ai_provider_of((query.get("provider") or ["codex"])[0])
-                    selected_bridge = self.bridge.for_business_workspace((query.get("workspace") or [""])[0])
-                    self.json_response(200, selected_bridge.business_conversation(program_id, item_key, thread_id, provider))
-                except (BridgeFailure, ValueError) as exc:
-                    self.json_response(400, {"error": str(exc)})
-                except Exception as exc:
-                    self.json_response(500, {"error": f"读取业务访谈会话失败：{exc}"})
-                return
-            program_id = program_id_of((query.get("programId") or [""])[0])
-            item_key = str((query.get("itemKey") or [""])[0]).strip()
+        program_id = program_id_of((query.get("programId") or [""])[0])
+        item_key = str((query.get("itemKey") or [""])[0]).strip()
+        thread_id = str((query.get("threadId") or [""])[0]).strip()
+        provider = ai_provider_of((query.get("provider") or ["codex"])[0])
+        if not program_id or not item_key:
+            self.json_response(400, {"error": "programId and itemKey are required"})
+            return
+        try:
+            selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
+            config = self.bridge.request_config(
+                {"programId": program_id},
+                self.allowed_origin() or "",
+                self.headers.get("token", "").strip(),
+            )
+            self.json_response(200, selected_bridge.conversation(program_id, item_key, thread_id, config=config, provider=provider))
+        except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
+            self.json_response(400, {"error": str(exc)})
+        except Exception as exc:
+            self.json_response(500, {"error": f"读取 Codex 会话失败：{exc}"})
+        return
+
+    def _get_environment_setup(self, parsed: ParseResult) -> None:
+        if not self.allowed_origin():
+            self.json_response(403, {"error": "origin not allowed"})
+            return
+        query = parse_qs(parsed.query)
+        try:
             thread_id = str((query.get("threadId") or [""])[0]).strip()
             provider = ai_provider_of((query.get("provider") or ["codex"])[0])
-            if not program_id or not item_key:
-                self.json_response(400, {"error": "programId and itemKey are required"})
-                return
+            use_git = str((query.get("useGit") or [""])[0]).strip().lower() == "true"
+            environments_raw = str((query.get("environments") or ["[]"])[0])
             try:
-                selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
-                config = self.bridge.request_config(
-                    {"programId": program_id},
-                    self.allowed_origin() or "",
-                    self.headers.get("token", "").strip(),
-                )
-                self.json_response(200, selected_bridge.conversation(program_id, item_key, thread_id, config=config, provider=provider))
-            except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
-                self.json_response(400, {"error": str(exc)})
-            except Exception as exc:
-                self.json_response(500, {"error": f"读取 Codex 会话失败：{exc}"})
+                environments = environment_selection_of(json.loads(environments_raw))
+            except (json.JSONDecodeError, TypeError):
+                raise BridgeFailure("预设环境参数无效")
+            config = self.bridge.global_environment_config({}, self.headers.get("token", "").strip())
+            self.json_response(200, self.bridge.environment_setup(
+                GLOBAL_ENVIRONMENT_SETUP_PROGRAM_ID,
+                thread_id,
+                config=config,
+                provider=provider,
+                use_git=use_git,
+                environments=environments,
+            ))
+        except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
+            self.json_response(400, {"error": str(exc)})
+        except Exception as exc:
+            self.json_response(500, {"error": f"读取预设环境会话失败：{exc}"})
+        return
+
+    def _get_planning(self, parsed: ParseResult) -> None:
+        if not self.allowed_origin():
+            self.json_response(403, {"error": "origin not allowed"})
             return
-        if parsed.path == "/v1/codex/environment-setup":
-            if not self.allowed_origin():
-                self.json_response(403, {"error": "origin not allowed"})
-                return
-            query = parse_qs(parsed.query)
-            try:
-                thread_id = str((query.get("threadId") or [""])[0]).strip()
-                provider = ai_provider_of((query.get("provider") or ["codex"])[0])
-                use_git = str((query.get("useGit") or [""])[0]).strip().lower() == "true"
-                environments_raw = str((query.get("environments") or ["[]"])[0])
-                try:
-                    environments = environment_selection_of(json.loads(environments_raw))
-                except (json.JSONDecodeError, TypeError):
-                    raise BridgeFailure("预设环境参数无效")
-                config = self.bridge.global_environment_config({}, self.headers.get("token", "").strip())
-                self.json_response(200, self.bridge.environment_setup(
-                    GLOBAL_ENVIRONMENT_SETUP_PROGRAM_ID,
-                    thread_id,
-                    config=config,
-                    provider=provider,
-                    use_git=use_git,
-                    environments=environments,
-                ))
-            except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
-                self.json_response(400, {"error": str(exc)})
-            except Exception as exc:
-                self.json_response(500, {"error": f"读取预设环境会话失败：{exc}"})
+        query = parse_qs(parsed.query)
+        program_id = program_id_of((query.get("programId") or [""])[0])
+        thread_id = str((query.get("threadId") or [""])[0]).strip()
+        requirement_key = str((query.get("requirementKey") or [""])[0]).strip()
+        provider = ai_provider_of((query.get("provider") or ["codex"])[0])
+        if not program_id:
+            self.json_response(400, {"error": "programId is required"})
             return
-        if parsed.path == "/v1/codex/planning":
-            if not self.allowed_origin():
-                self.json_response(403, {"error": "origin not allowed"})
-                return
-            query = parse_qs(parsed.query)
-            program_id = program_id_of((query.get("programId") or [""])[0])
-            thread_id = str((query.get("threadId") or [""])[0]).strip()
-            requirement_key = str((query.get("requirementKey") or [""])[0]).strip()
-            provider = ai_provider_of((query.get("provider") or ["codex"])[0])
-            if not program_id:
-                self.json_response(400, {"error": "programId is required"})
-                return
-            try:
-                selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
-                config = self.bridge.request_config(
-                    {"programId": program_id},
-                    self.allowed_origin() or "",
-                    self.headers.get("token", "").strip(),
-                )
-                self.json_response(200, selected_bridge.planning(program_id, thread_id, config=config, requirement_key=requirement_key, provider=provider))
-            except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
-                self.json_response(400, {"error": str(exc)})
-            except Exception as exc:
-                self.json_response(500, {"error": f"读取拆解会话失败：{exc}"})
-            return
-        else:
-            self.json_response(404, {"error": "not found"})
-            return
+        try:
+            selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
+            config = self.bridge.request_config(
+                {"programId": program_id},
+                self.allowed_origin() or "",
+                self.headers.get("token", "").strip(),
+            )
+            self.json_response(200, selected_bridge.planning(program_id, thread_id, config=config, requirement_key=requirement_key, provider=provider))
+        except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
+            self.json_response(400, {"error": str(exc)})
+        except Exception as exc:
+            self.json_response(500, {"error": f"读取拆解会话失败：{exc}"})
+        return
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
@@ -2119,46 +2223,15 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     self.headers.get("token", "").strip(),
                 )
                 selected_bridge = self.bridge.for_workspace(payload.get("workspace"))
-            if path == "/v1/codex/execute":
-                self.json_response(202, selected_bridge.execute(payload, config=config))
-            elif path == "/v1/codex/task-testing-cases":
-                self.json_response(202, selected_bridge.generate_task_testing_cases(payload, config))
-            elif path == "/v1/codex/task-testing-cases/stop":
-                self.json_response(202, selected_bridge.stop_task_testing_cases(payload, config))
-            elif path == "/v1/codex/task-fine-tuning":
-                self.json_response(202, selected_bridge.send_task_fine_tuning(payload, config))
-            elif path == "/v1/codex/task-fine-tuning/stop":
-                self.json_response(202, selected_bridge.stop_task_fine_tuning(payload, config))
-            elif path == "/v1/codex/execute-batch":
-                self.json_response(202, selected_bridge.execute_batch(payload, config=config))
-            elif path == "/v1/codex/execute-sequence":
-                self.json_response(202, selected_bridge.execute_sequence(payload, config=config))
-            elif path == "/v1/codex/conversation":
-                self.json_response(202, selected_bridge.send_conversation(payload, config=config))
-            elif path == "/v1/codex/planning":
-                self.json_response(202, selected_bridge.send_planning(payload, config))
-            elif path == "/v1/codex/planning/stop":
-                self.json_response(202, selected_bridge.stop_planning(payload, config))
-            elif path == "/v1/codex/environment-setup":
-                self.json_response(202, self.bridge.send_environment_setup(payload, config))
-            elif path == "/v1/codex/environment-setup/stop":
-                self.json_response(202, self.bridge.stop_environment_setup(payload, config))
-            elif path == "/v1/codex/requirement-prototype/generate":
-                self.json_response(202, selected_bridge.generate_requirement_prototype(payload, config))
-            elif path == "/v1/codex/requirement-prototype/conversation":
-                self.json_response(202, selected_bridge.send_requirement_prototype_message(payload, config))
-            elif path == "/v1/codex/requirement-testing":
-                self.json_response(202, selected_bridge.send_requirement_testing(payload, config))
-            elif path == "/v1/codex/requirement-testing/stop":
-                self.json_response(202, selected_bridge.stop_requirement_testing(payload, config))
-            elif path == "/v1/codex/requirement-review":
-                self.json_response(202, selected_bridge.send_requirement_review(payload, config))
-            elif path == "/v1/codex/requirement-review/stop":
-                self.json_response(202, selected_bridge.stop_requirement_review(payload, config))
-            elif path == "/v1/codex/requirement-fine-tuning":
-                self.json_response(202, selected_bridge.send_requirement_fine_tuning(payload, config))
-            elif path == "/v1/codex/requirement-fine-tuning/stop":
-                self.json_response(202, selected_bridge.stop_requirement_fine_tuning(payload, config))
+            route = self.POST_ROUTES.get(path)
+            if route is not None:
+                status, target, method, config_as_keyword = route
+                target_bridge = selected_bridge if target == "workspace" else self.bridge
+                call = getattr(target_bridge, method)
+                self.json_response(
+                    status,
+                    call(payload, config=config) if config_as_keyword else call(payload, config),
+                )
             elif path == "/v1/codex/requirement-document":
                 item_key = str(payload.get("itemKey") or "").strip()
                 if not item_key:
@@ -2200,8 +2273,6 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 self.json_response(200, selected_bridge.sync_cloud_workspace(
                     program_id_of(payload.get("programId")), config,
                 ))
-            elif path == "/v1/codex/git/push":
-                self.json_response(200, selected_bridge.push_requirement_branch(payload, config))
             elif path == "/v1/codex/git/branch":
                 self.json_response(200, git_create_branch_targets(
                     selected_bridge.workspace,
@@ -2211,8 +2282,6 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     git_subproject_targets_of(selected_bridge.workspace, payload.get("targets") or []),
                     bool(payload.get("skipRoot")),
                 ))
-            elif path == "/v1/codex/git/merge":
-                self.json_response(200, selected_bridge.merge_time_plan_branches(payload, config))
             elif path == "/v1/codex/git/prepare":
                 self.json_response(200, selected_bridge.prepare_requirement_git_branch(payload))
             elif path == "/v1/codex/workspace-file/reveal":
@@ -2222,10 +2291,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 if not item_key:
                     raise BridgeFailure("缺少任务标识")
                 self.json_response(202, selected_bridge.open_prototype_directory(program_id_of(payload.get("programId")), item_key, config=config))
-            elif path == "/v1/codex/stop-all":
-                self.json_response(202, selected_bridge.stop_all_executions(payload, config=config))
             else:
-                self.json_response(202, selected_bridge.stop_conversation(payload, config=config))
+                raise BridgeFailure(f"未处理的接口路径：{path}")
         except (BridgeFailure, planner.ToolFailure, json.JSONDecodeError, ValueError) as exc:
             self.json_response(400, {"error": str(exc)})
         except Exception as exc:
