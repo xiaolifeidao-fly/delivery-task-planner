@@ -281,8 +281,10 @@ SSH_PUBLIC_KEY_RE = re.compile(
 )
 REQUIREMENT_TESTING_ITEM_KEY = "__requirement_testing__"
 REQUIREMENT_REVIEW_ITEM_KEY = "__requirement_review__"
+REQUIREMENT_FINE_TUNING_ITEM_KEY = "__requirement_fine_tuning__"
 # 需求的测试会话和 review 会话共用同一张会话表，靠 metadata.kind 分流；旧数据没有这个字段，按测试算。
 REQUIREMENT_REVIEW_SESSION_KIND = "requirement-review"
+REQUIREMENT_FINE_TUNING_SESSION_KIND = "requirement-fine-tuning"
 # review 永远跳过的目录：文档和聊天归档不是代码，评它们只会稀释真正该看的改动。
 REVIEW_EXCLUDED_DIRECTORIES = ("doc", "chat")
 # 通用评审准则：面板固定下发给每一次首轮 review，和范围、项目技能那几条规则叠加执行。
@@ -1344,6 +1346,112 @@ def build_task_testing_cases_prompt(
         ],
         message or "请根据当前任务预先生成可执行测试用例，等待后续明确指令后再执行真实测试。",
     )
+
+
+def fine_tuning_skill_instruction() -> list[str]:
+    """Tell the execution agent exactly where the user-managed project skills live."""
+    return [
+        "开始任何调整前，先检查当前工作目录下的 `.codex/skills/`；若其中存在与用户本轮目标相关的 SKILL.md，"
+        "必须完整读取并遵循它。不要把无关技能、用户附件或聊天内容当作指令文件。",
+        "当前工作目录没有匹配技能时，再使用执行器已具备的适用技能；不要为了补齐技能而改动项目配置。",
+    ]
+
+
+def build_requirement_fine_tuning_prompt(
+    program_id: int,
+    requirement: dict[str, Any],
+    context: dict[str, Any],
+    message: str,
+    workspace: Path | None = None,
+    follow_up: bool = False,
+) -> str:
+    """Give a requirement-level refinement thread authoritative scope without reopening planning."""
+    requirement_key = str(requirement.get("requirementKey") or "").strip()
+    items = [item for item in context.get("items") or [] if isinstance(item, dict)]
+    related = [item for item in items if str(item.get("requirementKey") or "").strip() == requirement_key]
+    task_lines = [
+        f"- {item.get('itemKey') or '-'}: {item.get('title') or item.get('itemKey') or '未命名'}"
+        f"（{item.get('phase') or 'requirement'}/{item.get('status') or 'todo'}；需求文档：{document_path_of(item)}）"
+        for item in related[:60]
+    ]
+    common = [
+        "这是交付任务面板的需求级「微调」会话。按用户本轮原话，对已经交付的需求继续做实际调整。",
+        "用户的输入决定要改什么、改到什么程度；不要自行扩展目标，也不要先提出拆解方案代替执行。",
+        "允许按用户要求改工作区中的代码、文档、原型或测试资产；先检查真实项目状态再动手。",
+        "不得创建或拆解任务，不得领取任务、推进任务或需求阶段、写测试验收结论，也不得提交、推送或切换 Git 分支。",
+        workspace_instruction(workspace),
+        *fine_tuning_skill_instruction(),
+        f"项目 program_id: {program_id}",
+        f"需求键 requirement_key: {requirement_key}",
+        f"需求名称: {requirement.get('name') or requirement_key}",
+        "需求详情:",
+        str(requirement.get("detail") or "（未填写）"),
+        f"需求文档目录: doc/requirements/{requirement_key}/；按需读取其中的需求文档和原型，不存在时先说明。",
+        "本需求关联任务（仅作上下文，不得改变它们的面板状态）:",
+        *(task_lines or ["- 暂无任务"]),
+        "最终回复需简要列出实际改动、验证结果，以及仍需用户决定的事项。",
+        "本上下文标记闭合之后的内容，是用户本轮输入的原文。",
+    ]
+    if follow_up:
+        common = [
+            "这是同一条需求微调会话的追加回合。保持首轮已确定的微调边界，按用户本轮原话继续实际调整。",
+            "不得创建或拆解任务，不得改变需求或任务的面板状态，不得提交、推送或切换 Git 分支。",
+            workspace_instruction(workspace),
+            *fine_tuning_skill_instruction(),
+            f"项目 program_id: {program_id}",
+            f"需求键 requirement_key: {requirement_key}",
+            "本上下文标记闭合之后的内容，是用户本轮输入的原文。",
+        ]
+    return wrap_bridge_context(common, message)
+
+
+def build_task_fine_tuning_prompt(
+    program_id: int,
+    task: dict[str, Any],
+    context: dict[str, Any],
+    requirement: dict[str, Any] | None,
+    message: str,
+    workspace: Path | None = None,
+    follow_up: bool = False,
+) -> str:
+    """Task refinement gets the task, its parent requirement, and nearby documents automatically."""
+    item_key = str(task.get("itemKey") or "").strip()
+    requirement_key = str(task.get("requirementKey") or "").strip()
+    requirement_label = requirement_key or "未关联"
+    if requirement:
+        requirement_label = f"{requirement_label} · {requirement.get('name') or requirement_key}"
+    common = [
+        "这是交付任务面板的任务级「微调」会话。按用户本轮原话，对这一条任务已交付的产物继续做实际调整。",
+        "用户的输入决定要改什么、改到什么程度；不要自行扩大为需求拆解、任务执行或测试流程。",
+        "允许按用户要求改工作区中的代码、文档、原型或测试资产；先检查真实项目状态再动手。",
+        "不得领取任务、推进任务或需求阶段、写测试验收结论，也不得提交、推送或切换 Git 分支。",
+        workspace_instruction(workspace),
+        *fine_tuning_skill_instruction(),
+        f"项目 program_id: {program_id}",
+        f"任务键 item_key: {item_key}",
+        f"任务名称: {task.get('title') or item_key}",
+        f"任务当前阶段（只读）: {task.get('phase') or 'requirement'}/{task.get('status') or 'todo'}",
+        f"任务说明: {task.get('description') or '（未填写）'}",
+        f"任务需求文档: {document_path_of(task)}（开始前优先读取）",
+        f"所属需求: {requirement_label}",
+        "所属需求详情:",
+        str((requirement or {}).get("detail") or "（未填写）"),
+        *sibling_document_lines(requirement_document_catalog(context.get("items") or [], task, workspace)),
+        "最终回复需简要列出实际改动、验证结果，以及仍需用户决定的事项。",
+        "本上下文标记闭合之后的内容，是用户本轮输入的原文。",
+    ]
+    if follow_up:
+        common = [
+            "这是同一条任务微调会话的追加回合。保持首轮已确定的微调边界，按用户本轮原话继续实际调整。",
+            "不得领取或推进任务，不得改变需求或任务的面板状态，不得提交、推送或切换 Git 分支。",
+            workspace_instruction(workspace),
+            *fine_tuning_skill_instruction(),
+            f"项目 program_id: {program_id}",
+            f"任务键 item_key: {item_key}",
+            f"任务需求文档: {document_path_of(task)}",
+            "本上下文标记闭合之后的内容，是用户本轮输入的原文。",
+        ]
+    return wrap_bridge_context(common, message)
 
 
 def build_conversation_prompt(
@@ -4307,6 +4415,34 @@ def validate_task_testing_cases_payload(value: Any) -> tuple[int, str, str, str,
     )
 
 
+def validate_fine_tuning_payload(
+    value: Any, scope: str, message_required: bool = True,
+) -> tuple[int, str, str, str, bool, str, str, str, bool]:
+    """Validate the common free-form refinement request without introducing task actions."""
+    if not isinstance(value, dict):
+        raise BridgeFailure("请求体必须是 JSON 对象")
+    program_id = program_id_of(value.get("programId"))
+    key_name = "requirementKey" if scope == "requirement" else "itemKey"
+    subject_name = "需求" if scope == "requirement" else "任务"
+    key = str(value.get(key_name) or "").strip()
+    message = str(value.get("message") or "").strip()
+    thread_id = str(value.get("threadId") or "").strip()
+    model = str(value.get("model") or "").strip()
+    provider = ai_provider_of(value)
+    if not program_id or not key or len(key) > 64:
+        raise BridgeFailure(f"缺少或无效的项目、{subject_name}标识")
+    if message_required and not message:
+        raise BridgeFailure("请输入微调要求")
+    if len(message) > 32 * 1024:
+        raise BridgeFailure("微调要求不能超过 32KB")
+    if len(thread_id) > 255 or len(model) > 128:
+        raise BridgeFailure("会话或模型标识无效")
+    return (
+        program_id, key, message, thread_id, bool(value.get("newConversation")), model,
+        provider, reasoning_effort_of(value, provider), fast_mode_of(value, provider),
+    )
+
+
 def planning_requirement_of(value: dict[str, Any]) -> dict[str, Any]:
     """Normalize the requirement a planning turn belongs to.
 
@@ -4705,6 +4841,11 @@ def requirement_prototype_executor_type(provider: str) -> str:
 def task_testing_cases_executor_type(provider: str) -> str:
     """Keep pre-generated task test-case chats apart from task execution chats."""
     return f"{ai_provider_of(provider)}-testing-cases"
+
+
+def task_fine_tuning_executor_type(provider: str) -> str:
+    """Keep task-level refinement chats out of both execution and test-case histories."""
+    return f"{ai_provider_of(provider)}-fine-tuning"
 
 
 def validate_requirement_prototype_payload(value: Any, message_required: bool = False) -> tuple[int, str, str, str, str, bool]:
@@ -8626,6 +8767,245 @@ class ExecutionBridge:
                     self.active.discard(identity)
                     self._release_active_run(identity)
 
+    # ---------- 需求级微调会话 ----------
+
+    @staticmethod
+    def _requirement_fine_tuning_item_key(requirement_key: str) -> str:
+        return f"{REQUIREMENT_FINE_TUNING_ITEM_KEY}:{requirement_key}"
+
+    @staticmethod
+    def _requirement_fine_tuning_identity(program_id: int, requirement_key: str) -> tuple[str, int, str]:
+        return task_identity("", program_id, ExecutionBridge._requirement_fine_tuning_item_key(requirement_key))
+
+    def _load_requirement_fine_tuning_session(
+        self, config: dict[str, Any], program_id: int, requirement_key: str, provider: str, thread_id: str = "",
+    ) -> dict[str, Any] | None:
+        rows = planner.request_api(
+            config, "GET", "/delivery/requirement/testing-sessions",
+            query={"programId": program_id, "requirementKey": requirement_key},
+        )
+        rows = [
+            row for row in (rows or [])
+            if isinstance(row, dict) and str(row.get("threadId") or "")
+            and session_kind_of(row) == REQUIREMENT_FINE_TUNING_SESSION_KIND
+        ]
+        if not rows:
+            return None
+        catalog = [
+            {
+                "threadId": str(row.get("threadId") or ""), "title": str(row.get("title") or ""),
+                "createdAt": str(row.get("createdAt") or ""), "updatedAt": str(row.get("updatedAt") or ""),
+                "status": str(row.get("status") or "completed"),
+                "executorType": executor_provider_of(row, provider), "active": False,
+            }
+            for row in rows
+        ]
+        current = next((row for row in rows if str(row.get("threadId") or "") == thread_id), rows[-1])
+        metadata = current.get("metadata") if isinstance(current.get("metadata"), dict) else {}
+        return {
+            "threadId": str(current.get("threadId") or ""), "turnId": str(metadata.get("turnId") or ""),
+            "executorType": executor_provider_of(current, provider), "requirementKey": requirement_key, "catalog": catalog,
+        }
+
+    def _save_requirement_fine_tuning_session(
+        self, config: dict[str, Any], program_id: int, requirement_key: str, provider: str, session: dict[str, Any],
+    ) -> None:
+        thread_id = str(session.get("threadId") or "")
+        if not requirement_key or not thread_id:
+            return
+        entry = next((item for item in session.get("catalog") or [] if str(item.get("threadId") or "") == thread_id), {})
+        provider = executor_provider_of(entry, session.get("executorType") or provider)
+        try:
+            planner.request_api(
+                config, "POST", "/delivery/requirement/testing-session/bind",
+                body={
+                    "programId": program_id, "requirementKey": requirement_key, "executorType": provider,
+                    "threadId": thread_id, "title": str(entry.get("title") or "")[:120],
+                    "status": str(entry.get("status") or "running"),
+                    "metadata": {
+                        "turnId": str(session.get("turnId") or ""), "kind": REQUIREMENT_FINE_TUNING_SESSION_KIND,
+                        "workspace": self.workspace.name,
+                    },
+                    "actorName": f"{provider}-http-bridge",
+                },
+            )
+        except Exception as exc:
+            print(f"保存需求微调会话目录失败：{program_id}/{requirement_key}: {exc}", file=sys.stderr, flush=True)
+
+    def requirement_fine_tuning(
+        self, program_id: int, requirement_key: str, thread_id: str = "", provider: str = "codex", config: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        config = request_scoped_config(config, DEFAULT_BIZ_LINE, program_id)
+        provider = ai_provider_of(provider)
+        requirement = self._requirement_for_prototype(config, program_id, requirement_key)
+        session = self._load_requirement_fine_tuning_session(config, program_id, requirement_key, provider, thread_id)
+        catalog = list((session or {}).get("catalog") or [])
+        selected_thread_id = thread_id or str((session or {}).get("threadId") or "")
+        identity = self._requirement_fine_tuning_identity(program_id, requirement_key)
+        with self.lock:
+            active = self.active_runs.get(identity)
+        if not selected_thread_id:
+            return {
+                "programId": program_id, "requirementKey": requirement_key, "threadId": "", "executorType": provider,
+                "turns": [], "conversations": catalog, "active": False, "activeTurnId": "",
+            }
+        provider = executor_provider_of(
+            next((entry for entry in catalog if str(entry.get("threadId") or "") == selected_thread_id), {}),
+            (session or {}).get("executorType") or provider,
+        )
+        live_client = active["client"] if active is not None and active.get("threadId") == selected_thread_id else None
+        thread = self._read_thread_with_workspace_archive(
+            live_client, selected_thread_id, "requirement", requirement_key, config, program_id,
+            provider=provider, environment=codex_environment(config, program_id, write_allowed=True),
+        )
+        item_key = self._requirement_fine_tuning_item_key(requirement_key)
+        for entry in catalog:
+            entry["active"] = bool(active is not None and entry.get("threadId") == active.get("threadId"))
+            if not entry["active"] and entry.get("status") == "running":
+                entry["status"] = "interrupted"
+        return {
+            "programId": program_id, "requirementKey": requirement_key, "threadId": selected_thread_id,
+            "executorType": provider,
+            "turns": serialize_turns(
+                thread.get("turns") or [],
+                lambda attachment_ids: [ConversationAttachmentStore._public(attachment) for attachment in self.attachments.resolve(program_id, item_key, attachment_ids)],
+                lambda paths: self.artifacts.register(config_biz_line(config), program_id, item_key, paths),
+            ),
+            "conversations": catalog,
+            "active": bool(active is not None and active.get("threadId") == selected_thread_id),
+            "activeTurnId": str((active or {}).get("turnId") or ""),
+        }
+
+    def send_requirement_fine_tuning(self, raw: Any, config: dict[str, Any]) -> dict[str, Any]:
+        (
+            program_id, requirement_key, message, requested_thread_id, new_conversation, model,
+            provider, reasoning_effort, fast_mode,
+        ) = validate_fine_tuning_payload(raw, "requirement")
+        assert_runtime_project(config, program_id)
+        requirement = self._requirement_for_prototype(config, program_id, requirement_key)
+        context = planner.project_context(config, program_id)
+        identity = self._requirement_fine_tuning_identity(program_id, requirement_key)
+        session = self._load_requirement_fine_tuning_session(config, program_id, requirement_key, provider, requested_thread_id)
+        with self.lock:
+            active = self.active_runs.get(identity)
+        if active is not None:
+            if new_conversation or (requested_thread_id and requested_thread_id != active.get("threadId")):
+                raise BridgeFailure("当前需求已有正在运行的微调会话，请先停止或等待完成")
+            active["client"].steer_turn(
+                str(active["threadId"]), str(active["turnId"]), message, [], request_id=active["client"].next_request_id(),
+            )
+            self.progress.publish(identity, "message", "已追加微调要求", message, "running")
+            return {"accepted": True, "programId": program_id, "requirementKey": requirement_key, "threadId": active["threadId"], "turnId": active["turnId"], "active": True}
+        catalog = list((session or {}).get("catalog") or [])
+        known_thread_ids = {str(entry.get("threadId") or "") for entry in catalog}
+        if requested_thread_id and requested_thread_id not in known_thread_ids:
+            raise BridgeFailure("所选需求微调会话不存在")
+        if not session or new_conversation or not session.get("threadId"):
+            if len(catalog) >= MAX_PLANNING_CONVERSATIONS:
+                raise BridgeFailure("该需求保留的微调会话已达上限")
+            title = f"需求微调 · {requirement.get('name') or requirement_key}"
+            if catalog:
+                title = f"{title} V{len(catalog) + 1}"
+            client = create_ai_client(
+                provider, self.workspace, lambda event: self._publish_app_server_event(identity, event),
+                codex_environment(config, program_id, write_allowed=True),
+            )
+            try:
+                thread_id, turn_id = client.start_task(
+                    title, build_requirement_fine_tuning_prompt(program_id, requirement, context, message, self.workspace), [],
+                    model=model, reasoning_effort=reasoning_effort, fast_mode=fast_mode,
+                )
+            except Exception:
+                client.close()
+                raise
+            session = {
+                "threadId": thread_id, "turnId": turn_id, "requirementKey": requirement_key, "executorType": provider,
+                "catalog": [*catalog, {"threadId": thread_id, "title": title, "createdAt": utc_now(), "updatedAt": utc_now(), "status": "running", "active": True, "executorType": provider}],
+            }
+        else:
+            thread_id = requested_thread_id or str(session.get("threadId") or "")
+            provider = executor_provider_of(
+                next((entry for entry in catalog if str(entry.get("threadId") or "") == thread_id), {}),
+                session.get("executorType") or provider,
+            )
+            client = create_ai_client(
+                provider, self.workspace, lambda event: self._publish_app_server_event(identity, event),
+                codex_environment(config, program_id, write_allowed=True),
+            )
+            try:
+                client.resume_thread(thread_id)
+                turn_id = client.start_turn(
+                    thread_id, build_requirement_fine_tuning_prompt(program_id, requirement, context, message, self.workspace, follow_up=True), [],
+                    request_id=client.next_request_id(), model=model, reasoning_effort=reasoning_effort, fast_mode=fast_mode,
+                )
+            except Exception:
+                client.close()
+                raise
+            session.update({"threadId": thread_id, "turnId": turn_id, "executorType": provider})
+            for entry in session.get("catalog") or []:
+                if entry.get("threadId") == thread_id:
+                    entry.update({"status": "running", "active": True, "updatedAt": utc_now(), "executorType": provider})
+        with self.lock:
+            self.active.add(identity)
+            self.active_runs[identity] = {
+                "client": client, "threadId": thread_id, "turnId": turn_id, "requirementFineTuning": True,
+                "provider": provider, "config": config, "programId": program_id, "requirementKey": requirement_key,
+            }
+        self._save_requirement_fine_tuning_session(config, program_id, requirement_key, provider, session)
+        self.progress.publish(identity, "status", "正在微调需求", f"{provider_label(provider)} 正在按本轮要求调整需求产物。", "running")
+        threading.Thread(
+            target=self._follow_requirement_fine_tuning,
+            args=(identity, client, config, program_id, requirement_key, provider, session, thread_id, turn_id), daemon=True,
+        ).start()
+        return {"accepted": True, "programId": program_id, "requirementKey": requirement_key, "threadId": thread_id, "turnId": turn_id, "active": True}
+
+    def stop_requirement_fine_tuning(self, raw: Any, config: dict[str, Any]) -> dict[str, Any]:
+        program_id, requirement_key, _message, requested_thread_id, _new, _model, _provider, _effort, _fast = validate_fine_tuning_payload(raw, "requirement", message_required=False)
+        assert_runtime_project(config, program_id)
+        identity = self._requirement_fine_tuning_identity(program_id, requirement_key)
+        with self.lock:
+            active = self.active_runs.get(identity)
+        if active is None or not active.get("requirementFineTuning"):
+            raise BridgeFailure("该需求当前没有正在运行的微调会话")
+        if requested_thread_id and requested_thread_id != active.get("threadId"):
+            raise BridgeFailure("所选需求微调会话当前没有正在运行的回合")
+        active["client"].interrupt_turn(str(active["threadId"]), str(active["turnId"]), request_id=active["client"].next_request_id())
+        self.progress.publish(identity, "status", "已请求停止微调", "正在等待当前微调回合中断。", "running")
+        return {"accepted": True, "programId": program_id, "requirementKey": requirement_key, "threadId": active["threadId"], "turnId": active["turnId"], "active": True}
+
+    def _follow_requirement_fine_tuning(
+        self, identity: tuple[str, int, str], client: AppServerClient, config: dict[str, Any], program_id: int,
+        requirement_key: str, provider: str, session: dict[str, Any], thread_id: str, turn_id: str,
+    ) -> None:
+        try:
+            turn_status = client.wait_turn(turn_id)
+            entry = next((item for item in session.get("catalog") or [] if str(item.get("threadId") or "") == thread_id), {})
+            title = str(entry.get("title") or "需求微调")
+            self._archive_terminal_chat(
+                client, config=config, program_id=program_id, resource_kind="requirement", resource_key=requirement_key,
+                resource_name=title, conversation_title=title, thread_id=thread_id, provider=provider,
+                phase="fine-tuning", terminal_status=turn_status,
+            )
+            for item in session.get("catalog") or []:
+                if item.get("threadId") == thread_id:
+                    item.update({"status": turn_status, "active": False, "updatedAt": utc_now()})
+            session["turnId"] = turn_id
+            self._save_requirement_fine_tuning_session(config, program_id, requirement_key, provider, session)
+            self.progress.publish(
+                identity, "status", "需求微调已完成" if turn_status == "completed" else "需求微调未完成",
+                "请查看聊天中的改动和验证结果。", turn_status,
+            )
+        except Exception as exc:
+            self.progress.publish(identity, "error", "同步需求微调结果失败", str(exc), "failed")
+            print(f"同步需求微调结果失败：{program_id}/{requirement_key}: {exc}", file=sys.stderr, flush=True)
+        finally:
+            client.close()
+            with self.lock:
+                current = self.active_runs.get(identity)
+                if current is None or current.get("client") is client:
+                    self.active.discard(identity)
+                    self._release_active_run(identity)
+
     def models(self, config: dict[str, Any], provider: str = "codex") -> dict[str, Any]:
         program_id = program_id_of(config.get("_project_id"))
         assert_runtime_project(config, program_id)
@@ -8925,6 +9305,20 @@ class ExecutionBridge:
             raise BridgeFailure("任务测试用例路径超出当前项目") from exc
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_text(cases.rstrip() + "\n", encoding="utf-8")
+        return destination
+
+    def _persist_task_testing_report(self, item_key: str, report: str) -> Path:
+        """Keep the task-level report at the same project-relative location as its test cases."""
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", item_key):
+            raise BridgeFailure("任务测试报告路径无效")
+        relative = Path("doc") / "test" / item_key / "测试报告.md"
+        destination = (self.workspace / relative).resolve()
+        try:
+            destination.relative_to(self.workspace)
+        except ValueError as exc:
+            raise BridgeFailure("任务测试报告路径超出当前项目") from exc
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(report.rstrip() + "\n", encoding="utf-8")
         return destination
 
     def _task_testing_cases_binding(
@@ -9322,6 +9716,325 @@ class ExecutionBridge:
                 pass
             self.progress.publish(identity, "error", "同步任务测试用例失败", str(exc), "failed")
             print(f"同步任务测试用例失败：{program_id}/{item_key}: {exc}", file=sys.stderr, flush=True)
+        finally:
+            client.close()
+            with self.lock:
+                current = self.active_runs.get(identity)
+                if current is None or current.get("client") is client:
+                    self.active.discard(identity)
+                    self._release_active_run(identity)
+
+    # ---------- 任务级微调会话 ----------
+
+    @staticmethod
+    def _task_fine_tuning_identity(program_id: int, item_key: str, provider: str = "codex") -> tuple[str, int, str]:
+        return task_identity("", program_id, f"__fine_tuning__:{ai_provider_of(provider)}:{item_key}")
+
+    def _task_fine_tuning_bindings(
+        self, config: dict[str, Any], program_id: int, item_key: str, provider: str,
+    ) -> list[dict[str, Any]]:
+        sessions = planner.request_api(
+            config, "GET", "/delivery/item/execution-session",
+            query={"programId": program_id, "itemKey": item_key},
+        ) or []
+        executor_type = task_fine_tuning_executor_type(provider)
+        return [
+            session for session in sessions
+            if isinstance(session, dict) and same_executor_purpose(session, executor_type)
+        ]
+
+    def _bind_task_fine_tuning_session(
+        self,
+        config: dict[str, Any],
+        program_id: int,
+        item_key: str,
+        task: dict[str, Any],
+        provider: str,
+        binding: dict[str, Any] | None,
+        thread_id: str,
+        turn_id: str,
+        title: str = "",
+        status: str = "running",
+    ) -> dict[str, Any]:
+        task_phase = str(task.get("phase") or "requirement")
+        binding_phase = str((binding or {}).get("phase") or task_phase)
+        existing_thread_id = str((binding or {}).get("externalSessionId") or "")
+        phase = binding_phase if existing_thread_id == thread_id else task_phase
+        metadata = conversation_metadata(binding, thread_id, turn_id, status, title, phase)
+        metadata.update({"workspace": self.workspace.name, "source": "task-fine-tuning"})
+        body = {
+            "programId": program_id, "itemKey": item_key,
+            "executorType": task_fine_tuning_executor_type(provider), "phase": phase,
+            "status": SESSION_STATUS.get(status, "running"), "progress": 0,
+            "metadata": metadata, "actorName": f"{provider}-http-bridge",
+        }
+        if binding and existing_thread_id == thread_id and binding_phase != task_phase:
+            version = int(binding.get("version") or 0)
+            if version <= 0:
+                raise BridgeFailure("任务微调会话版本无效，请刷新后重试")
+            return self._request_with_retry(
+                config, "/delivery/item/execution-session/status", {**body, "version": version},
+            )
+        return planner.request_api(
+            config, "POST", "/delivery/item/execution-session/bind",
+            body={**body, "externalSessionId": thread_id},
+        )
+
+    @staticmethod
+    def _task_fine_tuning_title(task: dict[str, Any], binding: dict[str, Any] | None = None) -> str:
+        base = f"{' '.join(str(task.get('title') or task.get('itemKey') or '任务').split())} · 微调"
+        version = next_conversation_version(binding)
+        if version:
+            suffix = f" V{version + 1}"
+            return f"{base[:80 - len(suffix)].rstrip()}{suffix}"
+        return base[:80]
+
+    def _active_task_fine_tuning(self, program_id: int, item_key: str) -> tuple[tuple[str, int, str], dict[str, Any]] | None:
+        with self.lock:
+            for identity, active in self.active_runs.items():
+                if (
+                    identity[1] == program_id and active.get("taskFineTuning")
+                    and str(active.get("itemKey") or "") == item_key
+                ):
+                    return identity, active
+        return None
+
+    def task_fine_tuning_conversation(
+        self,
+        program_id: int,
+        item_key: str,
+        selected_thread_id: str = "",
+        provider: str = "codex",
+        config: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        provider = ai_provider_of(provider)
+        config = request_scoped_config(config, DEFAULT_BIZ_LINE, program_id)
+        task = self._task_detail(config, program_id, item_key)
+        bindings = self._task_fine_tuning_bindings(config, program_id, item_key, provider)
+        binding = bindings[-1] if bindings else None
+        catalog, binding_by_thread = merged_conversation_catalog(bindings)
+        current_thread_id = str((binding or {}).get("externalSessionId") or "")
+        known_thread_ids = {str(entry.get("threadId") or "") for entry in catalog}
+        if selected_thread_id and selected_thread_id not in known_thread_ids:
+            raise BridgeFailure("所选任务微调会话不存在")
+        thread_id = selected_thread_id or current_thread_id or (str(catalog[0].get("threadId") or "") if catalog else "")
+        binding = binding_by_thread.get(thread_id, binding)
+        provider = executor_provider_of(binding, provider)
+        identity = self._task_fine_tuning_identity(program_id, item_key, provider)
+        with self.lock:
+            active = self.active_runs.get(identity)
+        if not thread_id:
+            return {
+                "programId": program_id, "itemKey": item_key, "threadId": "", "executorType": provider,
+                "turns": [], "conversations": catalog, "active": False, "activeTurnId": "",
+            }
+        active_for_thread = active if active is not None and active.get("threadId") == thread_id else None
+        live_client = active_for_thread["client"] if active_for_thread is not None else None
+        thread = self._read_thread_with_workspace_archive(
+            live_client, thread_id, "task", item_key, config, program_id,
+            provider=provider, environment=codex_environment(config, program_id, write_allowed=True),
+        )
+        for entry in catalog:
+            entry["active"] = bool(active_for_thread is not None and entry.get("threadId") == thread_id)
+            if not entry["active"] and entry.get("status") == "running":
+                entry["status"] = "interrupted"
+        return {
+            "programId": program_id, "itemKey": item_key, "threadId": thread_id, "executorType": provider,
+            "turns": serialize_turns(
+                thread.get("turns") or [],
+                None,
+                lambda paths: self.artifacts.register(config_biz_line(config), program_id, item_key, paths),
+            ),
+            "conversations": catalog, "active": active_for_thread is not None,
+            "activeTurnId": str((active_for_thread or {}).get("turnId") or ""),
+        }
+
+    def _resume_task_fine_tuning_turn(
+        self,
+        config: dict[str, Any],
+        identity: tuple[str, int, str],
+        task: dict[str, Any],
+        binding: dict[str, Any],
+        provider: str,
+        thread_id: str,
+        turn_id: str,
+    ) -> dict[str, Any]:
+        with self.lock:
+            existing = self.active_runs.get(identity)
+            if existing is not None:
+                return existing
+            if identity in self.active:
+                raise BridgeFailure("该任务已有正在运行的微调会话")
+            self.active.add(identity)
+        client = create_ai_client(
+            provider, self.workspace, lambda event: self._publish_app_server_event(identity, event),
+            codex_environment(config, program_id_of(config.get("_project_id")), write_allowed=True),
+        )
+        try:
+            client.resume_thread(thread_id)
+            with self.lock:
+                self.active_runs[identity] = {
+                    "client": client, "threadId": thread_id, "turnId": turn_id, "taskFineTuning": True,
+                    "task": task, "binding": binding, "config": config, "provider": provider,
+                    "programId": program_id_of(config.get("_project_id")), "itemKey": str(task.get("itemKey") or ""),
+                }
+                return self.active_runs[identity]
+        except Exception:
+            client.close()
+            with self.lock:
+                self.active.discard(identity)
+                self._release_active_run(identity)
+            raise
+
+    def send_task_fine_tuning(self, raw: Any, config: dict[str, Any]) -> dict[str, Any]:
+        (
+            program_id, item_key, message, requested_thread_id, new_conversation, model,
+            provider, reasoning_effort, fast_mode,
+        ) = validate_fine_tuning_payload(raw, "task")
+        config = request_scoped_config(config, biz_line_of(raw), program_id)
+        task = self._task_detail(config, program_id, item_key)
+        context = planner.project_context(config, program_id)
+        requirement_key = str(task.get("requirementKey") or "").strip()
+        requirement = planner.requirement_record(config, program_id, requirement_key) if requirement_key else None
+        active_entry = self._active_task_fine_tuning(program_id, item_key)
+        if active_entry is not None:
+            identity, active = active_entry
+            if new_conversation or (requested_thread_id and requested_thread_id != active.get("threadId")):
+                raise BridgeFailure("该任务已有正在运行的微调会话，请先停止或等待完成")
+            active["client"].steer_turn(
+                str(active["threadId"]), str(active["turnId"]), message, request_id=active["client"].next_request_id(),
+            )
+            self.progress.publish(identity, "message", "已追加微调要求", message, "running")
+            return {"accepted": True, "programId": program_id, "itemKey": item_key, "threadId": active["threadId"], "turnId": active["turnId"], "active": True}
+        bindings = self._task_fine_tuning_bindings(config, program_id, item_key, provider)
+        binding = bindings[-1] if bindings else None
+        catalog, binding_by_thread = merged_conversation_catalog(bindings)
+        known_thread_ids = {str(entry.get("threadId") or "") for entry in catalog}
+        if requested_thread_id and requested_thread_id not in known_thread_ids:
+            raise BridgeFailure("所选任务微调会话不存在")
+        selected_thread_id = requested_thread_id or str((binding or {}).get("externalSessionId") or "")
+        if selected_thread_id:
+            binding = binding_by_thread.get(selected_thread_id, binding)
+            provider = executor_provider_of(binding, provider)
+        identity = self._task_fine_tuning_identity(program_id, item_key, provider)
+        if binding and binding.get("status") == "running" and selected_thread_id:
+            metadata = binding.get("metadata") if isinstance(binding.get("metadata"), dict) else {}
+            running_turn_id = str(metadata.get("turnId") or "")
+            if running_turn_id:
+                active = self._resume_task_fine_tuning_turn(
+                    config, identity, task, binding, provider, selected_thread_id, running_turn_id,
+                )
+                active["client"].steer_turn(
+                    selected_thread_id, running_turn_id, message, request_id=active["client"].next_request_id(),
+                )
+                self.progress.publish(identity, "message", "已追加微调要求", message, "running")
+                return {"accepted": True, "programId": program_id, "itemKey": item_key, "threadId": selected_thread_id, "turnId": running_turn_id, "active": True}
+        client = create_ai_client(
+            provider, self.workspace, lambda event: self._publish_app_server_event(identity, event),
+            codex_environment(config, program_id, write_allowed=True),
+        )
+        title = ""
+        try:
+            if not selected_thread_id or new_conversation:
+                title = self._task_fine_tuning_title(task, binding)
+                thread_id, turn_id = client.start_task(
+                    title, build_task_fine_tuning_prompt(program_id, task, context, requirement, message, self.workspace),
+                    model=model, reasoning_effort=reasoning_effort, fast_mode=fast_mode,
+                )
+            else:
+                thread_id = selected_thread_id
+                client.resume_thread(thread_id)
+                turn_id = client.start_turn(
+                    thread_id, build_task_fine_tuning_prompt(program_id, task, context, requirement, message, self.workspace, follow_up=True),
+                    request_id=client.next_request_id(), model=model, reasoning_effort=reasoning_effort, fast_mode=fast_mode,
+                )
+            refreshed_binding = self._bind_task_fine_tuning_session(
+                config, program_id, item_key, task, provider, binding, thread_id, turn_id, title,
+            )
+            with self.lock:
+                if identity in self.active:
+                    raise BridgeFailure("该任务已有正在运行的微调会话")
+                self.active.add(identity)
+                self.active_runs[identity] = {
+                    "client": client, "threadId": thread_id, "turnId": turn_id, "taskFineTuning": True,
+                    "task": task, "binding": refreshed_binding, "config": config, "provider": provider,
+                    "programId": program_id, "itemKey": item_key,
+                }
+        except Exception:
+            client.close()
+            with self.lock:
+                self.active.discard(identity)
+                self._release_active_run(identity)
+            raise
+        self.progress.publish(identity, "status", "正在微调任务", f"{provider_label(provider)} 正在按本轮要求调整任务产物。", "running")
+        threading.Thread(
+            target=self._follow_task_fine_tuning,
+            args=(identity, client, config, program_id, item_key, provider, thread_id, turn_id, task, refreshed_binding), daemon=True,
+        ).start()
+        return {"accepted": True, "programId": program_id, "itemKey": item_key, "threadId": thread_id, "turnId": turn_id, "active": True}
+
+    def stop_task_fine_tuning(self, raw: Any, config: dict[str, Any]) -> dict[str, Any]:
+        program_id, item_key, _message, requested_thread_id, _new, _model, provider, _effort, _fast = validate_fine_tuning_payload(raw, "task", message_required=False)
+        config = request_scoped_config(config, biz_line_of(raw), program_id)
+        active_entry = self._active_task_fine_tuning(program_id, item_key)
+        if active_entry is None:
+            bindings = self._task_fine_tuning_bindings(config, program_id, item_key, provider)
+            binding = bindings[-1] if bindings else None
+            catalog, binding_by_thread = merged_conversation_catalog(bindings)
+            if requested_thread_id:
+                binding = binding_by_thread.get(requested_thread_id, binding)
+            thread_id = str((binding or {}).get("externalSessionId") or "")
+            metadata = (binding or {}).get("metadata") if isinstance((binding or {}).get("metadata"), dict) else {}
+            turn_id = str(metadata.get("turnId") or "")
+            if not binding or binding.get("status") != "running" or not thread_id or not turn_id:
+                raise BridgeFailure("该任务当前没有正在运行的微调会话")
+            task = self._task_detail(config, program_id, item_key)
+            provider = executor_provider_of(binding, provider)
+            identity = self._task_fine_tuning_identity(program_id, item_key, provider)
+            active = self._resume_task_fine_tuning_turn(config, identity, task, binding, provider, thread_id, turn_id)
+        else:
+            identity, active = active_entry
+        if requested_thread_id and requested_thread_id != active.get("threadId"):
+            raise BridgeFailure("所选任务微调会话当前没有正在运行的回合")
+        active["client"].interrupt_turn(str(active["threadId"]), str(active["turnId"]), request_id=active["client"].next_request_id())
+        self.progress.publish(identity, "status", "已请求停止微调", "正在等待当前微调回合中断。", "running")
+        return {"accepted": True, "programId": program_id, "itemKey": item_key, "threadId": active["threadId"], "turnId": active["turnId"], "active": True}
+
+    def _follow_task_fine_tuning(
+        self, identity: tuple[str, int, str], client: AppServerClient, config: dict[str, Any], program_id: int,
+        item_key: str, provider: str, thread_id: str, turn_id: str,
+        task: dict[str, Any], binding: dict[str, Any],
+    ) -> None:
+        try:
+            turn_status = client.wait_turn(turn_id)
+            title = str(next((entry.get("title") for entry in conversation_catalog(binding) if entry.get("threadId") == thread_id), "") or "任务微调")
+            self._archive_terminal_chat(
+                client, config=config, program_id=program_id, resource_kind="task", resource_key=item_key,
+                resource_name=str(task.get("title") or item_key), requirement_key=str(task.get("requirementKey") or ""),
+                conversation_title=title, thread_id=thread_id, provider=provider, phase="fine-tuning", terminal_status=turn_status,
+            )
+            phase = str(binding.get("phase") or task.get("phase") or "requirement")
+            metadata = conversation_metadata(binding, thread_id, turn_id, turn_status, phase=phase)
+            metadata.update({"workspace": self.workspace.name, "source": "task-fine-tuning"})
+            version = int(binding.get("version") or 0)
+            if version > 0:
+                self._request_with_retry(
+                    config, "/delivery/item/execution-session/status",
+                    {
+                        "programId": program_id, "itemKey": item_key,
+                        "executorType": task_fine_tuning_executor_type(provider), "phase": phase,
+                        "version": version, "status": SESSION_STATUS.get(turn_status, "blocked"),
+                        "progress": 100 if turn_status == "completed" else 0, "metadata": metadata,
+                        "actorName": f"{provider}-http-bridge",
+                    },
+                )
+            self.progress.publish(
+                identity, "status", "任务微调已完成" if turn_status == "completed" else "任务微调未完成",
+                "请查看聊天中的改动和验证结果。", turn_status,
+            )
+        except Exception as exc:
+            self.progress.publish(identity, "error", "同步任务微调结果失败", str(exc), "failed")
+            print(f"同步任务微调结果失败：{program_id}/{item_key}: {exc}", file=sys.stderr, flush=True)
         finally:
             client.close()
             with self.lock:
@@ -12206,9 +12919,14 @@ class ExecutionBridge:
             }
             if output_field:
                 # 追加回合只产出增量：覆盖会把同一阶段前几轮的产物文档整段丢掉。
-                patch_body[output_field] = merged_execution_output(
+                output = merged_execution_output(
                     str(current_task.get(output_field) or ""), execution_output_text
                 )
+                patch_body[output_field] = output
+                if phase == "testing" and output.strip():
+                    # 测试报告和测试用例都以项目内相对路径作为权威预览源；
+                    # 不把工作区绝对路径传给面板，避免浏览器按 URL 打开时报 404。
+                    self._persist_task_testing_report(item_key, output)
             if phase == "requirement" and turn_status == "completed":
                 requirement_text = final_agent_text_from_output(execution_output_text)
                 self._persist_requirement_document(current_task, requirement_text)
@@ -13460,6 +14178,30 @@ class BridgeHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self.json_response(500, {"error": f"读取代码 review 会话失败：{exc}"})
             return
+        if parsed.path == "/v1/codex/requirement-fine-tuning":
+            if not self.allowed_origin():
+                self.json_response(403, {"error": "origin not allowed"})
+                return
+            query = parse_qs(parsed.query)
+            try:
+                program_id = program_id_of((query.get("programId") or [""])[0])
+                requirement_key = str((query.get("requirementKey") or [""])[0]).strip()
+                thread_id = str((query.get("threadId") or [""])[0]).strip()
+                provider = ai_provider_of((query.get("provider") or ["codex"])[0])
+                if not requirement_key:
+                    raise BridgeFailure("缺少需求标识")
+                selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
+                config = self.bridge.request_config(
+                    {"programId": program_id}, self.allowed_origin() or "", self.headers.get("token", "").strip(),
+                )
+                self.json_response(200, selected_bridge.requirement_fine_tuning(
+                    program_id, requirement_key, thread_id, provider, config=config,
+                ))
+            except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
+                self.json_response(400, {"error": str(exc)})
+            except Exception as exc:
+                self.json_response(500, {"error": f"读取需求微调会话失败：{exc}"})
+            return
         if parsed.path == "/v1/codex/task-testing-cases":
             if not self.allowed_origin():
                 self.json_response(403, {"error": "origin not allowed"})
@@ -13483,6 +14225,30 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 self.json_response(400, {"error": str(exc)})
             except Exception as exc:
                 self.json_response(500, {"error": f"读取任务测试用例会话失败：{exc}"})
+            return
+        if parsed.path == "/v1/codex/task-fine-tuning":
+            if not self.allowed_origin():
+                self.json_response(403, {"error": "origin not allowed"})
+                return
+            query = parse_qs(parsed.query)
+            try:
+                program_id = program_id_of((query.get("programId") or [""])[0])
+                item_key = str((query.get("itemKey") or [""])[0]).strip()
+                thread_id = str((query.get("threadId") or [""])[0]).strip()
+                provider = ai_provider_of((query.get("provider") or ["codex"])[0])
+                if not item_key:
+                    raise BridgeFailure("缺少任务标识")
+                selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
+                config = self.bridge.request_config(
+                    {"programId": program_id}, self.allowed_origin() or "", self.headers.get("token", "").strip(),
+                )
+                self.json_response(200, selected_bridge.task_fine_tuning_conversation(
+                    program_id, item_key, thread_id, provider, config=config,
+                ))
+            except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
+                self.json_response(400, {"error": str(exc)})
+            except Exception as exc:
+                self.json_response(500, {"error": f"读取任务微调会话失败：{exc}"})
             return
         if parsed.path in {"/v1/codex/document-set", "/v1/codex/document-file"}:
             if not self.allowed_origin():
@@ -13713,6 +14479,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
             "/v1/codex/execute",
             "/v1/codex/task-testing-cases",
             "/v1/codex/task-testing-cases/stop",
+            "/v1/codex/task-fine-tuning",
+            "/v1/codex/task-fine-tuning/stop",
             "/v1/codex/execute-batch",
             "/v1/codex/execute-sequence",
             "/v1/codex/conversation",
@@ -13726,6 +14494,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
             "/v1/codex/requirement-testing/stop",
             "/v1/codex/requirement-review",
             "/v1/codex/requirement-review/stop",
+            "/v1/codex/requirement-fine-tuning",
+            "/v1/codex/requirement-fine-tuning/stop",
             "/v1/codex/attachments",
             "/v1/codex/business-attachments",
             "/v1/codex/prototype-directory/open",
@@ -13827,6 +14597,10 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 self.json_response(202, selected_bridge.generate_task_testing_cases(payload, config))
             elif path == "/v1/codex/task-testing-cases/stop":
                 self.json_response(202, selected_bridge.stop_task_testing_cases(payload, config))
+            elif path == "/v1/codex/task-fine-tuning":
+                self.json_response(202, selected_bridge.send_task_fine_tuning(payload, config))
+            elif path == "/v1/codex/task-fine-tuning/stop":
+                self.json_response(202, selected_bridge.stop_task_fine_tuning(payload, config))
             elif path == "/v1/codex/execute-batch":
                 self.json_response(202, selected_bridge.execute_batch(payload, config=config))
             elif path == "/v1/codex/execute-sequence":
@@ -13853,6 +14627,10 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 self.json_response(202, selected_bridge.send_requirement_review(payload, config))
             elif path == "/v1/codex/requirement-review/stop":
                 self.json_response(202, selected_bridge.stop_requirement_review(payload, config))
+            elif path == "/v1/codex/requirement-fine-tuning":
+                self.json_response(202, selected_bridge.send_requirement_fine_tuning(payload, config))
+            elif path == "/v1/codex/requirement-fine-tuning/stop":
+                self.json_response(202, selected_bridge.stop_requirement_fine_tuning(payload, config))
             elif path == "/v1/codex/requirement-document":
                 item_key = str(payload.get("itemKey") or "").strip()
                 if not item_key:

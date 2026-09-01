@@ -647,6 +647,44 @@ class HttpBridgeTest(unittest.TestCase):
         self.assertIn("测试用例已生成", follow_up)
         self.assertNotIn("本需求下其他任务已写好的需求文档", follow_up)
 
+    def test_requirement_fine_tuning_prompt_loads_workspace_skills_without_reopening_delivery_flow(self):
+        requirement = {"requirementKey": "req-a", "name": "需求一", "detail": "已完成能力"}
+        context = {
+            "items": [
+                {"itemKey": "task-a", "title": "接口", "requirementKey": "req-a", "phase": "development", "status": "done"},
+                {"itemKey": "task-b", "title": "无关任务", "requirementKey": "req-b"},
+            ],
+        }
+
+        prompt = bridge.build_requirement_fine_tuning_prompt(
+            1, requirement, context, "补充一个筛选条件", Path("/tmp/workspace"),
+        )
+
+        self.assertIn(".codex/skills/", prompt)
+        self.assertIn("task-a: 接口", prompt)
+        self.assertNotIn("task-b: 无关任务", prompt)
+        self.assertIn("不得创建或拆解任务", prompt)
+        self.assertIn("不得领取任务", prompt)
+        self.assertIn("补充一个筛选条件", prompt)
+
+    def test_task_fine_tuning_prompt_and_stop_payload_preserve_task_lifecycle(self):
+        task = {
+            "itemKey": "task-a", "title": "接口", "requirementKey": "req-a",
+            "description": "已交付", "phase": "development", "status": "done",
+        }
+        requirement = {"requirementKey": "req-a", "name": "需求一", "detail": "需求上下文"}
+
+        prompt = bridge.build_task_fine_tuning_prompt(
+            1, task, {"items": [task]}, requirement, "调整返回字段", Path("/tmp/workspace"),
+        )
+        parsed = bridge.validate_fine_tuning_payload({"programId": 1, "itemKey": "task-a"}, "task", message_required=False)
+
+        self.assertEqual("task-a", parsed[1])
+        self.assertIn(".codex/skills/", prompt)
+        self.assertIn("需求上下文", prompt)
+        self.assertIn("不得领取任务、推进任务或需求阶段", prompt)
+        self.assertIn("调整返回字段", prompt)
+
     def test_requirement_prototype_follow_up_prompt_keeps_the_write_scope_red_line(self):
         requirement = {"requirementKey": "req-a", "name": "需求一", "detail": "很长的需求正文"}
 
@@ -3746,6 +3784,37 @@ class HttpBridgeTest(unittest.TestCase):
             self.assertFalse(any(path == "/delivery/item/patch" for _, path, _, _ in requests))
             update = next(request for request in requests if request[1] == "/delivery/item/testing-cases/save")
             self.assertEqual("ready", update[3]["testingCasesStatus"])
+
+    def test_task_testing_completion_persists_report_at_relative_workspace_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            executor = bridge.ExecutionBridge(workspace)
+            task = {
+                "itemKey": "api-1", "title": "Create API", "version": 2,
+                "phase": "testing", "status": "doing", "progress": 75, "testingReport": "",
+            }
+            requests = []
+
+            def request_with_retry(_config, path, body):
+                requests.append((path, body))
+                return {"version": 3}
+
+            with (
+                patch.object(executor, "_task_detail", return_value=task),
+                patch.object(executor, "_request_with_retry", side_effect=request_with_retry),
+            ):
+                executor._sync_result(
+                    self.runtime_config(), 1, "api-1", task,
+                    {"version": 1, "externalSessionId": "testing-thread", "metadata": {}},
+                    "testing-turn", "completed", "验收判定：通过\n\n测试完成。",
+                )
+
+            report_path = workspace / "doc/test/api-1/测试报告.md"
+            self.assertTrue(report_path.is_file())
+            self.assertIn("验收判定：通过", report_path.read_text(encoding="utf-8"))
+            patch_request = next(request for request in requests if request[0] == "/delivery/item/patch")
+            self.assertEqual("testingReport", next(key for key in patch_request[1] if key == "testingReport"))
+            self.assertEqual(report_path.read_text(encoding="utf-8"), patch_request[1]["testingReport"])
 
     def test_execute_marks_task_doing_before_starting_and_binding_thread(self):
         context = {
