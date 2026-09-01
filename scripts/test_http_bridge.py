@@ -31,6 +31,10 @@ SPEC.loader.exec_module(bridge)
 
 class HttpBridgeTest(unittest.TestCase):
     def setUp(self) -> None:
+        # THREAD_READERS 是模块级全局池，会把上一条用例建的只读执行器留给下一条。
+        bridge.THREAD_READERS.shutdown()
+        self.addCleanup(bridge.THREAD_READERS.shutdown)
+
         # 桥接请求会顺手刷新凭证文件；测试绝不能写到本机真实凭证上。
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
@@ -356,7 +360,7 @@ class HttpBridgeTest(unittest.TestCase):
             bridge.requirement_outline_path_of("../../etc")
 
     def test_planning_temp_path_is_plugin_local_and_sanitizes_names(self):
-        with tempfile.TemporaryDirectory() as temporary, patch.object(bridge, "PLUGIN_ROOT", Path(temporary)):
+        with tempfile.TemporaryDirectory() as temporary, patch.object(bridge.runtime, "PLUGIN_ROOT", Path(temporary)):
             path = bridge.planning_temp_document_path("导入/审核", "req-a", "thread/one")
 
         self.assertEqual(
@@ -377,7 +381,7 @@ class HttpBridgeTest(unittest.TestCase):
         self.assertNotIn("初稿", content)
 
     def test_planning_temp_summary_is_deleted_only_inside_the_managed_directory(self):
-        with tempfile.TemporaryDirectory() as temporary, patch.object(bridge, "PLUGIN_ROOT", Path(temporary)):
+        with tempfile.TemporaryDirectory() as temporary, patch.object(bridge.runtime, "PLUGIN_ROOT", Path(temporary)):
             path = bridge.planning_temp_document_path("审核", "req-a", "thread-1")
             bridge.write_planning_temp_summary(path, "审核", "req-a", "thread-1", "确认", "最终方案")
 
@@ -489,7 +493,7 @@ class HttpBridgeTest(unittest.TestCase):
         requirement = {"requirementKey": "req-a", "detail": "改过的正文"}
         with tempfile.TemporaryDirectory() as temporary:
             workspace = Path(temporary)
-            with patch.object(bridge, "PLUGIN_ROOT", workspace):
+            with patch.object(bridge.runtime, "PLUGIN_ROOT", workspace):
                 draft = bridge.planning_temp_document_path("", "req-a", "thread-1")
                 draft.parent.mkdir(parents=True, exist_ok=True)
                 draft.write_text("# 已沉淀的过程摘要\n", encoding="utf-8")
@@ -918,7 +922,7 @@ class HttpBridgeTest(unittest.TestCase):
 
             with (
                 patch.object(bridge.planner, "request_api", side_effect=request_api),
-                patch.object(bridge, "create_ai_client", return_value=client),
+                patch.object(bridge.factory, "create_ai_client", return_value=client),
                 patch.object(bridge.threading, "Thread") as thread,
             ):
                 result = executor.generate_requirement_prototype(
@@ -948,7 +952,7 @@ class HttpBridgeTest(unittest.TestCase):
         with (
             patch.object(bridge.planner, "project_context", return_value=context),
             patch.object(bridge.planner, "request_api", return_value=[]),
-            patch.object(bridge, "create_ai_client", return_value=client),
+            patch.object(bridge.factory, "create_ai_client", return_value=client),
             patch.object(bridge.threading, "Thread") as thread,
         ):
             created = executor.send_planning(payload, {"_project_id": 2})
@@ -973,13 +977,17 @@ class HttpBridgeTest(unittest.TestCase):
 
         with (
             patch.object(bridge.planner, "request_api", return_value=rows),
-            patch.object(bridge, "create_ai_client", return_value=client),
+            patch.object(bridge.factory, "create_ai_client", return_value=client),
         ):
             conversation = executor.planning(2, "thread-remote", config=self.runtime_config() | {"_project_id": 2}, requirement_key="req-a")
 
         self.assertEqual("thread-remote", conversation["threadId"])
         self.assertEqual([], conversation["turns"])
         self.assertEqual(["thread-remote"], [entry["threadId"] for entry in conversation["conversations"]])
+        # 只读执行器现在归 THREAD_READERS 复用池所有：读完不再立刻关，
+        # 但池子收摊时必须把进程关掉，不能泄漏。
+        client.close.assert_not_called()
+        bridge.THREAD_READERS.shutdown()
         client.close.assert_called_once()
 
     def test_read_thread_or_empty_swallows_only_the_missing_transcript(self):
@@ -1128,7 +1136,7 @@ class HttpBridgeTest(unittest.TestCase):
         client.start_task.return_value = ("thread-env", "turn-env")
 
         with (
-            patch.object(bridge, "create_ai_client", return_value=client) as create_client,
+            patch.object(bridge.factory, "create_ai_client", return_value=client) as create_client,
             patch.object(bridge, "ensure_github_ssh_key", return_value={"githubSshConfigured": True, "githubSshPublicKey": "public", "githubSshError": ""}),
             patch.object(bridge.ENVIRONMENT_SETUP_SESSIONS, "load", return_value=None),
             patch.object(bridge.ENVIRONMENT_SETUP_SESSIONS, "save") as save,
@@ -1212,7 +1220,7 @@ class HttpBridgeTest(unittest.TestCase):
         with (
             patch.object(bridge.planner, "project_context", return_value=context),
             patch.object(bridge.planner, "request_api", side_effect=request_api),
-            patch.object(bridge, "create_ai_client", side_effect=make_client),
+            patch.object(bridge.factory, "create_ai_client", side_effect=make_client),
             patch.object(bridge.threading, "Thread"),
         ):
             executor.send_planning(payload, config)
@@ -1270,7 +1278,7 @@ class HttpBridgeTest(unittest.TestCase):
 
         with (
             patch.object(bridge.planner, "request_api", side_effect=request_api),
-            patch.object(bridge, "create_ai_client", side_effect=make_client),
+            patch.object(bridge.factory, "create_ai_client", side_effect=make_client),
         ):
             result = executor.planning(
                 2, "", config={"api_url": "http://test/api", "key": "k", "_project_id": 2},
@@ -1281,7 +1289,7 @@ class HttpBridgeTest(unittest.TestCase):
         self.assertEqual(["codex-thread"], [entry["threadId"] for entry in result["conversations"]])
         self.assertEqual("codex", result["conversations"][0]["executorType"])
         self.assertEqual("codex-thread", result["threadId"])
-        self.assertEqual(["codex"], providers)
+        self.assertEqual({"codex"}, set(providers))
 
     def test_planning_follow_up_keeps_the_thread_own_tool(self):
         executor = bridge.ExecutionBridge(Path.cwd())
@@ -1310,7 +1318,7 @@ class HttpBridgeTest(unittest.TestCase):
         with (
             patch.object(bridge.planner, "project_context", return_value=context),
             patch.object(bridge.planner, "request_api", side_effect=request_api),
-            patch.object(bridge, "create_ai_client", side_effect=make_client),
+            patch.object(bridge.factory, "create_ai_client", side_effect=make_client),
             patch.object(bridge.threading, "Thread"),
         ):
             executor.send_planning(
@@ -1322,7 +1330,7 @@ class HttpBridgeTest(unittest.TestCase):
             )
 
         client.resume_thread.assert_called_once_with("codex-thread")
-        self.assertEqual(["codex"], providers)
+        self.assertEqual({"codex"}, set(providers))
         self.assertEqual("codex", binds[-1]["executorType"])
 
     def test_task_conversation_reads_a_chat_left_by_the_other_tool(self):
@@ -1354,13 +1362,13 @@ class HttpBridgeTest(unittest.TestCase):
 
         with (
             patch.object(bridge.planner, "request_api", side_effect=request_api),
-            patch.object(bridge, "create_ai_client", side_effect=make_client),
+            patch.object(bridge.factory, "create_ai_client", side_effect=make_client),
         ):
             result = executor.conversation(1, "api-1", config=self.runtime_config(), provider="claude")
 
         self.assertEqual("codex-thread", result["threadId"])
         self.assertEqual("codex", result["conversations"][0]["executorType"])
-        self.assertEqual(["codex"], providers)
+        self.assertEqual({"codex"}, set(providers))
 
     def test_planning_rejects_confirmation_without_a_previous_preview(self):
         executor = bridge.ExecutionBridge(Path.cwd())
@@ -1625,8 +1633,8 @@ class HttpBridgeTest(unittest.TestCase):
             copied_cli.write_bytes(b"codex")
             executor = bridge.ExecutionBridge(Path.cwd())
             with patch.object(bridge.shutil, "which", return_value=None):
-                with patch.object(bridge, "host_platform", return_value="windows"):
-                    with patch.object(bridge, "RUNTIME_DIR", Path(directory)):
+                with patch.object(bridge.hostinfo, "host_platform", return_value="windows"):
+                    with patch.object(bridge.runtime, "RUNTIME_DIR", Path(directory)):
                         self.assertTrue(executor.health("codex")["ready"])
 
     def test_codex_desktop_resource_is_copied_when_the_cli_is_missing(self):
@@ -1637,7 +1645,7 @@ class HttpBridgeTest(unittest.TestCase):
             source.write_bytes(b"desktop-codex")
             runtime = root / "runtime"
             with patch.object(bridge.shutil, "which", return_value=None):
-                with patch.object(bridge, "codex_desktop_resource_paths", return_value=[source]):
+                with patch.object(bridge.codex_cli, "codex_desktop_resource_paths", return_value=[source]):
                     copied = bridge.provision_codex_cli("windows", runtime)
 
             self.assertEqual(runtime / "bin" / "codex.exe", Path(copied))
@@ -1653,9 +1661,9 @@ class HttpBridgeTest(unittest.TestCase):
             desktop.write_bytes(b"desktop-codex")
             versions = {"/usr/local/bin/codex": "0.134.0", str(desktop): "0.149.0-alpha.4.1"}
             with patch.object(bridge.shutil, "which", return_value="/usr/local/bin/codex"):
-                with patch.object(bridge, "host_platform", return_value="macos"):
-                    with patch.object(bridge, "codex_desktop_resource_paths", return_value=[desktop]):
-                        with patch.object(bridge, "codex_cli_version", side_effect=lambda command: versions.get(command, "")):
+                with patch.object(bridge.hostinfo, "host_platform", return_value="macos"):
+                    with patch.object(bridge.codex_cli, "codex_desktop_resource_paths", return_value=[desktop]):
+                        with patch.object(bridge.codex_cli, "codex_cli_version", side_effect=lambda command: versions.get(command, "")):
                             self.assertEqual(str(desktop), bridge.provision_codex_cli("macos", root / "runtime"))
                             self.assertEqual(str(desktop), bridge.available_codex_cli("macos", root / "runtime"))
 
@@ -1668,9 +1676,9 @@ class HttpBridgeTest(unittest.TestCase):
             # 版本问不出来时保持原来的优先级：PATH 上的 CLI 仍然优先。
             versions = {"/usr/local/bin/codex": "0.150.0", str(desktop): ""}
             with patch.object(bridge.shutil, "which", return_value="/usr/local/bin/codex"):
-                with patch.object(bridge, "host_platform", return_value="macos"):
-                    with patch.object(bridge, "codex_desktop_resource_paths", return_value=[desktop]):
-                        with patch.object(bridge, "codex_cli_version", side_effect=lambda command: versions.get(command, "")):
+                with patch.object(bridge.hostinfo, "host_platform", return_value="macos"):
+                    with patch.object(bridge.codex_cli, "codex_desktop_resource_paths", return_value=[desktop]):
+                        with patch.object(bridge.codex_cli, "codex_cli_version", side_effect=lambda command: versions.get(command, "")):
                             self.assertEqual("/usr/local/bin/codex", bridge.provision_codex_cli("macos", root / "runtime"))
 
     def test_bridge_rejects_project_code_as_program_id(self):
@@ -2158,7 +2166,7 @@ class HttpBridgeTest(unittest.TestCase):
                 self.request_id += 1
                 return self.request_id
 
-            def read_thread(self, thread_id, request_id):
+            def read_thread(self, thread_id, request_id, timeout=20):
                 self.last_thread_id = thread_id
                 self.last_request_id = request_id
                 return {"turns": self.turns}
@@ -2208,7 +2216,7 @@ class HttpBridgeTest(unittest.TestCase):
                 def next_request_id(self):
                     return 1
 
-                def read_thread(self, _thread_id, request_id=None):
+                def read_thread(self, _thread_id, request_id=None, timeout=20):
                     raise bridge.BridgeFailure("thread not found")
 
             executor = bridge.ExecutionBridge(workspace)
@@ -2236,7 +2244,7 @@ class HttpBridgeTest(unittest.TestCase):
                 def next_request_id(self):
                     return 1
 
-                def read_thread(self, _thread_id, request_id=None):
+                def read_thread(self, _thread_id, request_id=None, timeout=20):
                     return {"turns": [{"items": [{"type": "agentMessage", "text": "本机内容"}]}]}
 
             result = bridge.ExecutionBridge(workspace)._read_thread_with_workspace_archive(
@@ -2254,7 +2262,7 @@ class HttpBridgeTest(unittest.TestCase):
             def next_request_id(self):
                 return 1
 
-            def read_thread(self, _thread_id, request_id=None):
+            def read_thread(self, _thread_id, request_id=None, timeout=20):
                 self.read_count += 1
                 raise bridge.BridgeFailure("thread not found")
 
@@ -2310,7 +2318,7 @@ class HttpBridgeTest(unittest.TestCase):
             def next_request_id(self):
                 return 1
 
-            def read_thread(self, _thread_id, request_id=None):
+            def read_thread(self, _thread_id, request_id=None, timeout=20):
                 return {"turns": [{"items": [{"type": "agentMessage", "text": "已完成"}]}]}
 
         with tempfile.TemporaryDirectory() as directory:
@@ -2647,7 +2655,7 @@ class HttpBridgeTest(unittest.TestCase):
             "path": "doc/requirements/req-a/prototype/index.html",
             "name": "index.html",
         }]
-        with patch.object(bridge, "requirement_prototype_files", return_value=("doc/requirements/req-a/prototype", prototype)):
+        with patch.object(bridge.execution.turns, "requirement_prototype_files", return_value=("doc/requirements/req-a/prototype", prototype)):
             lines = executor._conversation_mention_context(
                 {"api_url": "http://test/api", "key": "k"},
                 1,
@@ -2824,7 +2832,7 @@ class HttpBridgeTest(unittest.TestCase):
             patch.object(executor, "_task_detail", return_value={"itemKey": "a", "phase": "development", "status": "doing"}),
             patch.object(executor, "_session_binding", return_value=binding),
             patch.object(executor, "_task_session_bindings", return_value=[binding]),
-            patch.object(bridge, "AppServerClient", return_value=reader),
+            patch.object(bridge.clients.codex, "AppServerClient", return_value=reader),
         ):
             result = executor.conversation(1, "a", "thr_history", config=self.runtime_config())
 
@@ -3505,7 +3513,7 @@ class HttpBridgeTest(unittest.TestCase):
             with (
                 patch.object(bridge.planner, "request_api", side_effect=request_api),
                 patch.object(bridge.planner, "project_context", return_value={"items": []}),
-                patch.object(bridge, "create_ai_client", return_value=client),
+                patch.object(bridge.factory, "create_ai_client", return_value=client),
                 patch.object(bridge.threading, "Thread") as thread,
             ):
                 result = executor.send_requirement_testing(
@@ -3544,7 +3552,7 @@ class HttpBridgeTest(unittest.TestCase):
             with (
                 patch.object(bridge.planner, "request_api", side_effect=request_api),
                 patch.object(bridge.planner, "project_context", return_value={"items": []}),
-                patch.object(bridge, "create_ai_client", return_value=client),
+                patch.object(bridge.factory, "create_ai_client", return_value=client),
                 patch.object(bridge.threading, "Thread") as thread,
             ):
                 executor.send_requirement_testing(
@@ -3585,7 +3593,7 @@ class HttpBridgeTest(unittest.TestCase):
             with (
                 patch.object(bridge.planner, "project_context", return_value={"items": [task]}),
                 patch.object(bridge.planner, "request_api", side_effect=request_api),
-                patch.object(bridge, "create_ai_client", return_value=client),
+                patch.object(bridge.factory, "create_ai_client", return_value=client),
                 patch.object(bridge.threading, "Thread") as thread,
             ):
                 result = executor.generate_task_testing_cases(
@@ -3633,7 +3641,7 @@ class HttpBridgeTest(unittest.TestCase):
 
         with (
             patch.object(bridge.planner, "request_api", side_effect=request_api),
-            patch.object(bridge, "create_ai_client", return_value=client),
+            patch.object(bridge.factory, "create_ai_client", return_value=client),
         ):
             result = executor.task_testing_cases_conversation(1, "api-1", config=self.runtime_config())
 
@@ -3675,7 +3683,7 @@ class HttpBridgeTest(unittest.TestCase):
         with (
             patch.object(bridge.planner, "project_context", return_value={"items": [task]}),
             patch.object(bridge.planner, "request_api", side_effect=request_api),
-            patch.object(bridge, "create_ai_client", return_value=client),
+            patch.object(bridge.factory, "create_ai_client", return_value=client),
             patch.object(bridge.threading, "Thread") as thread,
         ):
             result = executor.generate_task_testing_cases(
@@ -3842,7 +3850,7 @@ class HttpBridgeTest(unittest.TestCase):
         with (
             patch.object(bridge.planner, "project_context", return_value=context),
             patch.object(bridge.planner, "request_api", side_effect=request_api),
-            patch.object(bridge, "AppServerClient", return_value=fake_client),
+            patch.object(bridge.clients.codex, "AppServerClient", return_value=fake_client),
             patch.object(bridge.threading, "Thread") as thread,
             patch.object(executor, "_migrate_legacy_task_outline") as migrate_legacy_outline,
         ):
@@ -4429,7 +4437,7 @@ class HttpBridgeTest(unittest.TestCase):
         client.thread_id = "thread-1"
         client.process = unittest.mock.MagicMock()
         client.process.poll.return_value = None
-        client.messages = bridge.queue.Queue()
+        client.messages = bridge.clients.codex.queue.Queue()
         client.messages.put({"method": "unrelated/notification"})
         client.read_turn_status = unittest.mock.MagicMock(side_effect=["inProgress", "interrupted"])
 
@@ -4444,7 +4452,7 @@ class HttpBridgeTest(unittest.TestCase):
         client.thread_id = "thread-1"
         client.process = unittest.mock.MagicMock()
         client.process.poll.return_value = None
-        client.messages = bridge.queue.Queue()
+        client.messages = bridge.clients.codex.queue.Queue()
         client.read_turn_status = unittest.mock.MagicMock(side_effect=[
             bridge.BridgeFailure("failed to read thread: rollout at ... is empty"),
             bridge.BridgeFailure("failed to read thread: rollout at ... is empty"),
@@ -4460,10 +4468,10 @@ class HttpBridgeTest(unittest.TestCase):
         client.thread_id = "thread-1"
         client.process = unittest.mock.MagicMock()
         client.process.poll.return_value = None
-        client.messages = bridge.queue.Queue()
+        client.messages = bridge.clients.codex.queue.Queue()
         client.read_turn_status = unittest.mock.MagicMock(side_effect=bridge.BridgeFailure("broken"))
 
-        with patch.object(bridge, "THREAD_READ_GRACE_SECONDS", 0):
+        with patch.object(bridge.clients.codex, "THREAD_READ_GRACE_SECONDS", 0):
             with self.assertRaises(bridge.BridgeFailure):
                 client.wait_turn("turn-1", poll_interval=0)
 
@@ -4633,7 +4641,7 @@ class HttpBridgeTest(unittest.TestCase):
                 "project_context",
                 return_value={"items": [{"itemKey": "a", "phase": "development", "status": "doing"}]},
             ),
-            patch.object(bridge, "AppServerClient") as app_server,
+            patch.object(bridge.clients.codex, "AppServerClient") as app_server,
         ):
             executor.reconcile()
 
@@ -5122,15 +5130,18 @@ class GitBranchTest(unittest.TestCase):
         self.assertEqual(["galactus"], bridge.git_pending_submodules(self.workspace))
 
         calls: list[list[str]] = []
-        real_run_git = bridge.run_git
+        real_run_git = bridge.git_ops.run_git
 
         def record(workspace, args, **kwargs):
             calls.append(list(args))
             return real_run_git(workspace, args, **kwargs)
 
-        with patch.object(bridge, "run_git", side_effect=record):
+        # git_create_branch_targets 和 run_git 同在 delivery_bridge.git_ops 里，
+        # 打桩必须打在它真正解析名字的那个模块上，打在 http_bridge 的再导出名上是无效的。
+        with patch.object(bridge.git_ops, "run_git", side_effect=record):
             bridge.git_create_branch_targets(self.workspace, "main", "feature/issue_req-1", [])
 
+        self.assertNotEqual([], calls)
         self.assertEqual([], [args for args in calls if args[:2] == ["submodule", "update"]])
         self.assertEqual(["galactus"], bridge.git_pending_submodules(self.workspace))
         self.assertEqual("feature/issue_req-1", bridge.git_current_branch(self.workspace))
@@ -5434,13 +5445,13 @@ class GitBranchTest(unittest.TestCase):
         (self.workspace / "README.md").write_text("root changed", encoding="utf-8")
         execution = bridge.ExecutionBridge(self.workspace)
         calls: list[Path] = []
-        real_push = bridge.git_push_branch
+        real_push = bridge.execution.git.git_push_branch
 
         def ordered_push(workspace: Path, *args, **kwargs):
             calls.append(workspace.resolve())
             return real_push(workspace, *args, **kwargs)
 
-        with patch.object(bridge, "git_push_branch", side_effect=ordered_push):
+        with patch.object(bridge.execution.git, "git_push_branch", side_effect=ordered_push):
             result = execution.push_requirement_branch({
                 "programId": 1,
                 "branch": branch,
