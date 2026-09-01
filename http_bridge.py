@@ -32,6 +32,19 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 from urllib.request import Request, urlopen
 
 import server as planner
+
+from delivery_bridge import (
+    codex_cli,
+    documents,
+    errors,
+    git_ops,
+    github_ssh,
+    hostinfo,
+    prompt_context,
+    runtime,
+    turn_output,
+    workspaces,
+)
 from delivery_bridge.update_manager import PluginUpdateManager, UpdateFailure
 from delivery_bridge.versioning import compare_versions, manifest_version
 
@@ -41,7 +54,6 @@ from delivery_bridge.versioning import compare_versions, manifest_version
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8765
 DEFAULT_BUSINESS_WORKSPACE_ROOT = Path.home() / ".local" / "share" / "delivery-task-planner" / "business-workspaces"
-BUSINESS_WORKSPACE_SCOPE = "业务空间"
 PLUGIN_MANIFEST_PATH = Path(__file__).resolve().parent / ".codex-plugin" / "plugin.json"
 PLUGIN_ROOT = Path(__file__).resolve().parent
 # 执行器一律走这个命令行入口写任务面板。
@@ -69,13 +81,6 @@ THREAD_READ_GRACE_SECONDS = 30.0
 PLUGIN_UPDATES: PluginUpdateManager
 
 
-def default_runtime_dir() -> Path:
-    configured = os.environ.get("DELIVERY_TASK_PLANNER_RUNTIME_DIR", "").strip()
-    if configured:
-        return Path(configured).expanduser().resolve()
-    if sys.platform == "win32" and os.environ.get("LOCALAPPDATA"):
-        return Path(os.environ["LOCALAPPDATA"]) / "delivery-task-planner"
-    return Path.home() / ".local" / "state" / "delivery-task-planner"
 
 
 def plugin_version_from_manifest(path: Path) -> str:
@@ -151,7 +156,10 @@ def plugin_update_status() -> dict[str, Any]:
     return result
 
 
-RUNTIME_DIR = default_runtime_dir()
+from delivery_bridge.runtime import (
+    default_runtime_dir,
+    RUNTIME_DIR,
+)
 PLUGIN_UPDATES = PluginUpdateManager(
     Path(__file__).resolve().parent,
     RUNTIME_DIR,
@@ -202,28 +210,16 @@ CHAT_ARCHIVE_MAX_FILE_BYTES = 5 * 1024 * 1024
 CLOUD_SYNC_SCOPES = {"chat", "requirement", "design"}
 MAX_CLOUD_SYNC_FILE_BYTES = 8 * 1024 * 1024
 MAX_CLOUD_SYNC_FILES_PER_RUN = 500
-# 需求拆解沉淀下来的需求大纲：每条需求一份，落在该需求的文档目录里。
-REQUIREMENT_OUTLINE_FILE_NAME = "需求大纲.md"
-MAX_REQUIREMENT_OUTLINE_BYTES = 2 * 1024 * 1024
-# 面板直接编辑大纲时走 POST，请求体本身限制在 64KB 级别，这里留出同量级的正文上限。
-MAX_EDITABLE_OUTLINE_BYTES = 512 * 1024
 MAX_WORKSPACE_ARTIFACT_BYTES = 50 * 1024 * 1024
 # 回复正文里的文件链接常常只写文件名（`ShenShiAccessibilityService.kt`），
 # 按工作区根目录拼出来的路径并不存在，只能靠一份文件名索引反查真实路径。
 WORKSPACE_FILE_INDEX_TTL_SECONDS = 30
 MAX_WORKSPACE_FILE_INDEX_ENTRIES = 40000
-# 需求大纲、任务文档、设计文档、测试用例这几个栏目都从「一个固定文件」升级成「一个目录里的多份文档」：
-# 目录里所有可读的 Markdown、纯文本和 HTML 文档都能在面板上选择预览，原来的固定文件名继续作为默认主文档，存量数据不受影响。
-DOCUMENT_SET_SUFFIXES = {".md", ".markdown", ".txt", ".html", ".htm"}
-MAX_DOCUMENT_SET_FILES = 200
-MAX_DOCUMENT_SET_FILE_BYTES = 2 * 1024 * 1024
 # 面板还可以直接往栏目目录里放文档（本地选文件或粘贴正文）：什么后缀都收得下，
 # 但只有文本类文档能在面板里预览编辑，其余的走附件预览与下载。
 MAX_DOCUMENT_UPLOAD_FILES = 10
 MAX_DOCUMENT_UPLOAD_FILE_BYTES = 20 * 1024 * 1024
 MAX_DOCUMENT_UPLOAD_BYTES = MAX_DOCUMENT_UPLOAD_FILES * MAX_DOCUMENT_UPLOAD_FILE_BYTES + 128 * 1024
-# 测试技能把一条需求或一条任务的全部测试资产写在 doc/test/<键>/ 下。
-TESTING_ASSET_ROOT = "test"
 TESTING_CASES_FILE_NAME = "测试用例.md"
 PLANNING_ITEM_KEY = "__project_planning__"
 GIT_ENVIRONMENT_SESSIONS_PATH = RUNTIME_DIR / "git-environment-sessions.json"
@@ -232,53 +228,6 @@ MAX_GIT_ENVIRONMENT_CONVERSATIONS = 12
 ENVIRONMENT_SETUP_ITEM_KEY = "__environment_setup__"
 ENVIRONMENT_SETUP_SESSIONS_PATH = RUNTIME_DIR / "environment-setup-sessions.json"
 MAX_ENVIRONMENT_SETUP_CONVERSATIONS = 12
-MAX_ENVIRONMENT_SETUP_ITEMS = 12
-# 预设环境属于当前电脑，不属于任务面板中的任一项目。
-GLOBAL_ENVIRONMENT_SETUP_PROGRAM_ID = 0
-# 预设环境的版本下限、探测命令和安装命令：前端只传标识，这份是唯一事实来源。
-# 检测和安装命令按 macOS / Windows 分开写死 —— 两个系统的命令名和包管理器都不一样，
-# 交给执行器现猜会猜出 Windows 上根本不存在的 `python3`。
-ENVIRONMENT_PRESETS: dict[str, dict[str, Any]] = {
-    "python": {
-        "label": "Python",
-        "requirement": "3.11 及以上",
-        "minimumVersion": "3.11",
-        "probe": {"macos": "python3 --version", "windows": "py -3 --version"},
-        "install": {"macos": "brew install python@3.12", "windows": "winget install --id Python.Python.3.12 -e"},
-    },
-    "node": {
-        "label": "Node.js",
-        "requirement": "22.0 及以上",
-        "minimumVersion": "22.0",
-        "probe": {"macos": "node --version", "windows": "node --version"},
-        "install": {"macos": "brew install node@22", "windows": "winget install --id OpenJS.NodeJS.LTS -e"},
-    },
-    "go": {
-        "label": "Go",
-        "requirement": "1.21 及以上",
-        "minimumVersion": "1.21",
-        "probe": {"macos": "go version", "windows": "go version"},
-        "install": {"macos": "brew install go", "windows": "winget install --id GoLang.Go -e"},
-    },
-}
-GIT_PRESET: dict[str, Any] = {
-    "label": "Git",
-    "probe": {"macos": "git --version", "windows": "git --version"},
-    "install": {
-        "macos": "brew install git；没有 Homebrew 就用 xcode-select --install",
-        "windows": "winget install --id Git.Git -e",
-    },
-}
-GITHUB_SSH_HOST = "github.com"
-GITHUB_SSH_KEY_NAME = "id_ed25519_github_delivery_task_planner"
-GITHUB_SSH_CONFIG_START = "# >>> delivery-task-planner GitHub SSH key >>>"
-GITHUB_SSH_CONFIG_END = "# <<< delivery-task-planner GitHub SSH key <<<"
-GITHUB_SSH_CONFIG_BLOCK_RE = re.compile(
-    rf"(?ms)^{re.escape(GITHUB_SSH_CONFIG_START)}\n.*?^{re.escape(GITHUB_SSH_CONFIG_END)}\n?",
-)
-SSH_PUBLIC_KEY_RE = re.compile(
-    r"^(?:ssh-(?:ed25519|rsa|dss)|ecdsa-sha2-nistp(?:256|384|521)|sk-(?:ssh-ed25519|ecdsa-sha2-nistp256)@openssh\\.com)\s+[A-Za-z0-9+/=]+(?:\s+.*)?$",
-)
 REQUIREMENT_TESTING_ITEM_KEY = "__requirement_testing__"
 REQUIREMENT_REVIEW_ITEM_KEY = "__requirement_review__"
 REQUIREMENT_FINE_TUNING_ITEM_KEY = "__requirement_fine_tuning__"
@@ -337,43 +286,27 @@ ATTACHMENT_DIRECTORY_NAME = "delivery-task-attachments"
 ARTIFACT_DIRECTORY_NAME = "delivery-task-artifacts"
 ATTACHMENT_MARKER_RE = re.compile(r"<!-- delivery-task-attachments:([A-Za-z0-9_-]+(?:,[A-Za-z0-9_-]+)*) -->")
 ATTACHMENT_CONTEXT_RE = re.compile(r"\n?<delivery-task-attachments>.*?</delivery-task-attachments>", re.DOTALL)
-# 真正发给执行器的提示词里裹着一大段面板上下文，聊天记录里只留用户自己写的那几句。
-# planning 是需求拆解会话的旧标记名，历史会话里还在，两个都要认。
-BRIDGE_CONTEXT_TAG = "delivery-bridge-context"
 BRIDGE_CONTEXT_RE = re.compile(
     r"\n?<delivery-(?:bridge|planning)-context>.*?</delivery-(?:bridge|planning)-context>\n?",
     re.DOTALL,
 )
 IMAGE_SUFFIXES = {".gif", ".jpeg", ".jpg", ".png", ".webp"}
-HTML_SUFFIXES = {".html", ".htm"}
-# HTML 文档和原型页经常把样式、脚本拆成同目录的独立文件，但预览是把正文塞进 blob 地址的 iframe，
-# 相对路径在那里解析不出来。读 HTML 时顺带把它引用到的同目录 css/js 一起带上，前端预览时内联进去。
-HTML_ASSET_SUFFIXES = {".css", ".js", ".mjs"}
-MAX_HTML_ASSET_FILES = 40
-MAX_HTML_ASSET_TOTAL_BYTES = 4 * 1024 * 1024
-HTML_ASSET_REFERENCE_RE = re.compile(
-    r"""(?:<link\b[^>]*?\bhref|<script\b[^>]*?\bsrc)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))""",
-    re.IGNORECASE,
-)
 MARKDOWN_ARTIFACT_RE = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
 EXCLUDED_ARTIFACT_PARTS = {".codex", ".git"}
 EXCLUDED_ARTIFACT_NAMES = {".env", ".env.local", ".env.production", "credentials.json", "secrets.json"}
 RUNTIME_CONFIG_KEY = "_deliveryRuntimeConfig"
-AI_PROVIDERS = {"codex", "claude"}
 CODEX_MODEL_CATALOG = [
     {"model": "gpt-5.6-sol", "displayName": "5.6 Sol", "description": ""},
     {"model": "gpt-5.6-terra", "displayName": "5.6 Terra", "description": ""},
     {"model": "gpt-5.6-luna", "displayName": "5.6 Luna", "description": ""},
 ]
-CODEX_REASONING_EFFORTS = {"minimal", "low", "medium", "high", "xhigh"}
-CLAUDE_REASONING_EFFORTS = {"minimal", "low", "medium", "high", "max"}
 DEFAULT_BIZ_LINE = ""
 CODEX_GLOBAL_STATE_PATH = Path.home() / ".codex" / ".codex-global-state.json"
-CODEX_DESKTOP_RESOURCE_COMPANIONS = ("codex-code-mode-host",)
 
 
-class BridgeFailure(Exception):
-    pass
+from delivery_bridge.errors import (
+    BridgeFailure,
+)
 
 
 # Capture the manifest version exactly once for the lifetime of this Python
@@ -469,67 +402,36 @@ def complete_plugin_update_in_background(job_id: str, bridge: Any) -> None:
     threading.Thread(target=monitor, daemon=True, name=f"plugin-update-{job_id[:8]}").start()
 
 
-def ai_provider_of(value: Any) -> str:
-    provider = str((value or {}).get("provider") or "codex").strip().lower() if isinstance(value, dict) else str(value or "codex").strip().lower()
-    if provider not in AI_PROVIDERS:
-        raise BridgeFailure("AI 工具必须是 codex 或 claude")
-    return provider
 
 
-def provider_label(provider: str) -> str:
-    return "Claude" if provider == "claude" else "Codex"
 
 
-def executor_type_of(value: Any) -> str:
-    """会话目录记录里的执行器类型，形如 codex / claude-prototype / codex-testing-cases。"""
-    if isinstance(value, dict):
-        return str(value.get("executorType") or "").strip().lower()
-    return str(value or "").strip().lower()
 
 
-def executor_provider_of(value: Any, fallback: str = "codex") -> str:
-    """这条会话是哪个 AI 工具留下的；读不出来就按调用方当前选的工具兜底。"""
-    head = executor_type_of(value).split("-", 1)[0]
-    return head if head in AI_PROVIDERS else ai_provider_of(fallback)
 
 
-def executor_purpose_of(value: Any) -> str:
-    """执行器类型里的用途后缀，拆解会话为空、原型是 prototype，跨工具列目录时只比这一段。"""
-    parts = executor_type_of(value).split("-", 1)
-    return parts[1] if len(parts) > 1 else ""
 
 
-def same_executor_purpose(row: Any, executor_type: str) -> bool:
-    return executor_purpose_of(row) == executor_purpose_of(executor_type)
 
 
-def reasoning_effort_of(value: Any, provider: str = "codex") -> str:
-    effort = str((value or {}).get("reasoningEffort") or "").strip() if isinstance(value, dict) else str(value or "").strip()
-    allowed = CLAUDE_REASONING_EFFORTS if provider == "claude" else CODEX_REASONING_EFFORTS
-    if effort and effort not in allowed:
-        raise BridgeFailure(f"{provider_label(provider)} 推理强度无效")
-    return effort
 
 
-def fast_mode_of(value: Any, provider: str = "codex") -> bool:
-    if provider != "claude":
-        return False
-    raw = (value or {}).get("fastMode", False) if isinstance(value, dict) else value
-    if not isinstance(raw, bool):
-        raise BridgeFailure("Claude 快速模式必须是布尔值")
-    return raw
 
 
-def program_id_of(value: Any, label: str = "项目标识") -> int:
-    if isinstance(value, bool):
-        raise BridgeFailure(f"{label}必须是项目表的数值主键")
-    try:
-        program_id = int(str(value).strip())
-    except (TypeError, ValueError):
-        raise BridgeFailure(f"{label}必须是项目表的数值主键") from None
-    if program_id <= 0:
-        raise BridgeFailure(f"{label}必须是项目表的正整数主键")
-    return program_id
+from delivery_bridge.providers import (
+    AI_PROVIDERS,
+    CODEX_REASONING_EFFORTS,
+    CLAUDE_REASONING_EFFORTS,
+    ai_provider_of,
+    provider_label,
+    executor_type_of,
+    executor_provider_of,
+    executor_purpose_of,
+    same_executor_purpose,
+    reasoning_effort_of,
+    fast_mode_of,
+    program_id_of,
+)
 
 
 def placeholder_workspace() -> Path:
@@ -544,180 +446,51 @@ def placeholder_workspace() -> Path:
     return root.resolve()
 
 
-def host_platform() -> str:
-    """桥接自己跑在哪个系统上。
-
-    执行器和桥接在同一台机器上，系统由这里说了算，不让提示词去猜——猜出来的
-    `python3` 在 Windows 上根本不存在，`winget` 在 macOS 上同理。
-    """
-    system = platform.system().strip().lower()
-    if system == "darwin":
-        return "macos"
-    if system == "windows":
-        return "windows"
-    return "linux"
 
 
-def host_platform_label(value: str = "") -> str:
-    return {"macos": "macOS", "windows": "Windows"}.get(value or host_platform(), "Linux")
+from delivery_bridge.hostinfo import (
+    host_platform,
+    host_platform_label,
+)
 
 
-def codex_cli_name(host: str = "") -> str:
-    return "codex.exe" if (host or host_platform()) == "windows" else "codex"
 
 
-def codex_cli_cache_path(host: str = "", runtime_dir: Path | None = None) -> Path:
-    return (runtime_dir or RUNTIME_DIR) / "bin" / codex_cli_name(host)
 
 
-def codex_desktop_resource_paths(host: str = "") -> list[Path]:
-    """Known Codex Desktop resource locations, ordered by the per-user install first."""
-    system = host or host_platform()
-    executable = codex_cli_name(system)
-    if system == "windows":
-        local_app_data = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local"))
-        program_files = Path(os.environ.get("ProgramFiles") or r"C:\Program Files")
-        roots = [
-            local_app_data / "Programs" / "Codex",
-            local_app_data / "Programs" / "Codex Desktop",
-            local_app_data / "Codex",
-            local_app_data / "Codex Desktop",
-            program_files / "Codex",
-            program_files / "Codex Desktop",
-        ]
-        return [root / "resources" / executable for root in roots]
-    if system == "macos":
-        roots = [
-            Path.home() / "Applications" / "Codex.app",
-            Path("/Applications/Codex.app"),
-            Path.home() / "Applications" / "ChatGPT.app",
-            Path("/Applications/ChatGPT.app"),
-        ]
-        return [root / "Contents" / "Resources" / executable for root in roots]
-    return []
 
 
-WINDOWS_CLI_WRAPPER_SUFFIXES = ("", ".cmd", ".bat", ".ps1")
 
 
-def path_codex_cli(host: str = "") -> tuple[str, str]:
-    """PATH 上的 codex，拆成「能直接起进程的可执行文件」和「只能兜底的包装脚本」。
-
-    Windows 上 npm 全局安装和 Codex Desktop 都会往 PATH 里塞 `codex.cmd` / `codex.ps1`
-    这类包装脚本，CreateProcess 起不动它们（WinError 193），所以宁可退回到本地复制出来的
-    codex.exe；实在什么都没有时再拿包装脚本兜底，好过直接报"未找到 CLI"。
-    """
-    command = shutil.which("codex") or ""
-    if not command:
-        return "", ""
-    if (host or host_platform()) == "windows" and Path(command).suffix.lower() in WINDOWS_CLI_WRAPPER_SUFFIXES:
-        return "", command
-    return command, ""
 
 
-CODEX_CLI_VERSIONS: dict[str, str] = {}
 
 
-def codex_cli_version(command: str) -> str:
-    """`codex --version` 的版本号，按可执行文件缓存；问不出来就返回空串。"""
-    if command in CODEX_CLI_VERSIONS:
-        return CODEX_CLI_VERSIONS[command]
-    version = ""
-    try:
-        result = subprocess.run([command, "--version"], capture_output=True, text=True, timeout=15)
-        version = (result.stdout or result.stderr or "").strip().split()[-1] if result.returncode == 0 else ""
-    except (OSError, subprocess.SubprocessError, IndexError):
-        version = ""
-    CODEX_CLI_VERSIONS[command] = version
-    return version
 
 
-def newest_codex_cli(candidates: list[str]) -> str:
-    """在几个都能用的 codex 里挑版本最高的那个，问不出版本时保持传入顺序。
-
-    Codex Desktop 自带的 codex 和它捆绑的 MCP 服务（node_repl、browser-use、computer-use）
-    是配套发版的：实测 PATH 上的 0.134.0 调 node_repl 会被拒（`sandboxCwd must be an
-    absolute file URI`），换成桌面端自带的 0.149.0-alpha，同一段代码同一组参数就能跑通。
-    所以这里不能只看"PATH 上有没有 codex"，还得看它够不够新。
-    """
-    available = [candidate for candidate in candidates if candidate]
-    if not available:
-        return ""
-    best = available[0]
-    for candidate in available[1:]:
-        if newer_codex_cli(candidate, best):
-            best = candidate
-    return best
 
 
-def newer_codex_cli(candidate: str, current: str) -> bool:
-    """版本问不出来或者格式不认识，就当它不比现有的新，保持原来的优先级。"""
-    candidate_version = codex_cli_version(candidate)
-    current_version = codex_cli_version(current)
-    if not candidate_version:
-        return False
-    if not current_version:
-        return True
-    try:
-        return compare_versions(candidate_version, current_version) > 0
-    except ValueError:
-        return False
 
 
-def codex_cli_candidates(host: str = "", runtime_dir: Path | None = None) -> list[str]:
-    """本机所有可直接拉起的 codex，按原来的优先级排列。"""
-    cache_path = codex_cli_cache_path(host, runtime_dir)
-    command, _ = path_codex_cli(host)
-    candidates = [command, str(cache_path) if cache_path.is_file() else ""]
-    candidates.extend(str(path) for path in codex_desktop_resource_paths(host) if path.is_file())
-    return [candidate for candidate in candidates if candidate]
 
 
-def available_codex_cli(host: str = "", runtime_dir: Path | None = None) -> str:
-    """Locate a PATH CLI, a previously copied local CLI, or a Desktop resource."""
-    cache_path = codex_cli_cache_path(host, runtime_dir)
-    # 已经复制到运行时目录的 codex.exe 是确定能跑的，Windows 上优先用它。
-    if (host or host_platform()) == "windows" and cache_path.is_file():
-        return str(cache_path)
-    _, wrapper = path_codex_cli(host)
-    return newest_codex_cli(codex_cli_candidates(host, runtime_dir)) or wrapper
 
 
-def provision_codex_cli(host: str = "", runtime_dir: Path | None = None) -> str:
-    """Copy Codex Desktop's bundled CLI locally when it is the newest one on this machine."""
-    cache_path = codex_cli_cache_path(host, runtime_dir)
-    # 与 available_codex_cli 保持同一优先级，避免"检测到的"和"真正拉起的"不是同一个。
-    if (host or host_platform()) == "windows" and cache_path.is_file():
-        return str(cache_path)
-    command, wrapper = path_codex_cli(host)
-    chosen = newest_codex_cli(codex_cli_candidates(host, runtime_dir))
-    desktop_paths = {str(path) for path in codex_desktop_resource_paths(host)}
-    if chosen and chosen not in desktop_paths:
-        return chosen
-    source = Path(chosen) if chosen else next((path for path in codex_desktop_resource_paths(host) if path.is_file()), None)
-    if source is None:
-        return command or wrapper
-    # 桌面端资源目录里的可执行文件本来就能直接跑，而且它的同目录伴生文件都在。
-    # 复制只是 Windows 那边为了绕开包装脚本才需要的，别为此搬运一个几百 MB 的二进制。
-    if (host or host_platform()) != "windows":
-        return str(source)
-    if cache_path.is_file() and cache_path.stat().st_size == source.stat().st_size:
-        return str(cache_path)
-    try:
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, cache_path)
-        source_suffix = ".exe" if source.suffix.lower() == ".exe" else ""
-        for companion in CODEX_DESKTOP_RESOURCE_COMPANIONS:
-            companion_source = source.with_name(f"{companion}{source_suffix}")
-            if companion_source.is_file():
-                shutil.copy2(companion_source, cache_path.with_name(companion_source.name))
-        # 复制过来的是另一个版本，之前问出来的版本号不能再算数。
-        CODEX_CLI_VERSIONS.pop(str(cache_path), None)
-        return str(cache_path)
-    except OSError:
-        # Desktop resources are directly executable too. Keep the board usable
-        # when a restrictive filesystem prevents creating the local copy.
-        return str(source)
+from delivery_bridge.codex_cli import (
+    CODEX_DESKTOP_RESOURCE_COMPANIONS,
+    codex_cli_name,
+    codex_cli_cache_path,
+    codex_desktop_resource_paths,
+    WINDOWS_CLI_WRAPPER_SUFFIXES,
+    path_codex_cli,
+    CODEX_CLI_VERSIONS,
+    codex_cli_version,
+    newest_codex_cli,
+    newer_codex_cli,
+    codex_cli_candidates,
+    available_codex_cli,
+    provision_codex_cli,
+)
 
 
 def environment_setup_workspace() -> Path:
@@ -731,58 +504,13 @@ def environment_setup_workspace() -> Path:
     return root.resolve()
 
 
-def workspace_path_of(value: Any) -> Path:
-    raw = str(value or "").strip()
-    if not raw:
-        raise BridgeFailure("未提供 Codex 工作目录，请先在项目管理中确认当前项目的工作目录")
-    candidate = Path(raw).expanduser()
-    if not candidate.is_absolute():
-        raise BridgeFailure("Codex 工作目录必须是绝对路径")
-    try:
-        resolved = candidate.resolve(strict=True)
-    except OSError as exc:
-        raise BridgeFailure(f"Codex 工作目录不存在：{candidate}") from exc
-    if not resolved.is_dir():
-        raise BridgeFailure(f"Codex 工作目录不是目录：{resolved}")
-    return resolved
 
 
-def business_workspace_path_of(value: Any, root: Path) -> Path:
-    """Resolve and create one server-owned business conversation directory.
-
-    The API carries a logical path only: ``{username}/业务空间/{projectName}``.
-    It is never treated as an arbitrary path supplied by a browser or upstream
-    server, so a business conversation cannot escape the configured root.
-    """
-    raw = str(value or "").strip().replace("\\", "/")
-    parts = [part.strip() for part in raw.split("/")]
-    if len(parts) != 3 or parts[1] != BUSINESS_WORKSPACE_SCOPE:
-        raise BridgeFailure("业务工作目录必须是 用户名/业务空间/项目名称")
-    owner, _scope, project_name = parts
-    # The authenticated account name can be Chinese or another Unicode name.
-    # It only needs to be a single safe directory segment; the Go service uses
-    # the same rule when it builds the logical workspace path.
-    if not owner or owner in {".", ".."} or len(owner) > 120:
-        raise BridgeFailure("业务工作目录中的用户名无效")
-    if any(ord(character) < 0x20 or character in {"/", "\\"} for character in owner):
-        raise BridgeFailure("业务工作目录中的用户名无效")
-    if not project_name or project_name in {".", ".."} or len(project_name) > 120:
-        raise BridgeFailure("业务工作目录中的项目名称无效")
-    if any(ord(character) < 0x20 or character in {"/", "\\"} for character in project_name):
-        raise BridgeFailure("业务工作目录中的项目名称无效")
-
-    try:
-        root = root.expanduser()
-        root.mkdir(parents=True, exist_ok=True)
-        resolved_root = root.resolve(strict=True)
-        workspace = (resolved_root / owner / BUSINESS_WORKSPACE_SCOPE / project_name).resolve()
-        workspace.relative_to(resolved_root)
-        workspace.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        raise BridgeFailure(f"无法创建业务工作目录：{exc}") from exc
-    except ValueError as exc:
-        raise BridgeFailure("业务工作目录超出允许范围") from exc
-    return workspace
+from delivery_bridge.workspaces import (
+    BUSINESS_WORKSPACE_SCOPE,
+    workspace_path_of,
+    business_workspace_path_of,
+)
 
 
 def codex_local_projects() -> list[dict[str, Any]]:
@@ -1065,35 +793,16 @@ def progress_event_of(message: dict[str, Any]) -> tuple[str, str, str, str] | No
     return None
 
 
-def wrap_bridge_context(context_lines: list[str], spoken: str) -> str:
-    """Put the board's assembled context behind a marker and leave the user's own words after it.
-
-    面板会往提示词里塞项目、任务、阶段、技能一大堆上下文；那是给执行器看的，
-    聊天记录里只该回显 `spoken`，也就是用户自己写的内容。
-    """
-    # 只带附件不写字也是一次有效的输入，补一句可见文案：空文本的条目会被整条丢掉。
-    text = spoken.strip() or "请查看随附文件并继续处理。"
-    return "\n".join([f"<{BRIDGE_CONTEXT_TAG}>", *context_lines, f"</{BRIDGE_CONTEXT_TAG}>", "", text])
 
 
-def with_mention_context(message: str, mention_context: list[str]) -> str:
-    """Wrap @-selected entities for an in-flight or follow-up turn only when needed."""
-    return wrap_bridge_context(mention_context, message) if mention_context else message
 
 
-def workspace_instruction(workspace: Path | None) -> str:
-    """Point every phase at the project's bound working directory and its own dev skills.
-
-    四个阶段（拆解、梳理、执行、测试）都得先看真实代码：面板返回的结构化上下文里没有工程现状，
-    不点名工作目录和项目技能，执行器就会照着业务名词泛化出一套和仓库对不上的东西。
-    """
-    if not workspace:
-        return "项目工作目录: 未提供。动手前先向用户确认代码仓库位置，不要拿当前目录或安装目录顶替。"
-    return (
-        f"项目工作目录（项目管理里为本项目绑定的代码仓库，也是本轮 cwd）: {workspace}。"
-        "开始前先加载该目录下项目自己的开发技能（如 backend-development、web-development），"
-        "并读相关目录和现有实现；结论要落在真实文件路径上，不要凭业务名词推演。"
-    )
+from delivery_bridge.prompt_context import (
+    BRIDGE_CONTEXT_TAG,
+    wrap_bridge_context,
+    with_mention_context,
+    workspace_instruction,
+)
 
 
 def document_path_of(task: dict[str, Any]) -> str:
@@ -2123,250 +1832,35 @@ def build_requirement_testing_prompt(
     )
 
 
-def environment_selection_of(value: Any) -> list[dict[str, Any]]:
-    """把前端偏好里选中的环境标识翻成「名称 + 版本要求 + 分系统的检测/安装命令」。
-
-    预设项的版本要求由桥接决定，自定义项照抄用户填的原文——用户自己写的东西
-    没有可校验的版本下限，也没法预判它在 macOS 和 Windows 上各叫什么，交给执行器按字面理解。
-    """
-    if value is None:
-        return []
-    if not isinstance(value, list):
-        raise BridgeFailure("预设环境必须是数组")
-    if len(value) > MAX_ENVIRONMENT_SETUP_ITEMS:
-        raise BridgeFailure(f"预设环境最多 {MAX_ENVIRONMENT_SETUP_ITEMS} 项")
-    selected: list[dict[str, Any]] = []
-    for raw in value:
-        name = str(raw or "").strip()
-        if not name:
-            continue
-        if len(name) > 64:
-            raise BridgeFailure("单个预设环境不能超过 64 个字符")
-        preset = ENVIRONMENT_PRESETS.get(name.lower())
-        entry = (
-            {
-                "id": name.lower(),
-                "label": preset["label"],
-                "requirement": preset["requirement"],
-                "minimumVersion": preset["minimumVersion"],
-                "probe": dict(preset["probe"]),
-                "install": dict(preset["install"]),
-            }
-            if preset
-            else {"id": name, "label": name, "requirement": "", "probe": {}, "install": {}}
-        )
-        if entry not in selected:
-            selected.append(entry)
-    return selected
-
-def validate_environment_setup_payload(value: Any) -> tuple[int, str, str, bool, bool, list[dict[str, Any]], str, str, bool]:
-    if not isinstance(value, dict):
-        raise BridgeFailure("请求体必须是 JSON 对象")
-    message = str(value.get("message") or "").strip()
-    if len(message) > 32 * 1024:
-        raise BridgeFailure("消息不能超过 32KB")
-    thread_id = str(value.get("threadId") or "").strip()
-    if len(thread_id) > 255:
-        raise BridgeFailure("会话标识无效")
-    use_git = value.get("useGit", False)
-    if not isinstance(use_git, bool):
-        raise BridgeFailure("是否使用 Git 必须是布尔值")
-    environments = environment_selection_of(value.get("environments"))
-    if not use_git and not environments and not message:
-        raise BridgeFailure("请先在高级设置里选择要预设的环境")
-    model = str(value.get("model") or "").strip()
-    if len(model) > 128:
-        raise BridgeFailure("模型标识不能超过 128 个字符")
-    provider = ai_provider_of(value)
-    return (
-        GLOBAL_ENVIRONMENT_SETUP_PROGRAM_ID,
-        message,
-        thread_id,
-        bool(value.get("newConversation")),
-        use_git,
-        environments,
-        model,
-        reasoning_effort_of(value, provider),
-        fast_mode_of(value, provider),
-    )
 
 
-def environment_command_for(entry: dict[str, Any], field: str, host: str) -> str:
-    """取某项环境在本机系统上的检测 / 安装命令，自定义项没写就返回空串。"""
-    value = entry.get(field)
-    if not isinstance(value, dict):
-        return ""
-    # Linux 没有逐项写死命令，回落到 macOS 那条，让执行器自己换成 apt / yum。
-    return str(value.get(host) or value.get("macos") or "").strip()
 
 
-def github_ssh_paths(home: Path | None = None) -> tuple[Path, Path]:
-    root = (home or Path.home()).expanduser()
-    ssh_directory = root / ".ssh"
-    return ssh_directory, ssh_directory / "config"
 
 
-def github_identity_files(config_path: Path, home: Path) -> list[Path]:
-    """Read only `Host github.com` identity entries from the user's SSH config.
-
-    The UI only claims that a GitHub key is ready when its corresponding public
-    key is present. We intentionally do not inspect private-key contents.
-    """
-    try:
-        lines = config_path.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeDecodeError):
-        return []
-    identities: list[Path] = []
-    host_matches = False
-    for line in lines:
-        try:
-            parts = shlex.split(line, comments=True, posix=True)
-        except ValueError:
-            continue
-        if len(parts) < 2:
-            continue
-        option = parts[0].lower()
-        if option == "host":
-            host_matches = any(item.casefold() == GITHUB_SSH_HOST for item in parts[1:])
-            continue
-        if option != "identityfile" or not host_matches:
-            continue
-        raw_path = parts[1].replace("%d", str(home)).replace("%h", GITHUB_SSH_HOST)
-        if raw_path == "~":
-            candidate = home
-        elif raw_path.startswith("~/"):
-            candidate = home / raw_path[2:]
-        else:
-            candidate = Path(raw_path).expanduser()
-        if not candidate.is_absolute():
-            candidate = home / ".ssh" / candidate
-        resolved = candidate.resolve(strict=False)
-        if resolved not in identities:
-            identities.append(resolved)
-    return identities
 
 
-def public_key_from_file(path: Path) -> str:
-    try:
-        if path.stat().st_size > 16 * 1024:
-            return ""
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeDecodeError):
-        return ""
-    for line in lines:
-        candidate = line.strip()
-        if candidate and not candidate.startswith("#"):
-            return candidate if SSH_PUBLIC_KEY_RE.fullmatch(candidate) else ""
-    return ""
 
 
-def github_ssh_key_status(home: Path | None = None) -> dict[str, Any]:
-    """Return only public, display-safe GitHub SSH state for the environment UI."""
-    root = (home or Path.home()).expanduser()
-    _, config_path = github_ssh_paths(root)
-    result = {
-        "githubSshConfigured": False,
-        "githubSshPublicKey": "",
-        "githubSshError": "",
-    }
-    for identity_path in github_identity_files(config_path, root):
-        public_key = public_key_from_file(identity_path.with_name(f"{identity_path.name}.pub"))
-        if public_key:
-            result.update({"githubSshConfigured": True, "githubSshPublicKey": public_key})
-            return result
-    return result
 
 
-def write_github_ssh_config(config_path: Path, home: Path, identity_path: Path) -> None:
-    if config_path.exists() and config_path.is_symlink():
-        raise BridgeFailure("SSH 配置文件是符号链接，未自动修改；请先手动配置 GitHub 密钥")
-    try:
-        existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
-    except (OSError, UnicodeDecodeError) as exc:
-        raise BridgeFailure(f"无法读取 SSH 配置文件：{exc}") from exc
-    relative_identity = identity_path.relative_to(home)
-    managed_block = "\n".join((
-        GITHUB_SSH_CONFIG_START,
-        f"Host {GITHUB_SSH_HOST}",
-        f"  HostName {GITHUB_SSH_HOST}",
-        "  User git",
-        f"  IdentityFile ~/{relative_identity}",
-        "  IdentitiesOnly yes",
-        GITHUB_SSH_CONFIG_END,
-        "",
-    ))
-    content = GITHUB_SSH_CONFIG_BLOCK_RE.sub("", existing).lstrip()
-    temporary = config_path.with_name(f".{config_path.name}.delivery-task-planner.tmp")
-    try:
-        temporary.write_text(managed_block + content, encoding="utf-8")
-        os.chmod(temporary, 0o600)
-        os.replace(temporary, config_path)
-    except OSError as exc:
-        try:
-            temporary.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise BridgeFailure(f"无法写入 SSH 配置文件：{exc}") from exc
 
 
-def ensure_github_ssh_key(home: Path | None = None) -> dict[str, Any]:
-    """Create a managed GitHub key only when no configured public key is usable."""
-    root = (home or Path.home()).expanduser()
-    current = github_ssh_key_status(root)
-    if current["githubSshConfigured"]:
-        return current
-    ssh_directory, config_path = github_ssh_paths(root)
-    try:
-        ssh_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-        os.chmod(ssh_directory, 0o700)
-    except OSError as exc:
-        current["githubSshError"] = f"无法创建 SSH 目录：{exc}"
-        return current
-    private_key = ssh_directory / GITHUB_SSH_KEY_NAME
-    public_key = private_key.with_name(f"{private_key.name}.pub")
-    ssh_keygen = shutil.which("ssh-keygen")
-    if not ssh_keygen:
-        current["githubSshError"] = "未找到 ssh-keygen；请先完成 Git 安装后重新预设"
-        return current
-    try:
-        if not private_key.exists():
-            generated = subprocess.run(
-                [ssh_keygen, "-q", "-t", "ed25519", "-f", str(private_key), "-N", "", "-C", "delivery-task-planner-github"],
-                check=False,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                timeout=10,
-            )
-            if generated.returncode != 0:
-                current["githubSshError"] = f"GitHub SSH 密钥生成失败：{(generated.stdout or '').strip() or 'ssh-keygen 退出异常'}"
-                return current
-        elif not public_key_from_file(public_key):
-            recovered = subprocess.run(
-                [ssh_keygen, "-y", "-f", str(private_key)],
-                check=False,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                timeout=10,
-            )
-            recovered_key = (recovered.stdout or "").strip()
-            if recovered.returncode != 0 or not SSH_PUBLIC_KEY_RE.fullmatch(recovered_key):
-                current["githubSshError"] = "已有 GitHub 密钥无法恢复公钥，未覆盖原有文件"
-                return current
-            public_key.write_text(f"{recovered_key}\n", encoding="utf-8")
-        os.chmod(private_key, 0o600)
-        os.chmod(public_key, 0o644)
-        write_github_ssh_config(config_path, root, private_key)
-    except (BridgeFailure, OSError, subprocess.SubprocessError) as exc:
-        current["githubSshError"] = str(exc)
-        return current
-    configured = github_ssh_key_status(root)
-    if not configured["githubSshConfigured"]:
-        configured["githubSshError"] = "GitHub SSH 密钥已生成，但未能完成配置校验"
-    return configured
+
+from delivery_bridge.github_ssh import (
+    GITHUB_SSH_HOST,
+    GITHUB_SSH_KEY_NAME,
+    GITHUB_SSH_CONFIG_START,
+    GITHUB_SSH_CONFIG_END,
+    GITHUB_SSH_CONFIG_BLOCK_RE,
+    SSH_PUBLIC_KEY_RE,
+    github_ssh_paths,
+    github_identity_files,
+    public_key_from_file,
+    github_ssh_key_status,
+    write_github_ssh_config,
+    ensure_github_ssh_key,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -2374,1210 +1868,116 @@ def ensure_github_ssh_key(home: Path | None = None) -> dict[str, Any]:
 # 命令参数一律固定，不拼接用户输入到 shell；分支名先做白名单校验再交给 Git。
 # ---------------------------------------------------------------------------
 
-# git check-ref-format 明确禁止的字符，外加空白和 ASCII 控制字符。
-# 别再自己另立一套更窄的白名单：仓库里真实存在 feature/issue#duokai 这种合法分支，
-# 白名单挡掉它们之后，提交推送这些工程会直接失败在「分支名不合法」上。
-GIT_BRANCH_FORBIDDEN_RE = re.compile(r"[\x00-\x20\x7f~^:?*\[\\]")
-GIT_REMOTE_PREFIX = "remotes/"
-GIT_REMOTE_NAME_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
-# 关联远端仓库时只接受这几种常见写法，挡掉以 - 开头会被 git 当成选项的输入。
-GIT_REPOSITORY_URL_RE = re.compile(r"(?:[A-Za-z0-9._-]+@[A-Za-z0-9._-]+:[A-Za-z0-9._~/-]+|(?:ssh|git|https|http)://[A-Za-z0-9._~@:/-]+)")
-
-
-def valid_git_branch_name(value: str) -> bool:
-    """挡掉明显非法的分支名。最终仍由 git check-ref-format 判定，这里只做前置过滤。
-
-    规则对齐 git 自己的 check-ref-format：只挡它禁止的字符和形态，不额外收窄。
-    额外挡掉以 - 开头的名字——命令参数是按列表传的，不过 git 会把它当成选项。
-    """
-    name = str(value or "").strip()
-    if not name or len(name) > 255 or name == "@":
-        return False
-    if GIT_BRANCH_FORBIDDEN_RE.search(name):
-        return False
-    if name.startswith(("-", "/", ".")) or name.endswith(("/", ".", ".lock")):
-        return False
-    return ".." not in name and "//" not in name and "@{" not in name
-
-
-def valid_git_remote_name(value: str) -> bool:
-    return bool(GIT_REMOTE_NAME_RE.fullmatch(str(value or "").strip()))
-
-
-def run_git(workspace: Path, args: list[str], timeout: int = 20) -> subprocess.CompletedProcess:
-    """在项目工作目录里执行一条只带固定参数的 Git 命令。"""
-    try:
-        return subprocess.run(
-            ["git", "-C", str(workspace), *args],
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            timeout=timeout,
-        )
-    except FileNotFoundError as exc:
-        raise BridgeFailure("本机未安装 Git，请先在环境预设中完成安装") from exc
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise BridgeFailure(f"执行 Git 命令失败：{exc}") from exc
-
-
-def git_output(workspace: Path, args: list[str], failure: str, timeout: int = 20) -> str:
-    completed = run_git(workspace, args, timeout=timeout)
-    if completed.returncode != 0:
-        raise BridgeFailure(f"{failure}：{(completed.stdout or '').strip() or 'git 退出异常'}")
-    return (completed.stdout or "").strip()
-
-
-def git_workspace_probe(workspace: Path) -> tuple[bool, str]:
-    """判断目录是否落在某个 Git 工作树里，同时把 git 原文带回去用于报错。"""
-    completed = run_git(workspace, ["rev-parse", "--is-inside-work-tree"])
-    output = (completed.stdout or "").strip()
-    # run_git 把 stderr 并进了 stdout，git 的 warning/hint 会混在结果前面，判定只认最后一行。
-    verdict = output.splitlines()[-1].strip() if output else ""
-    return (completed.returncode == 0 and verdict == "true"), (output or "git 退出异常")
-
-
-def require_git_workspace(workspace: Path) -> None:
-    inside, detail = git_workspace_probe(workspace)
-    if not inside:
-        # 带上 git 原文，否则「不是仓库」和「仓库归属存疑」「HOME 不可读」在前端长得一模一样。
-        raise BridgeFailure(f"项目工作目录不是 Git 仓库：{workspace}（git: {detail}）")
-
-
-def git_current_branch(workspace: Path) -> str:
-    """游离 HEAD 时返回空串，调用方据此提示用户先切回分支。"""
-    completed = run_git(workspace, ["symbolic-ref", "--quiet", "--short", "HEAD"])
-    return (completed.stdout or "").strip() if completed.returncode == 0 else ""
-
-
-def git_default_branch(workspace: Path, branches: list[str]) -> str:
-    """基准分支的默认值：优先当前分支，其次远端 HEAD，最后常见主干名。"""
-    current = git_current_branch(workspace)
-    if current:
-        return current
-    head = run_git(workspace, ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"])
-    if head.returncode == 0:
-        candidate = (head.stdout or "").strip()
-        if candidate in branches:
-            return candidate
-    for candidate in ("main", "master", "develop"):
-        if candidate in branches:
-            return candidate
-    return branches[0] if branches else ""
-
-
-def git_fetch_all(workspace: Path, remote: str = "origin") -> str:
-    """把远端分支引用同步到本机。返回失败说明，空串表示成功或没有远端。
-
-    别人新建的需求分支只有 fetch 过才看得见；离线时不该把整个分支列表也一起废掉。
-    """
-    if remote not in git_output(workspace, ["remote"], "读取 Git 远端失败").split():
-        return ""
-    completed = run_git(workspace, ["fetch", "--prune", remote], timeout=180)
-    if completed.returncode != 0:
-        return (completed.stdout or "").strip() or "git 退出异常"
-    return ""
-
-
-def git_branch_catalog(workspace: Path) -> dict[str, Any]:
-    """本地分支加远端分支，去重后按名称排序；origin/HEAD 这类符号引用不列出。"""
-    require_git_workspace(workspace)
-    # 列分支前先同步远端引用：别人刚推的分支要能直接在建分支表单里选到。
-    fetch_error = git_fetch_all(workspace)
-    listed = git_output(
-        workspace,
-        ["for-each-ref", "--format=%(refname:short)", "refs/heads", "refs/remotes"],
-        "读取 Git 分支失败",
-    )
-    # refs/remotes/origin/HEAD 的简写就是 origin，光判 /HEAD 结尾漏得掉，会混进分支下拉里。
-    remote_names = set(git_output(workspace, ["remote"], "读取 Git 远端失败").split())
-    branches: list[str] = []
-    for line in listed.splitlines():
-        name = line.strip()
-        if not name or name.endswith("/HEAD") or name in remote_names:
-            continue
-        if name not in branches:
-            branches.append(name)
-    branches.sort()
-    return {
-        "branches": branches,
-        "defaultBranch": git_default_branch(workspace, branches),
-        # 面板要标注项目此刻所处的分支，游离 HEAD 时为空串。
-        "currentBranch": git_current_branch(workspace),
-        # 拉取远端失败时照样给本地分支，但要让面板能说清列表可能不是最新的。
-        "fetchError": fetch_error,
-    }
-
-
-def normalized_git_remote_url(value: str) -> str:
-    """用于显示层面的远端比较，忽略协议和 .git 尾缀的等价形式。"""
-    text = str(value or "").strip().rstrip("/")
-    if text.endswith(".git"):
-        text = text[:-4]
-    if text.startswith("git@") and ":" in text:
-        host, path = text[4:].split(":", 1)
-        text = f"{host}/{path}"
-    for prefix in ("ssh://git@", "https://", "http://"):
-        if text.startswith(prefix):
-            text = text[len(prefix):]
-            break
-    return text.lower().rstrip("/")
-
-
-def git_remote_url(workspace: Path, remote: str) -> str:
-    if not valid_git_remote_name(remote):
-        raise BridgeFailure("Git 远端名称不合法")
-    completed = run_git(workspace, ["remote", "get-url", remote])
-    if completed.returncode != 0:
-        return ""
-    return (completed.stdout or "").strip()
-
-
-def git_worktree_summary(workspace: Path) -> dict[str, int | bool]:
-    """把 porcelain 状态压成面板需要的数量，绝不返回文件路径。"""
-    # porcelain 的前两位就是暂存区 / 工作区状态，不能复用 git_output：它会 trim
-    # 整段输出，恰好会吞掉第一行的前导空格，把 " M" 误读成 "M "。
-    completed = run_git(workspace, ["status", "--porcelain=v1"])
-    if completed.returncode != 0:
-        raise BridgeFailure(f"读取 Git 工作区状态失败：{(completed.stdout or '').strip() or 'git 退出异常'}")
-    output = (completed.stdout or "").rstrip()
-    changed = 0
-    staged = 0
-    unstaged = 0
-    untracked = 0
-    for line in output.splitlines():
-        changed += 1
-        if line.startswith("??"):
-            untracked += 1
-            continue
-        state = line[:2]
-        if state[:1] not in {" ", "?"}:
-            staged += 1
-        if len(state) > 1 and state[1:2] not in {" ", "?"}:
-            unstaged += 1
-    return {
-        "dirty": bool(output),
-        "changed": changed,
-        "staged": staged,
-        "unstaged": unstaged,
-        "untracked": untracked,
-    }
-
-
-# 变更明细面板的两条硬上限：文件太多只列前面一批，单个文件太大就不回正文。
-MAX_GIT_CHANGE_FILES = 300
-MAX_GIT_CHANGE_FILE_BYTES = 512 * 1024
-
-
-def run_git_bytes(workspace: Path, args: list[str], timeout: int = 20) -> subprocess.CompletedProcess:
-    """要原样拿文件内容时用这个：stderr 单独收，也不做文本解码。"""
-    try:
-        return subprocess.run(
-            ["git", "-C", str(workspace), *args],
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=timeout,
-        )
-    except FileNotFoundError as exc:
-        raise BridgeFailure("本机未安装 Git，请先在环境预设中完成安装") from exc
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise BridgeFailure(f"执行 Git 命令失败：{exc}") from exc
-
-
-def git_has_head(workspace: Path) -> bool:
-    return run_git(workspace, ["rev-parse", "--verify", "--quiet", "HEAD"]).returncode == 0
-
-
-def git_change_kind_of(state: str) -> str:
-    """把 porcelain 的两位状态压成面板要的四种：add / modify / delete / rename。"""
-    letters = {state[:1], state[1:2]} - {" "}
-    if "D" in letters:
-        return "delete"
-    if "R" in letters:
-        return "rename"
-    if "A" in letters or "?" in letters:
-        return "add"
-    return "modify"
-
-
-def git_numstat_totals(workspace: Path) -> dict[str, tuple[int, int]]:
-    """已跟踪文件相对 HEAD 的增删行数；二进制文件 git 给的是 -，按 0 计。"""
-    if not git_has_head(workspace):
-        return {}
-    completed = run_git(workspace, ["diff", "--numstat", "HEAD"], timeout=60)
-    if completed.returncode != 0:
-        return {}
-    totals: dict[str, tuple[int, int]] = {}
-    for line in (completed.stdout or "").splitlines():
-        parts = line.split("\t")
-        if len(parts) < 3:
-            continue
-        added = int(parts[0]) if parts[0].isdigit() else 0
-        removed = int(parts[1]) if parts[1].isdigit() else 0
-        # 重命名在 numstat 里是 "old => new" 这种写法，取最后一段当作现在的路径。
-        path = parts[2].split(" => ")[-1].strip("{}")
-        totals[path] = (added, removed)
-    return totals
-
-
-def git_untracked_line_count(workspace: Path, path: str) -> int:
-    target = workspace / path
-    try:
-        if not target.is_file() or target.stat().st_size > MAX_GIT_CHANGE_FILE_BYTES:
-            return 0
-        raw = target.read_bytes()
-    except OSError:
-        return 0
-    if b"\0" in raw:
-        return 0
-    return len(raw.splitlines())
-
-
-def git_change_files(workspace: Path) -> dict[str, Any]:
-    """列出工作区相对 HEAD 的文件级改动，给「变更」面板点开看明细用。"""
-    require_git_workspace(workspace)
-    # -uall 让未跟踪目录展开成一条条文件，否则新增的整个目录只会收到一条以 / 结尾的条目，
-    # 面板既算不出行数，也读不到正文，点开只剩「没有可对比的内容」。
-    completed = run_git(workspace, ["status", "--porcelain=v1", "-z", "-uall"], timeout=60)
-    if completed.returncode != 0:
-        raise BridgeFailure(f"读取 Git 变更清单失败：{(completed.stdout or '').strip() or 'git 退出异常'}")
-    entries = [chunk for chunk in (completed.stdout or "").split("\0") if chunk]
-    totals = git_numstat_totals(workspace)
-    files: list[dict[str, Any]] = []
-    skip_next = False
-    for index, entry in enumerate(entries):
-        if skip_next:
-            # 重命名条目后面紧跟一条旧路径，-z 下没有引号可解析，只能靠位置跳过。
-            skip_next = False
-            continue
-        if len(entry) < 4:
-            continue
-        state = entry[:2]
-        path = entry[3:]
-        kind = git_change_kind_of(state)
-        if kind == "rename":
-            skip_next = index + 1 < len(entries)
-        untracked = state == "??"
-        added, removed = totals.get(path, (0, 0))
-        if untracked:
-            added = git_untracked_line_count(workspace, path)
-            removed = 0
-        files.append({
-            "path": path,
-            "kind": kind,
-            "added": added,
-            "removed": removed,
-            "staged": state[:1] not in {" ", "?"},
-            "untracked": untracked,
-        })
-    files.sort(key=lambda item: item["path"])
-    truncated = len(files) > MAX_GIT_CHANGE_FILES
-    return {
-        "workspace": str(workspace),
-        "branch": git_current_branch(workspace),
-        "files": files[:MAX_GIT_CHANGE_FILES],
-        "total": len(files),
-        "truncated": truncated,
-    }
-
-
-def git_change_text(raw: bytes) -> tuple[str, bool]:
-    """返回可展示的正文和「是不是二进制」；二进制一律不回正文。"""
-    if b"\0" in raw:
-        return "", True
-    try:
-        return raw.decode("utf-8"), False
-    except UnicodeDecodeError:
-        return "", True
-
-
-def git_change_detail(workspace: Path, path: str) -> dict[str, Any]:
-    """一个文件改动前后的两份正文，交给前端的 diff 组件对比。
-
-    只接受当前确实有改动的路径：这样既不用自己防目录穿越，也不会变成任意文件读取口子。
-    """
-    target = str(path or "").strip()
-    if not target:
-        raise BridgeFailure("缺少文件路径")
-    listing = git_change_files(workspace)
-    entry = next((item for item in listing["files"] if item["path"] == target), None)
-    if entry is None:
-        raise BridgeFailure(f"当前工作区没有这个文件的改动：{target}")
-    old_raw = b""
-    if not entry["untracked"] and entry["kind"] != "add" and git_has_head(workspace):
-        completed = run_git_bytes(workspace, ["show", f"HEAD:{target}"], timeout=60)
-        if completed.returncode == 0:
-            old_raw = completed.stdout or b""
-    new_raw = b""
-    working = workspace / target
-    try:
-        if working.is_file():
-            new_raw = working.read_bytes()
-    except OSError as exc:
-        raise BridgeFailure(f"读取文件失败：{exc}") from exc
-    if len(old_raw) > MAX_GIT_CHANGE_FILE_BYTES or len(new_raw) > MAX_GIT_CHANGE_FILE_BYTES:
-        return {**entry, "oldText": "", "newText": "", "binary": False, "truncated": True}
-    old_text, old_binary = git_change_text(old_raw)
-    new_text, new_binary = git_change_text(new_raw)
-    return {
-        **entry,
-        "oldText": old_text,
-        "newText": new_text,
-        "binary": old_binary or new_binary,
-        "truncated": False,
-    }
-
-
-def git_local_branch_for_reference(workspace: Path, reference: str, remote: str) -> tuple[str, str]:
-    """解析本地或远端分支引用，返回应使用的本地名和可选远端引用。"""
-    value = str(reference or "").strip()
-    if not valid_git_branch_name(value):
-        raise BridgeFailure("需求分支名不合法")
-    if git_branch_exists(workspace, value):
-        return value, ""
-    remote_prefix = f"{remote}/"
-    if value.startswith(remote_prefix):
-        local = value[len(remote_prefix):]
-        remote_ref = value
-    else:
-        local = value
-        remote_ref = f"{remote}/{value}"
-    if not valid_git_branch_name(local):
-        raise BridgeFailure("远端需求分支名不合法")
-    exists = run_git(workspace, ["rev-parse", "--verify", "--quiet", f"refs/remotes/{remote_ref}"])
-    if exists.returncode != 0:
-        # 分支可能是别人刚推上来的，本机还没 fetch 过；先拉一次远端引用再判断。
-        fetched = run_git(workspace, ["fetch", remote, local], timeout=180)
-        exists = run_git(workspace, ["rev-parse", "--verify", "--quiet", f"refs/remotes/{remote_ref}"])
-        if exists.returncode != 0:
-            detail = (fetched.stdout or "").strip()
-            raise BridgeFailure(
-                f"本机和远端都不存在需求分支 {value}" + (f"。git 输出：{detail}" if fetched.returncode != 0 and detail else "")
-            )
-    return local, remote_ref
-
-
-def git_checkout_reference(
-    workspace: Path, reference: str, remote: str, keep_submodules: list[str] | None = None,
-) -> tuple[str, list[dict[str, Any]]]:
-    """切到本地分支；只有远端存在时创建受跟踪的本地分支。返回分支名和子模组同步结果。"""
-    local, remote_ref = git_local_branch_for_reference(workspace, reference, remote)
-    if git_current_branch(workspace) == local:
-        return local, []
-    if git_worktree_dirty(workspace):
-        raise BridgeFailure(f"工作目录有未提交改动，无法切换到分支 {local}，请先提交或暂存")
-    args = ["checkout", local] if not remote_ref else ["checkout", "-b", local, "--track", remote_ref]
-    completed = run_git(workspace, args)
-    if completed.returncode != 0:
-        raise BridgeFailure(f"切换分支 {local} 失败：{(completed.stdout or '').strip() or 'git 退出异常'}")
-    return local, git_sync_unselected_submodules(workspace, keep_submodules or [])
-
-
-def git_workspace_status(workspace: Path, expected_remote_url: str = "", remote: str = "origin") -> dict[str, Any]:
-    """读取项目当前 Git 状态。此函数只做本机读取，不 fetch、不切换、不写入。"""
-    require_git_workspace(workspace)
-    if not valid_git_remote_name(remote):
-        raise BridgeFailure("Git 远端名称不合法")
-    actual_remote_url = git_remote_url(workspace, remote)
-    expected = str(expected_remote_url or "").strip()
-    remote_matches = not expected or (
-        bool(actual_remote_url) and normalized_git_remote_url(actual_remote_url) == normalized_git_remote_url(expected)
-    )
-    summary = git_worktree_summary(workspace)
-    current = git_current_branch(workspace)
-    # 远端地址可能包含嵌入式凭据；浏览器只需要知道是否一致，不能回传具体地址。
-    return {
-        "workspace": str(workspace),
-        "isGitRepository": True,
-        "remoteName": remote,
-        "remoteMatches": remote_matches,
-        "currentBranch": current,
-        "detached": not bool(current),
-        "checkedAt": int(time.time()),
-        **summary,
-    }
-
-
-def git_prepare_branch(
-    workspace: Path,
-    reference: str,
-    strategy: str = "switch",
-    commit_message: str = "",
-    expected_remote_url: str = "",
-    remote: str = "origin",
-    allow_detached: bool = False,
-    keep_submodules: list[str] | None = None,
-) -> dict[str, Any]:
-    """用户确认后才处理未提交改动并切分支；绝不丢弃改动或自动应用 stash。
-
-    allow_detached 只给子项目用。`git submodule update` 本来就是把子模块检出到父仓库
-    记录的那个 commit，游离 HEAD 是子模块的常态而不是异常，一律拒绝会让子项目永远停在
-    「分支不一致」上，切不过去。根工作目录仍然拒绝：那里的游离 HEAD 通常是人工操作的中间态。
-    """
-    if strategy not in {"switch", "commit", "stash"}:
-        raise BridgeFailure("未知的 Git 分支处理方式")
-    status = git_workspace_status(workspace, expected_remote_url, remote)
-    if not status["remoteMatches"]:
-        raise BridgeFailure("本机 Git 远端与项目配置不一致，请先确认项目仓库地址或工作目录")
-    if status["detached"] and not allow_detached:
-        raise BridgeFailure("当前工作目录处于游离 HEAD，不能切换需求分支")
-    if status["detached"] and status["dirty"] and strategy == "commit":
-        # 游离 HEAD 上提交会生成一个没有分支指向的提交，切走之后就只能靠 reflog 找回来。
-        raise BridgeFailure("当前项目处于游离 HEAD，改动不能就地提交，请改选暂存后切换")
-    local, _ = git_local_branch_for_reference(workspace, reference, remote)
-    if status["currentBranch"] == local:
-        # 已经在需求分支上：干净的工作区顺手拉一次最新，脏工作区不动它，交给用户先处理改动。
-        pulled_only = False if status["dirty"] else git_pull_branch(workspace, local, remote)
-        return {
-            "branch": local,
-            "previousBranch": status["currentBranch"],
-            "pulled": pulled_only,
-            "committed": False,
-            "stashed": False,
-            "submodules": [],
-            "status": git_workspace_status(workspace, expected_remote_url, remote) if pulled_only else status,
-        }
-    # 先把目标分支拉到远端最新，再决定怎么处理当前改动：拉不动就不该先提交一轮。
-    pulled = git_pull_branch(workspace, local, remote)
-    committed = False
-    stashed = False
-    if status["dirty"]:
-        dirty_submodules = git_dirty_submodule_workspaces(workspace)
-        if strategy == "commit":
-            message = git_commit_message_of(commit_message, str(status["currentBranch"]))
-            for submodule in dirty_submodules:
-                submodule_label = git_submodule_label(workspace, submodule)
-                if not git_current_branch(submodule):
-                    raise BridgeFailure(f"子模块 {submodule_label} 处于游离 HEAD，不能自动提交，请改选暂存后切换")
-                if run_git(submodule, ["add", "--all"]).returncode != 0:
-                    raise BridgeFailure(f"暂存子模块 {submodule_label} 改动失败")
-                completed = run_git(submodule, ["commit", "-m", f"{message} ({submodule_label})"], timeout=120)
-                if completed.returncode != 0:
-                    raise BridgeFailure(
-                        f"提交子模块 {submodule_label} 改动失败：{(completed.stdout or '').strip() or 'git 退出异常'}"
-                    )
-            if run_git(workspace, ["add", "--all"]).returncode != 0:
-                raise BridgeFailure("暂存当前工作区改动失败")
-            completed = run_git(workspace, ["commit", "-m", message], timeout=120)
-            if completed.returncode != 0:
-                raise BridgeFailure(f"提交当前分支改动失败：{(completed.stdout or '').strip() or 'git 退出异常'}")
-            committed = True
-        elif strategy == "stash":
-            label = f"delivery-task-planner: {status['currentBranch']} -> {local}"
-            for submodule in dirty_submodules:
-                submodule_label = git_submodule_label(workspace, submodule)
-                completed = run_git(
-                    submodule,
-                    ["stash", "push", "--include-untracked", "-m", f"{label} ({submodule_label})"],
-                    timeout=120,
-                )
-                if completed.returncode != 0:
-                    raise BridgeFailure(
-                        f"暂存子模块 {submodule_label} 改动失败：{(completed.stdout or '').strip() or 'git 退出异常'}"
-                    )
-            completed = run_git(workspace, ["stash", "push", "--include-untracked", "-m", label], timeout=120)
-            if completed.returncode != 0:
-                raise BridgeFailure(f"暂存当前分支改动失败：{(completed.stdout or '').strip() or 'git 退出异常'}")
-            stashed = True
-        else:
-            raise BridgeFailure("工作目录有未提交改动，请选择先提交或暂存后再切换")
-        if git_worktree_dirty(workspace):
-            remaining = git_worktree_summary(workspace)
-            raise BridgeFailure(
-                f"处理改动后工作目录仍有 {remaining['changed']} 个待提交文件，可能有其它进程正在写入；请停止写入后重试"
-            )
-    branch, submodules = git_checkout_reference(workspace, reference, remote, keep_submodules)
-    return {
-        "branch": branch,
-        "pulled": pulled,
-        "committed": committed,
-        "stashed": stashed,
-        "submodules": submodules,
-        "previousBranch": status["currentBranch"],
-        "status": git_workspace_status(workspace, expected_remote_url, remote),
-    }
-
-
-def git_branch_exists(workspace: Path, branch: str) -> bool:
-    return run_git(workspace, ["rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"]).returncode == 0
-
-
-def git_worktree_dirty(workspace: Path) -> bool:
-    return bool(git_output(workspace, ["status", "--porcelain"], "读取 Git 工作区状态失败"))
-
-
-def git_submodule_workspaces(workspace: Path) -> list[Path]:
-    """返回已初始化的子模块，按最内层到最外层排列，便于先处理嵌套工作区。"""
-    root = workspace.resolve()
-    seen: set[Path] = set()
-    result: list[Path] = []
-
-    def collect(parent: Path) -> None:
-        completed = run_git(parent, ["config", "--file", ".gitmodules", "--null", "--get-regexp", r"^submodule\..*\.path$"])
-        if completed.returncode == 1:
-            return
-        if completed.returncode != 0:
-            raise BridgeFailure(f"读取子模块配置失败：{(completed.stdout or '').strip() or 'git 退出异常'}")
-        for record in (completed.stdout or "").split("\0"):
-            if not record:
-                continue
-            _, separator, raw_path = record.partition("\n")
-            child = (parent / raw_path.strip()).resolve()
-            if not separator or not raw_path.strip():
-                raise BridgeFailure("子模块路径配置无效")
-            try:
-                child.relative_to(root)
-            except ValueError as exc:
-                raise BridgeFailure("子模块路径超出项目工作目录") from exc
-            # 没初始化的子模组只是个空目录，rev-parse 会一路走到父仓库照样说「在工作树里」。
-            # 只有自带 .git（子模组是一个 gitfile）才算真的检出过，能当成独立工作区来读写。
-            if child in seen or not (child / ".git").exists():
-                continue
-            seen.add(child)
-            collect(child)
-            result.append(child)
-
-    collect(root)
-    return result
-
-
-def git_dirty_submodule_workspaces(workspace: Path) -> list[Path]:
-    return [submodule for submodule in git_submodule_workspaces(workspace) if git_worktree_dirty(submodule)]
-
-
-def git_submodule_label(workspace: Path, submodule: Path) -> str:
-    return submodule.resolve().relative_to(workspace.resolve()).as_posix()
-
-
-def git_sync_unselected_submodules(workspace: Path, targets: list[str]) -> list[dict[str, Any]]:
-    """切完分支后，把没被勾选的子模组同步到父仓库这条分支记录的 commit。
-
-    切分支本身不再带 --recurse-submodules：那是整仓行为，一个对象缺失或有本地改动的子模组
-    就能让整条需求分支都建不出来，而界面上勾没勾它完全不起作用。改成切完再逐个同步之后，
-    同步不动的子模组只留一条结果记录，不连累根工作目录和同一轮里的其它工程。
-
-    勾选中的子模组不在这里同步：它们下一步要建（或切到）自己的需求分支，
-    先 submodule update 会把它们检出成游离 HEAD，把那一步的活儿白做一遍。
-    """
-    selected = {str(name or "").strip().strip("/") for name in targets}
-    records: list[dict[str, Any]] = []
-    try:
-        # git_submodule_workspaces 是最内层在前，这里反过来：先更新外层，嵌套的那层才对得上新指针。
-        submodules = list(reversed(git_submodule_workspaces(workspace)))
-    except BridgeFailure as exc:
-        # 分支已经切好了，读不动子模组配置不该反过来变成整个动作失败。
-        return [{
-            "path": ".gitmodules",
-            "name": ".gitmodules",
-            "branch": "",
-            "baseBranch": "",
-            "created": False,
-            "switched": False,
-            "skipped": True,
-            "error": str(exc),
-        }]
-    for submodule in submodules:
-        label = git_submodule_label(workspace, submodule)
-        if label in selected:
-            continue
-        # 不带 --init：这里只把已经检出的子模组对齐到新指针，绝不顺手克隆一个新的。
-        # 建分支是个前台动作，超时按分钟算，不能让一次慢 fetch 把整个弹窗挂住。
-        completed = run_git(
-            submodule.parent, ["submodule", "update", "--", submodule.name], timeout=120,
-        )
-        if completed.returncode != 0:
-            records.append({
-                "path": label,
-                "name": label,
-                "branch": "",
-                "baseBranch": "",
-                "created": False,
-                "switched": False,
-                "skipped": True,
-                "error": f"同步子模组 {label} 失败：{(completed.stdout or '').strip() or 'git 退出异常'}",
-            })
-    return records
-
-
-# 扫子项目时不进这些目录：依赖和产物目录里也可能躺着 .git，但它们不是这个项目的工程。
-GIT_SUBPROJECT_SKIP_DIRS = {
-    "node_modules", "vendor", "dist", "build", "out", "target",
-    "__pycache__", "venv", ".venv", "tmp", "temp",
-}
-
-
-def git_subproject_workspaces(workspace: Path) -> list[Path]:
-    """工作目录下一级子目录里自带 .git 的独立工程，按目录名排序。
-
-    只看一级：再往下扫要为每个候选目录多跑一轮 IO，而实际的多工程布局都是
-    「工作目录/工程名」这一层。已注册成 submodule 的目录同样自带 .git，照样列出来。
-    """
-    root = workspace.resolve()
-    try:
-        children = sorted(root.iterdir(), key=lambda item: item.name.casefold())
-    except OSError as exc:
-        raise BridgeFailure(f"读取项目工作目录失败：{exc}") from exc
-    result: list[Path] = []
-    for child in children:
-        if child.name.startswith(".") or child.name in GIT_SUBPROJECT_SKIP_DIRS:
-            continue
-        if child.is_symlink() or not child.is_dir():
-            continue
-        if not (child / ".git").exists():
-            continue
-        result.append(child.resolve())
-    return result
-
-
-def git_subproject_workspace_of(workspace: Path, relative: str) -> Path:
-    """把前端传回来的子项目相对路径还原成目录；只认扫描列出来的那一级。"""
-    value = str(relative or "").strip().strip("/")
-    root = workspace.resolve()
-    if not value or value == ".":
-        return root
-    candidate = (root / value).resolve()
-    if candidate == root:
-        return root
-    if candidate not in git_subproject_workspaces(root):
-        raise BridgeFailure(f"子项目不存在或不是 Git 仓库：{value}")
-    return candidate
-
-
-def git_branch_reference_exists(workspace: Path, branch: str, remote: str = "origin") -> bool:
-    """本机或已同步的远端引用里有没有这条分支；只读本地引用，不联网 fetch。"""
-    if not valid_git_branch_name(branch):
-        return False
-    if git_branch_exists(workspace, branch):
-        return True
-    # 分支名本身可能已经带了远端前缀（下拉里选的是 origin/main）；再拼一次会查成 origin/origin/main，
-    # 结果把明明存在的基准分支判成不存在。
-    reference = branch if branch.startswith(f"{remote}/") else f"{remote}/{branch}"
-    return run_git(workspace, ["rev-parse", "--verify", "--quiet", f"refs/remotes/{reference}"]).returncode == 0
-
-
-def git_project_snapshot(workspace: Path, relative: str, branch: str = "", remote: str = "origin") -> dict[str, Any]:
-    """单个工程的 Git 快照。读不动的工程只把原因带回去，不连累同级的其它工程。"""
-    record: dict[str, Any] = {
-        "path": relative,
-        "name": relative or workspace.name,
-        "workspace": str(workspace),
-        "isGitRepository": False,
-        "hasBranch": False,
-        "error": "",
-        "remoteName": remote,
-        "remoteMatches": True,
-        "currentBranch": "",
-        "detached": False,
-        "dirty": False,
-        "changed": 0,
-        "staged": 0,
-        "unstaged": 0,
-        "untracked": 0,
-        "checkedAt": int(time.time()),
-    }
-    try:
-        record.update(git_workspace_status(workspace, "", remote))
-        if branch:
-            record["hasBranch"] = git_branch_reference_exists(workspace, branch, remote)
-    except BridgeFailure as exc:
-        record["error"] = str(exc)
-    # git_workspace_status 会覆盖 workspace，但不认识 path / name，这里补回来。
-    record["path"] = relative
-    record["name"] = relative or workspace.name
-    return record
-
-
-def git_workspace_projects(workspace: Path, branch: str = "", remote: str = "origin") -> dict[str, Any]:
-    """根工作目录加一级子项目的 Git 快照，给需求窗口的 Git 面板分工程展示。"""
-    projects = [git_project_snapshot(workspace, "", branch, remote)]
-    for child in git_subproject_workspaces(workspace):
-        projects.append(git_project_snapshot(child, child.name, branch, remote))
-    return {"workspace": str(workspace), "projects": projects}
-
-
-def git_subproject_targets_of(workspace: Path, raw: Any, branch: str = "", remote: str = "origin") -> list[str]:
-    """请求里带了 targets 就按它来，没带就自动选出所有已有这条分支的子项目。
-
-    没带 targets 的调用方（需求列表的分支检查、旧版本控制台）也该把子项目一起带上，
-    否则切完分支只有根目录跟着走，子工程还停在别的需求上。
-    """
-    if raw is None:
-        if not branch:
-            return []
-        return [
-            child.name for child in git_subproject_workspaces(workspace)
-            if git_branch_reference_exists(child, branch, remote)
-        ]
-    if not isinstance(raw, list):
-        raise BridgeFailure("子项目列表格式不正确")
-    targets: list[str] = []
-    for value in raw:
-        name = str(value or "").strip().strip("/")
-        if name and name != "." and name not in targets:
-            targets.append(name)
-    return targets
-
-
-def git_checkout_branch(
-    workspace: Path, branch: str, keep_submodules: list[str] | None = None,
-) -> list[dict[str, Any]]:
-    """切换到已存在的本地分支；工作区有未提交改动时不强行切，交回给用户处理。"""
-    if git_current_branch(workspace) == branch:
-        return []
-    if git_worktree_dirty(workspace):
-        raise BridgeFailure(f"工作目录有未提交改动，无法切换到分支 {branch}，请先提交或暂存")
-    completed = run_git(workspace, ["checkout", branch])
-    if completed.returncode != 0:
-        raise BridgeFailure(f"切换分支 {branch} 失败：{(completed.stdout or '').strip() or 'git 退出异常'}")
-    return git_sync_unselected_submodules(workspace, keep_submodules or [])
-
-
-def git_default_remote(workspace: Path) -> str:
-    """只认 origin：需求分支是给评审用的，推到哪个远端不该由面板猜。"""
-    remotes = git_output(workspace, ["remote"], "读取 Git 远端失败").split()
-    if "origin" in remotes:
-        return "origin"
-    raise BridgeFailure("当前仓库没有配置 origin 远端，无法推送")
-
-
-GIT_PUSH_REPAIR_TIMEOUT_SECONDS = 15 * 60
-
-
-def git_branch_synced(workspace: Path, branch: str, remote: str = "origin") -> bool:
-    """本地分支是否已经全部推到远端。AI 兜底之后用它判定，而不是信 AI 的自述。"""
-    run_git(workspace, ["fetch", remote, branch], timeout=180)
-    ahead = run_git(workspace, ["rev-list", "--count", f"{remote}/{branch}..{branch}"])
-    return ahead.returncode == 0 and (ahead.stdout or "").strip() == "0"
-
-
-def build_git_push_repair_prompt(workspace: Path, branch: str, remote: str, failure: str, commit_message: str) -> str:
-    """推送失败时交给 AI 的修复提示词。只授权它解决推送本身，不允许改业务实现。"""
-    return wrap_bridge_context(
-        [
-            "这是交付任务面板的「推送需求分支」回合：面板已经尝试提交并推送，但失败了，请你在本机把它修好并真正推送成功。",
-            workspace_instruction(workspace),
-            f"需求分支: {branch}",
-            f"远端: {remote}",
-            f"面板使用的提交说明: {commit_message}",
-            "",
-            "面板执行失败的原始输出:",
-            failure,
-            "",
-            "处理要求:",
-            "- 面板已经把改动提交成提交点，并自动试过一次 rebase；失败后已经 --abort，仓库现在是干净状态，不在变基中。",
-            "- 只解决提交与推送本身：拉取远端、rebase 或 merge、解决冲突、补提交、重新 push。",
-            "- 解决冲突时保留双方的真实意图，不要为了让命令通过而删掉别人的改动。",
-            "- 不要修改与本次冲突无关的业务实现，不要改动其他分支。",
-            f"- 禁止 force push、禁止 push 到 {branch} 以外的分支、禁止改写已经推到远端的历史。",
-            "- 处理不了（例如需要凭据、需要人工决策的冲突）就停下来说明原因，不要绕开。",
-            "- 最后必须实际执行一次 push，并在回复里贴出 push 命令的真实输出。",
-        ],
-        f"推送需求分支 {branch} 失败，请解决后重新推送。",
-    )
-
-
-MAX_GIT_COMMIT_MESSAGE_BYTES = 4 * 1024
-
-
-def git_commit_message_of(value: str, branch: str) -> str:
-    """提交说明来自用户输入，只做长度和控制字符限制；命令参数是数组，不存在注入。"""
-    message = str(value or "").strip() or f"chore: {branch}"
-    if len(message.encode("utf-8")) > MAX_GIT_COMMIT_MESSAGE_BYTES:
-        raise BridgeFailure("提交说明过长")
-    if "\x00" in message:
-        raise BridgeFailure("提交说明不能包含控制字符")
-    return message
-
-
-def git_rebase_onto_remote(workspace: Path, branch: str, remote: str = "origin") -> str:
-    """推送前把远端最新并进本地分支。返回 ""/"pulled"/"rebased"。
-
-    这里刻意不用 stash：改动在上一步已经提交成一个提交点，没有需要暂存的东西；
-    冲突留在 rebase 里比留在 stash pop 里可控得多，失败也会 --abort 回到干净状态。
-    """
-    if remote not in git_output(workspace, ["remote"], "读取 Git 远端失败").split():
-        return ""
-    fetched = run_git(workspace, ["fetch", remote, branch], timeout=180)
-    remote_ref = f"{remote}/{branch}"
-    if run_git(workspace, ["rev-parse", "--verify", "--quiet", f"refs/remotes/{remote_ref}"]).returncode != 0:
-        # 远端还没有这条分支，这次就是首推。
-        return ""
-    if fetched.returncode != 0:
-        raise BridgeFailure(f"拉取分支 {branch} 失败：{(fetched.stdout or '').strip() or 'git 退出异常'}")
-    if git_remote_ref_merged(workspace, remote_ref, branch):
-        return ""
-    if run_git(workspace, ["merge-base", "--is-ancestor", branch, remote_ref]).returncode == 0:
-        # 本地只是落后：快进即可，不要平白造一个合并提交。
-        completed = run_git(workspace, ["merge", "--ff-only", remote_ref], timeout=120)
-        if completed.returncode != 0:
-            raise BridgeFailure(f"快进到 {remote_ref} 失败：{(completed.stdout or '').strip() or 'git 退出异常'}")
-        return "pulled"
-    completed = run_git(workspace, ["rebase", remote_ref], timeout=300)
-    if completed.returncode != 0:
-        detail = (completed.stdout or "").strip() or "git 退出异常"
-        # 冲突不留在半路：先回到干净状态，再把原始输出抛上去交给 AI 兜底那一轮处理。
-        run_git(workspace, ["rebase", "--abort"], timeout=120)
-        raise BridgeFailure(f"本地分支 {branch} 与 {remote_ref} 有冲突，自动 rebase 没能完成：{detail}")
-    return "rebased"
-
-
-def git_push_branch(workspace: Path, branch: str, message: str = "", push: bool = True) -> dict[str, Any]:
-    """先同步远端最新，再把工作区改动提交到需求分支并推到 origin。
-
-    只做普通推送，不带 --force：远端已经跑在前面时报错给用户，不在这里替他决定怎么合。
-    push=False 时只提交不推送，给「仅提交」用：本地留一个提交点，什么时候推由用户决定。
-    """
-    if not valid_git_branch_name(branch):
-        raise BridgeFailure("需求分支名不合法")
-    require_git_workspace(workspace)
-    if not git_branch_exists(workspace, branch):
-        raise BridgeFailure(f"本机不存在需求分支 {branch}，请先创建分支")
-    # 仅提交在有 origin 时也要先同步最新；纯本地仓库仍可正常落一个提交点。
-    remote = git_default_remote(workspace) if push else (
-        "origin" if "origin" in git_output(workspace, ["remote"], "读取 Git 远端失败").split() else ""
-    )
-    commit_message = git_commit_message_of(message, branch)
-    current = git_current_branch(workspace)
-    dirty = git_worktree_dirty(workspace)
-    if current != branch:
-        # 改动是在别的分支上做的，提交到需求分支多半是误操作，让用户自己先归位。
-        if dirty:
-            raise BridgeFailure(
-                f"工作目录当前在分支 {current or 'HEAD'} 上且有未提交改动，请先处理后再推送需求分支 {branch}"
-            )
-        git_checkout_branch(workspace, branch)
-    committed = False
-    synced = ""
-    if dirty:
-        # 工作区有改动时不能直接 pull/rebase。先落一个仅供同步使用的临时提交，
-        # 同步完成（或失败并 abort）后立即拆回工作区改动，再用用户填写的说明正式提交。
-        # 这样远端冲突发生在正式提交之前，也不会把用户改动藏进 stash。
-        add = run_git(workspace, ["add", "--all"])
-        if add.returncode != 0:
-            raise BridgeFailure(f"暂存改动失败：{(add.stdout or '').strip() or 'git 退出异常'}")
-        temporary = run_git(workspace, ["commit", "-m", "delivery-task-planner: sync before commit"], timeout=120)
-        if temporary.returncode != 0:
-            raise BridgeFailure(f"准备拉取前的临时提交失败：{(temporary.stdout or '').strip() or 'git 退出异常'}")
-        try:
-            if remote:
-                synced = git_rebase_onto_remote(workspace, branch, remote)
-        finally:
-            restored = run_git(workspace, ["reset", "--mixed", "HEAD^"], timeout=120)
-            if restored.returncode != 0:
-                raise BridgeFailure(
-                    f"拉取后恢复待提交改动失败：{(restored.stdout or '').strip() or 'git 退出异常'}"
-                )
-        commit = run_git(workspace, ["add", "--all"])
-        if commit.returncode != 0:
-            raise BridgeFailure(f"暂存改动失败：{(commit.stdout or '').strip() or 'git 退出异常'}")
-        commit = run_git(workspace, ["commit", "-m", commit_message], timeout=120)
-        if commit.returncode != 0:
-            raise BridgeFailure(f"提交改动失败：{(commit.stdout or '').strip() or 'git 退出异常'}")
-        committed = True
-    elif remote:
-        # 没有工作区改动也要在“提交/推送”动作开始时同步一次，避免基于旧分支判断已是最新。
-        synced = git_rebase_onto_remote(workspace, branch, remote)
-    if not push:
-        return {
-            "pushed": False,
-            "branch": branch,
-            "remote": remote,
-            "committed": committed,
-            "commitMessage": commit_message if committed else "",
-            "upToDate": False,
-            "synced": synced,
-            "output": "",
-        }
-    # 首次同步与 push 之间远端仍可能变化；推送前再确认一次，关闭这段竞态窗口。
-    synced = git_rebase_onto_remote(workspace, branch, remote) or synced
-    completed = run_git(workspace, ["push", "--set-upstream", remote, f"{branch}:{branch}"], timeout=180)
-    output = (completed.stdout or "").strip()
-    if completed.returncode != 0:
-        raise BridgeFailure(f"推送分支 {branch} 失败：{output or 'git 退出异常'}")
-    return {
-        "pushed": True,
-        "branch": branch,
-        "remote": remote,
-        "committed": committed,
-        "commitMessage": commit_message if committed else "",
-        "upToDate": "Everything up-to-date" in output,
-        # 推送前是否并过远端最新："pulled" 是快进，"rebased" 是把本地提交挪到远端之后。
-        "synced": synced,
-        "output": output[-2000:],
-    }
-
-
-def git_remote_ref_merged(workspace: Path, remote_ref: str, local_branch: str) -> bool:
-    """远端引用是否已经在本地分支里；领先远端的本地分支不该被当成「拉取失败」。"""
-    return run_git(workspace, ["merge-base", "--is-ancestor", remote_ref, local_branch]).returncode == 0
-
-
-def git_pull_branch(workspace: Path, local: str, remote: str = "origin") -> bool:
-    """切到需求分支前先把它拉到远端最新；拉不动就报错，不带着旧代码切过去。
-
-    返回是否真的更新过本地分支。远端还没有这条分支时直接跳过：刚建的需求分支很正常。
-    """
-    remotes = git_output(workspace, ["remote"], "读取 Git 远端失败").split()
-    if remote not in remotes:
-        return False
-    fetched = run_git(workspace, ["fetch", remote, local], timeout=180)
-    remote_ref = f"{remote}/{local}"
-    if run_git(workspace, ["rev-parse", "--verify", "--quiet", f"refs/remotes/{remote_ref}"]).returncode != 0:
-        return False
-    if fetched.returncode != 0:
-        raise BridgeFailure(f"拉取需求分支 {local} 失败：{(fetched.stdout or '').strip() or 'git 退出异常'}")
-    if not git_branch_exists(workspace, local):
-        # 本机还没有这条分支，切换时会基于刚拉到的远端引用创建，已经是最新的。
-        return False
-    if git_remote_ref_merged(workspace, remote_ref, local):
-        return False
-    if git_current_branch(workspace) == local:
-        completed = run_git(workspace, ["merge", "--ff-only", remote_ref], timeout=120)
-    else:
-        completed = run_git(workspace, ["fetch", remote, f"{local}:{local}"], timeout=180)
-    if completed.returncode != 0:
-        raise BridgeFailure(
-            f"需求分支 {local} 无法快进到 {remote_ref}：本机的 {local} 上有还没推送的提交，或者已经和远端分叉。"
-            f"请先把 {local} 上的改动推送或自行合并，再重新切换。"
-            f"git 输出：{(completed.stdout or '').strip() or 'git 退出异常'}"
-        )
-    return True
-
-
-def git_sync_base_branch(workspace: Path, base_branch: str, remote: str = "origin") -> str:
-    """建需求分支前把基准分支拉到远端最新；否则新分支会切在过时的代码上。
-
-    返回真正用来切分支的引用：能同步就是本地基准分支，只存在于远端时返回 remote/xxx。
-    只做快进，分叉了就报错交回给用户，不在这里 merge 或 rebase。
-    """
-    remotes = git_output(workspace, ["remote"], "读取 Git 远端失败").split()
-    remote_prefix = f"{remote}/"
-    # 基准分支可能是用户直接选的 origin/xxx；拉取时要用远端那一侧的名字。
-    remote_side = base_branch[len(remote_prefix):] if base_branch.startswith(remote_prefix) else base_branch
-    local_exists = git_branch_exists(workspace, base_branch)
-    if remote not in remotes:
-        # 没有 origin 的纯本地仓库没有「最新」可拉，按本地基准分支继续。
-        if not local_exists:
-            raise BridgeFailure(f"基准分支不存在：{base_branch}")
-        return base_branch
-    fetched = run_git(workspace, ["fetch", remote, remote_side], timeout=180)
-    remote_ref = f"{remote}/{remote_side}"
-    remote_exists = run_git(workspace, ["rev-parse", "--verify", "--quiet", f"refs/remotes/{remote_ref}"]).returncode == 0
-    if not remote_exists:
-        # 远端没有这条分支：只可能是仅存在于本机的基准分支。
-        if local_exists:
-            return base_branch
-        raise BridgeFailure(f"基准分支在本机和 {remote} 都不存在：{base_branch}")
-    if fetched.returncode != 0:
-        raise BridgeFailure(f"拉取基准分支 {base_branch} 失败：{(fetched.stdout or '').strip() or 'git 退出异常'}")
-    if not local_exists:
-        # 本机还没有这条基准分支，直接从刚拉到的远端引用切出需求分支。
-        return remote_ref
-    if git_remote_ref_merged(workspace, remote_ref, base_branch):
-        # 本地已经包含远端全部提交（可能还领先），没有可拉的东西。
-        return base_branch
-    if git_current_branch(workspace) == base_branch:
-        completed = run_git(workspace, ["merge", "--ff-only", remote_ref], timeout=120)
-    else:
-        # 不在基准分支上时用 fetch 的引用更新做快进，避免为了拉一次而来回切分支。
-        completed = run_git(workspace, ["fetch", remote, f"{remote_side}:{base_branch}"], timeout=180)
-    if completed.returncode != 0:
-        raise BridgeFailure(
-            f"基准分支 {base_branch} 无法快进到 {remote_ref}，可能已经分叉或有未推送的提交，"
-            f"请先自行处理：{(completed.stdout or '').strip() or 'git 退出异常'}"
-        )
-    return base_branch
-
-
-def git_create_branch(
-    workspace: Path, base_branch: str, branch: str, keep_submodules: list[str] | None = None,
-) -> dict[str, Any]:
-    """从基准分支创建并切换到需求分支；分支已存在时只切换，不覆盖已有提交。"""
-    if not valid_git_branch_name(base_branch):
-        raise BridgeFailure("基准分支名不合法")
-    if not valid_git_branch_name(branch):
-        raise BridgeFailure("需求分支名不合法")
-    require_git_workspace(workspace)
-    remote = "origin"
-    has_remote = remote in git_output(workspace, ["remote"], "读取 Git 远端失败").split()
-    # 「已有分支」下拉给的是 origin/xxx；照原样建会多出一条名叫 origin/xxx 的本地分支。
-    local = branch[len(f"{remote}/"):] if has_remote and branch.startswith(f"{remote}/") else branch
-    if not local or run_git(workspace, ["check-ref-format", "--branch", local]).returncode != 0:
-        raise BridgeFailure(f"需求分支名不符合 Git 规范：{branch}")
-    if git_branch_exists(workspace, local):
-        # 本机已有这条分支：切过去并拉到远端最新，不覆盖已有提交。
-        submodules = git_checkout_branch(workspace, local, keep_submodules)
-        git_pull_branch(workspace, local)
-        return {"created": False, "baseBranch": base_branch, "branch": local, "submodules": submodules}
-    if git_worktree_dirty(workspace):
-        raise BridgeFailure("工作目录有未提交改动，无法创建需求分支，请先提交或暂存")
-    if has_remote:
-        run_git(workspace, ["fetch", remote, local], timeout=180)
-        if run_git(workspace, ["rev-parse", "--verify", "--quiet", f"refs/remotes/{remote}/{local}"]).returncode == 0:
-            # 别人已经推过同名分支：必须关联它，从基准分支另起一条会和远端分叉。
-            checkout = run_git(workspace, ["checkout", "-b", local, "--track", f"{remote}/{local}"])
-            if checkout.returncode != 0:
-                raise BridgeFailure(f"关联远端需求分支 {local} 失败：{(checkout.stdout or '').strip() or 'git 退出异常'}")
-            return {
-                "created": False, "baseBranch": base_branch, "branch": local,
-                "submodules": git_sync_unselected_submodules(workspace, keep_submodules or []),
-            }
-    # 先把基准分支拉到最新，再从它切出去；基准分支是否存在也在这一步确认。
-    base_reference = git_sync_base_branch(workspace, base_branch)
-    # 从远端引用切出来时不要跟踪基准分支：需求分支后面要推到它自己的远端分支。
-    from_remote_ref = run_git(
-        workspace, ["rev-parse", "--verify", "--quiet", f"refs/remotes/{base_reference}"],
-    ).returncode == 0
-    track = ["--no-track"] if from_remote_ref else []
-    completed = run_git(workspace, ["checkout", *track, "-b", local, base_reference])
-    if completed.returncode != 0:
-        raise BridgeFailure(f"创建需求分支失败：{(completed.stdout or '').strip() or 'git 退出异常'}")
-    return {
-        "created": True, "baseBranch": base_branch, "branch": local,
-        "submodules": git_sync_unselected_submodules(workspace, keep_submodules or []),
-    }
-
-
-def git_effective_base_branch(workspace: Path, base_branch: str, remote: str = "origin") -> str:
-    """子项目不一定有同名基准分支：没有就退回它自己的主干，而不是直接建不出来。
-
-    回落只认主干，绝不认「当前分支」：子项目常常还停在上一条需求分支上，从那里切出去
-    会把上一条需求的提交整个带进新需求分支，而且看不出来。宁可报错也不要切错基准。
-    """
-    if git_branch_reference_exists(workspace, base_branch, remote):
-        return base_branch
-    candidates: list[str] = []
-    # origin/HEAD 是远端自己声明的主干，比猜名字准；没同步过这条符号引用时才轮到下面的常见名。
-    head = run_git(workspace, ["symbolic-ref", "--quiet", "--short", f"refs/remotes/{remote}/HEAD"])
-    if head.returncode == 0:
-        candidates.append((head.stdout or "").strip())
-    # 只认主干名，按常见程度排；develop 排在最后，主干真叫它的仓库才会用到。
-    candidates.extend([
-        f"{remote}/main", f"{remote}/master", f"{remote}/develop", "main", "master", "develop",
-    ])
-    for candidate in candidates:
-        if candidate and git_branch_reference_exists(workspace, candidate, remote):
-            return candidate
-    raise BridgeFailure(
-        f"子项目里没有基准分支 {base_branch}，也找不到 {remote}/main、{remote}/master 这样的主干可以退回"
-    )
-
-
-def git_create_branch_targets(
-    workspace: Path,
-    base_branch: str,
-    branch: str,
-    targets: list[str],
-    skip_root: bool = False,
-) -> dict[str, Any]:
-    """在根工作目录和选中的子项目里创建同一条需求分支。
-
-    根目录失败照旧直接报错（需求还没落库，不该留下半条关联）；子项目失败只记在结果里，
-    不回滚已经建好的分支——把已完成的部分撤掉比留着更难收拾。
-
-    skip_root 用于「给已有需求补建子项目分支」：根目录早就在这条分支上，这一轮不该顺手
-    切它、拉它，工作区里没提交的改动更不该被牵连。
-    """
-    if skip_root:
-        require_git_workspace(workspace)
-        remote = "origin"
-        has_remote = remote in git_output(workspace, ["remote"], "读取 Git 远端失败").split()
-        local = branch[len(f"{remote}/"):] if has_remote and branch.startswith(f"{remote}/") else branch
-        if not git_branch_exists(workspace, local):
-            raise BridgeFailure(f"根工作目录还没有需求分支 {local}，请先创建需求分支")
-        result: dict[str, Any] = {"created": False, "baseBranch": base_branch, "branch": local}
-    else:
-        result = git_create_branch(workspace, base_branch, branch, targets)
-        local = str(result["branch"])
-    records: list[dict[str, Any]] = [{
-        "path": "",
-        "name": workspace.name,
-        "branch": local,
-        "baseBranch": str(result["baseBranch"]),
-        "created": bool(result["created"]),
-        "skipped": skip_root,
-        "error": "",
-    }]
-    # 勾中的子模组在下面单独建自己的需求分支，这里只带回没勾的那些的同步结果。
-    records.extend(result.pop("submodules", []))
-    for relative in targets:
-        record: dict[str, Any] = {
-            "path": relative,
-            "name": relative,
-            "branch": local,
-            "baseBranch": "",
-            "created": False,
-            "error": "",
-        }
-        try:
-            child = git_subproject_workspace_of(workspace, relative)
-            if child == workspace.resolve():
-                continue
-            base = git_effective_base_branch(child, base_branch)
-            child_result = git_create_branch(child, base, local)
-            record["baseBranch"] = str(child_result["baseBranch"])
-            record["created"] = bool(child_result["created"])
-        except BridgeFailure as exc:
-            record["error"] = str(exc)
-        records.append(record)
-    result["results"] = records
-    return result
-
-
-def git_prepare_branch_targets(
-    workspace: Path,
-    reference: str,
-    strategy: str,
-    commit_message: str,
-    expected_remote_url: str,
-    remote: str,
-    targets: list[str],
-) -> dict[str, Any]:
-    """根工作目录切完需求分支后，把选中的子项目也切到同一条分支上。
-
-    子项目里没有这条分支时跳过：不是每个工程都参与这条需求，缺分支不算失败。
-    """
-    result = git_prepare_branch(
-        workspace, reference, strategy, commit_message, expected_remote_url, remote, keep_submodules=targets,
-    )
-    branch = str(result["branch"])
-    records: list[dict[str, Any]] = [{
-        "path": "",
-        "name": workspace.name,
-        "branch": branch,
-        "switched": True,
-        "skipped": False,
-        "error": "",
-    }]
-    records.extend(result.pop("submodules", []))
-    for relative in targets:
-        record: dict[str, Any] = {
-            "path": relative,
-            "name": relative,
-            "branch": branch,
-            "switched": False,
-            "skipped": False,
-            "error": "",
-        }
-        try:
-            child = git_subproject_workspace_of(workspace, relative)
-            if child == workspace.resolve():
-                continue
-            if not git_branch_reference_exists(child, branch, remote):
-                record["skipped"] = True
-            else:
-                # 子模块常态就是游离 HEAD，这里放行，让它从远端的需求分支建出本地分支。
-                child_result = git_prepare_branch(
-                    child, branch, strategy, commit_message, "", remote, allow_detached=True,
-                )
-                record["branch"] = str(child_result["branch"])
-                record["switched"] = True
-        except BridgeFailure as exc:
-            record["error"] = str(exc)
-        records.append(record)
-    result["results"] = records
-    return result
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -3588,454 +1988,136 @@ def git_prepare_branch_targets(
 # 每个方向都先出一份预览（哪些工程参与、各改了多少文件），由用户勾选后再真正合并。
 # ---------------------------------------------------------------------------
 
-# 解冲突可能要读不少代码，按一轮完整会话的量级给，和修推送同一个数量级。
-GIT_MERGE_REPAIR_TIMEOUT_SECONDS = 20 * 60
 
 
-def git_merge_resolved_ref(workspace: Path, branch: str, remote: str = "origin") -> str:
-    """把分支名解析成本机此刻可用的引用，优先远端最新。
-
-    合并要合的是「远端上那一版」，不是本机可能落后好几天的同名本地分支；
-    远端没有这条分支时（纯本地分支、还没推过的计划分支）才退回本地引用。
-    """
-    value = str(branch or "").strip()
-    if not valid_git_branch_name(value):
-        raise BridgeFailure(f"分支名不合法：{branch}")
-    remote_prefix = f"{remote}/"
-    remote_side = value[len(remote_prefix):] if value.startswith(remote_prefix) else value
-    remote_ref = f"{remote}/{remote_side}"
-    if run_git(workspace, ["rev-parse", "--verify", "--quiet", f"refs/remotes/{remote_ref}"]).returncode == 0:
-        return remote_ref
-    if git_branch_exists(workspace, value):
-        return value
-    return ""
 
 
-def git_merge_changed_files(workspace: Path, target_ref: str, source_ref: str) -> list[str]:
-    """source 相对合并基准改了哪些文件。
-
-    用三点 diff：只算源分支自己带来的改动，不把目标分支上别人的提交也算进来，
-    否则计划分支越往后走，每条需求显示的文件数都会虚高。
-    """
-    completed = run_git(workspace, ["diff", "--name-only", f"{target_ref}...{source_ref}"], timeout=120)
-    if completed.returncode != 0:
-        return []
-    return [line.strip() for line in (completed.stdout or "").splitlines() if line.strip()]
 
 
-def git_merge_ahead_commits(workspace: Path, target_ref: str, source_ref: str) -> int:
-    """source 上还没进 target 的提交数；为 0 表示这一条已经合过了。"""
-    completed = run_git(workspace, ["rev-list", "--count", f"{target_ref}..{source_ref}"])
-    if completed.returncode != 0:
-        return 0
-    return int((completed.stdout or "0").strip() or 0)
 
 
-def git_merge_project_preview(
-    workspace: Path, relative: str, target: str, sources: list[str], remote: str = "origin",
-) -> dict[str, Any]:
-    """单个工程的合并预览。读不动的工程只带回原因，不连累同级的其它工程。"""
-    record: dict[str, Any] = {
-        "path": relative,
-        "name": relative or workspace.name,
-        "workspace": str(workspace),
-        "hasTarget": False,
-        "targetRef": "",
-        "dirty": False,
-        "currentBranch": "",
-        "changedFiles": 0,
-        "sources": [],
-        "error": "",
-    }
-    try:
-        require_git_workspace(workspace)
-        # 预览必须基于远端最新：拿本机过时的引用算出来的文件数会误导勾选。
-        git_fetch_all(workspace, remote)
-        record["currentBranch"] = git_current_branch(workspace)
-        record["dirty"] = git_worktree_dirty(workspace)
-        target_ref = git_merge_resolved_ref(workspace, target, remote)
-        record["hasTarget"] = bool(target_ref)
-        record["targetRef"] = target_ref
-        changed_paths: set[str] = set()
-        for source in sources:
-            entry: dict[str, Any] = {
-                "branch": source,
-                "exists": False,
-                "sourceRef": "",
-                "changedFiles": 0,
-                "commits": 0,
-            }
-            source_ref = git_merge_resolved_ref(workspace, source, remote)
-            entry["exists"] = bool(source_ref)
-            entry["sourceRef"] = source_ref
-            if source_ref and target_ref:
-                files = git_merge_changed_files(workspace, target_ref, source_ref)
-                entry["changedFiles"] = len(files)
-                entry["commits"] = git_merge_ahead_commits(workspace, target_ref, source_ref)
-                changed_paths.update(files)
-            record["sources"].append(entry)
-        # 工程层面按去重后的文件数报：两条需求改同一个文件，勾选面板上不该显示成两个。
-        record["changedFiles"] = len(changed_paths)
-    except BridgeFailure as exc:
-        record["error"] = str(exc)
-    return record
 
 
-def git_merge_preview(
-    workspace: Path, target: str, sources: list[str], remote: str = "origin",
-) -> dict[str, Any]:
-    """根工作目录加一级子项目的合并预览，供合并弹窗按工程勾选。"""
-    if not str(target or "").strip():
-        raise BridgeFailure("缺少目标分支")
-    branches = [str(value or "").strip() for value in sources if str(value or "").strip()]
-    if not branches:
-        raise BridgeFailure("缺少要合并的来源分支")
-    projects = [git_merge_project_preview(workspace, "", target, branches, remote)]
-    for child in git_subproject_workspaces(workspace):
-        projects.append(git_merge_project_preview(child, child.name, target, branches, remote))
-    return {"workspace": str(workspace), "target": target, "sources": branches, "projects": projects}
 
 
-def build_git_merge_repair_prompt(
-    workspace: Path, target: str, source: str, remote: str, failure: str, conflicts: list[str],
-) -> str:
-    """合并冲突时交给 AI 的提示词。只授权它解决这一次合并的冲突，不允许顺手改别的实现。"""
-    return wrap_bridge_context(
-        [
-            "这是交付任务面板的「时间计划分支合并」回合：面板执行 git merge 时遇到冲突，"
-            "仓库现在停在冲突状态，请你在本机把冲突解决掉并完成这次合并提交。",
-            workspace_instruction(workspace),
-            f"目标分支（当前所在分支）: {target}",
-            f"来源分支: {source}",
-            f"远端: {remote}",
-            "",
-            "冲突文件:",
-            *([f"- {path}" for path in conflicts] or ["- （git 没有列出具体文件，请自行用 git status 确认）"]),
-            "",
-            "git merge 的原始输出:",
-            failure,
-            "",
-            "处理要求:",
-            f"- 仓库正处于 merge 冲突中，目标分支是 {target}，不要 --abort，也不要切到别的分支。",
-            "- 逐个文件解决冲突：两边的真实意图都要保留，不要为了让命令通过就整块采用一侧或删掉别人的改动。",
-            "- 冲突涉及业务逻辑时，先读双方改动所在的上下文再决定合并结果，必要时读相关实现文件。",
-            "- 不要修改与本次冲突无关的文件，不要顺手重构。",
-            "- 解决完执行 git add 与 git commit 完成这次合并提交；不要 push，推送由面板统一负责。",
-            "- 解决不了（需要人工决策的业务取舍）就停下来说明卡在哪个文件、两边分别想做什么，不要瞎猜。",
-            "- 回复里逐条列出：改了哪些文件、每个冲突各自采用了什么结论。面板会把这段说明原样展示给用户。",
-        ],
-        f"合并 {source} 到 {target} 时发生冲突，请解决冲突并完成合并提交。",
-    )
 
 
-def git_merge_conflict_files(workspace: Path) -> list[str]:
-    """当前处于冲突状态的文件清单。"""
-    completed = run_git(workspace, ["diff", "--name-only", "--diff-filter=U"])
-    if completed.returncode != 0:
-        return []
-    return [line.strip() for line in (completed.stdout or "").splitlines() if line.strip()]
 
 
-def git_merge_in_progress(workspace: Path) -> bool:
-    """仓库是不是还停在一次没收尾的合并里。
-
-    用 rev-parse 问 git 而不是看 .git/MERGE_HEAD 这个路径：子模组的 .git 是一个指向别处的
-    文件，按路径拼永远判不出来，会把停在冲突里的子项目当成干净仓库继续往下走。
-    """
-    if run_git(workspace, ["rev-parse", "--verify", "--quiet", "MERGE_HEAD"]).returncode == 0:
-        return True
-    return bool(git_merge_conflict_files(workspace))
 
 
-def git_merge_one(
-    workspace: Path, target: str, source_ref: str, source_label: str,
-) -> dict[str, Any]:
-    """把一条来源分支合进当前已经切好的目标分支。
-
-    返回 conflict=True 时仓库仍停在冲突状态，交给调用方决定是否起 AI 来解；
-    这里不 --abort，abort 掉就没法把冲突现场交给 AI 了。
-    """
-    record: dict[str, Any] = {
-        "branch": source_label,
-        "merged": False,
-        "upToDate": False,
-        "conflict": False,
-        "conflictFiles": [],
-        "output": "",
-    }
-    if git_merge_ahead_commits(workspace, target, source_ref) == 0:
-        record["upToDate"] = True
-        return record
-    message = f"Merge branch '{source_label}' into {target}"
-    completed = run_git(workspace, ["merge", "--no-ff", "-m", message, source_ref], timeout=300)
-    output = (completed.stdout or "").strip()
-    record["output"] = output[-2000:]
-    if completed.returncode == 0:
-        record["merged"] = True
-        return record
-    conflicts = git_merge_conflict_files(workspace)
-    if not conflicts and not git_merge_in_progress(workspace):
-        raise BridgeFailure(f"合并 {source_label} 到 {target} 失败：{output or 'git 退出异常'}")
-    record["conflict"] = True
-    record["conflictFiles"] = conflicts
-    return record
-
-def git_repository_url_of(value: Any) -> str:
-    """关联远端只接受完整的仓库地址；带空白、换行或以 - 开头的输入直接拒绝。"""
-    url = str(value or "").strip()
-    if not url:
-        raise BridgeFailure("请先填写 Git 仓库地址")
-    if len(url) > 512 or any(char.isspace() for char in url) or url.startswith("-"):
-        raise BridgeFailure(f"Git 仓库地址不合法：{url}")
-    if not GIT_REPOSITORY_URL_RE.fullmatch(url):
-        raise BridgeFailure(f"Git 仓库地址不合法：{url}")
-    return url
 
 
-def git_initializable_workspace_of(value: Any) -> Path:
-    """关联前目录可以还不存在：父目录必须已存在，缺的那一层由这里补上。"""
-    raw = str(value or "").strip()
-    if not raw:
-        raise BridgeFailure("未提供 Codex 工作目录，请先在项目管理中确认当前项目的工作目录")
-    candidate = Path(raw).expanduser()
-    if not candidate.is_absolute():
-        raise BridgeFailure("Codex 工作目录必须是绝对路径")
-    if candidate.exists():
-        return workspace_path_of(candidate)
-    parent = candidate.parent
-    if not parent.is_dir():
-        raise BridgeFailure(f"上级目录不存在：{parent}")
-    try:
-        candidate.mkdir()
-    except OSError as exc:
-        raise BridgeFailure(f"创建项目工作目录失败：{exc}") from exc
-    return workspace_path_of(candidate)
 
 
-def git_workspace_check(value: Any) -> dict[str, Any]:
-    """给「项目偏好设置」判断这个目录要不要初始化 Git，本身不写任何东西。"""
-    raw = str(value or "").strip()
-    if not raw:
-        raise BridgeFailure("未提供 Codex 工作目录，请先在项目管理中确认当前项目的工作目录")
-    candidate = Path(raw).expanduser()
-    if not candidate.is_absolute():
-        raise BridgeFailure("Codex 工作目录必须是绝对路径")
-    resolved = candidate.resolve()
-    if not resolved.is_dir():
-        return {
-            "workspace": str(resolved),
-            "exists": False,
-            "isGitRepository": False,
-            "repositoryRoot": "",
-            "remoteName": "origin",
-            "remoteConfigured": False,
-            "empty": False,
-            "pendingSubmodules": [],
-        }
-    inside, _ = git_workspace_probe(resolved)
-    if not inside:
-        return {
-            "workspace": str(resolved),
-            "exists": True,
-            "isGitRepository": False,
-            "repositoryRoot": "",
-            "remoteName": "origin",
-            "remoteConfigured": False,
-            "empty": not any(resolved.iterdir()),
-            "pendingSubmodules": [],
-        }
-    root = run_git(resolved, ["rev-parse", "--show-toplevel"])
-    return {
-        "workspace": str(resolved),
-        "exists": True,
-        "isGitRepository": True,
-        "repositoryRoot": (root.stdout or "").strip().splitlines()[-1].strip() if root.returncode == 0 else "",
-        "remoteName": "origin",
-        # 远端地址可能带内嵌凭据，只回传是否已配置。
-        "remoteConfigured": bool(git_remote_url(resolved, "origin")),
-        "empty": False,
-        # 目录早就是仓库、但子模块还是空的，也要能在偏好设置里补一次初始化。
-        "pendingSubmodules": git_pending_submodules(resolved),
-    }
 
 
-def git_adopt_remote_branch(workspace: Path, branch: str, remote: str) -> None:
-    """目录里已有文件、检出会被拒时的退路。
-
-    索引对齐远端提交，本地已有的同名文件原样留成未提交改动；
-    本地缺的那些文件再从索引检出来，这样远端内容仍然完整落到磁盘上，且不覆盖任何本地文件。
-    """
-    git_output(workspace, ["branch", "--force", branch, f"{remote}/{branch}"], "创建本地分支失败")
-    git_output(workspace, ["symbolic-ref", "HEAD", f"refs/heads/{branch}"], "切换本地分支失败")
-    git_output(workspace, ["reset", "--mixed"], "对齐远端提交失败", timeout=120)
-    run_git(workspace, ["branch", "--set-upstream-to", f"{remote}/{branch}", branch])
-    missing = [
-        line for line in git_output(workspace, ["ls-files", "-z", "--deleted"], "读取缺失文件失败", timeout=120).split("\0")
-        if line
-    ]
-    # 一次全塞进命令行可能超出系统参数上限，按批检出。
-    for start in range(0, len(missing), 200):
-        git_output(workspace, ["checkout", "--", *missing[start:start + 200]], "检出远端文件失败", timeout=300)
 
 
-def git_pending_submodules(workspace: Path) -> list[str]:
-    """.gitmodules 里登记了、但本机还没检出内容的子模块路径。
-
-    git submodule status 用行首的 - 标记「还没初始化」，这里只认这个标记，
-    不去猜目录空不空——子模块目录本来就可能有被忽略的构建产物。
-    """
-    if not (workspace / ".gitmodules").is_file():
-        return []
-    completed = run_git(workspace, ["submodule", "status", "--recursive"], timeout=120)
-    if completed.returncode != 0:
-        return []
-    pending: list[str] = []
-    for line in (completed.stdout or "").splitlines():
-        if not line.startswith("-"):
-            continue
-        parts = line[1:].strip().split()
-        if len(parts) >= 2:
-            pending.append(parts[1])
-    return pending
 
 
-def git_initialize_submodules(workspace: Path) -> dict[str, Any]:
-    """把 .gitmodules 里还没初始化的子模块一并拉下来。
-
-    子模块失败不该把主仓库的初始化算作失败：主仓库已经可用了，这里只把原因带回去。
-    """
-    pending = git_pending_submodules(workspace)
-    if not pending:
-        return {"submodules": [], "submoduleError": ""}
-    completed = run_git(workspace, ["submodule", "update", "--init", "--recursive"], timeout=1800)
-    if completed.returncode != 0:
-        return {
-            "submodules": pending,
-            "submoduleError": (completed.stdout or "").strip() or "git 退出异常",
-        }
-    remaining = git_pending_submodules(workspace)
-    return {
-        "submodules": [path for path in pending if path not in remaining],
-        "submoduleError": (
-            f"以下子模块仍未初始化：{'、'.join(remaining)}" if remaining else ""
-        ),
-    }
 
 
-def git_initialize_workspace(
-    workspace: Path,
-    repository_url: str,
-    remote: str = "origin",
-    base_branch: str = "",
-) -> dict[str, Any]:
-    """把还不是 Git 仓库的项目目录关联到远端：init + remote + fetch + 检出默认分支。
 
-    目录里已有文件时不覆盖：改成把索引对齐到远端提交，本地文件留作未提交改动，
-    由用户自己决定提交还是丢弃。中途失败会把这一步刚建出来的 .git 删掉，方便改地址重试。
-    """
-    url = git_repository_url_of(repository_url)
-    if not valid_git_remote_name(remote):
-        raise BridgeFailure("Git 远端名称不合法")
-    if base_branch and not valid_git_branch_name(base_branch):
-        raise BridgeFailure("基准分支名不合法")
-    inside, _ = git_workspace_probe(workspace)
-    if inside:
-        raise BridgeFailure(f"项目工作目录已经是 Git 仓库：{workspace}")
-    git_directory = workspace / ".git"
-    created_git_directory = False
-    try:
-        git_output(workspace, ["init"], "初始化 Git 仓库失败")
-        created_git_directory = git_directory.exists()
-        git_output(workspace, ["remote", "add", remote, url], "关联 Git 远端失败")
-        # 首次关联要把整个仓库拉下来，网络耗时远超普通 Git 命令。
-        git_output(workspace, ["fetch", "--prune", remote], "拉取远端仓库失败", timeout=900)
-        run_git(workspace, ["remote", "set-head", remote, "-a"], timeout=60)
-        branch = base_branch.strip()
-        if branch and run_git(workspace, ["rev-parse", "--verify", "--quiet", f"{remote}/{branch}^{{commit}}"]).returncode != 0:
-            raise BridgeFailure(f"远端仓库没有基准分支：{branch}")
-        if not branch:
-            head = run_git(workspace, ["symbolic-ref", "--quiet", "--short", f"refs/remotes/{remote}/HEAD"])
-            candidate = (head.stdout or "").strip() if head.returncode == 0 else ""
-            prefix = f"{remote}/"
-            branch = candidate[len(prefix):] if candidate.startswith(prefix) else ""
-        if not branch:
-            for candidate in ("main", "master", "develop"):
-                if run_git(workspace, ["rev-parse", "--verify", "--quiet", f"{remote}/{candidate}^{{commit}}"]).returncode == 0:
-                    branch = candidate
-                    break
-        if not branch:
-            raise BridgeFailure("远端仓库没有可检出的分支，请确认仓库地址是否正确")
-        adopted = run_git(workspace, ["checkout", "-b", branch, "--track", f"{remote}/{branch}"], timeout=300).returncode != 0
-        if adopted:
-            git_adopt_remote_branch(workspace, branch, remote)
-    except BaseException:
-        # 只删这一步自己建出来的 .git，工作目录里原有的文件一个都不动。
-        if created_git_directory and git_directory.is_dir():
-            shutil.rmtree(git_directory, ignore_errors=True)
-        raise
-    # 主仓库已经能用了，子模块是附带的一步：失败只回传原因，不回滚 .git。
-    submodules = git_initialize_submodules(workspace)
-    return {
-        "workspace": str(workspace),
-        "initialized": True,
-        "branch": branch,
-        "remoteName": remote,
-        "adopted": adopted,
-        "status": git_workspace_status(workspace, url, remote),
-        **submodules,
-    }
-
-VERSION_RE = re.compile(r"(?<!\d)(\d+(?:\.\d+)+)")
-
-
-def version_at_least(version: str, minimum: str) -> bool:
-    """比较由固定探测命令返回的数字版本，不接受任意命令或版本表达式。"""
-    actual = tuple(int(part) for part in version.split("."))
-    expected = tuple(int(part) for part in minimum.split("."))
-    length = max(len(actual), len(expected))
-    return actual + (0,) * (length - len(actual)) >= expected + (0,) * (length - len(expected))
-
-
-def environment_probe_status(entry: dict[str, Any], host: str = "") -> dict[str, Any]:
-    """执行预设的只读版本命令；绿色状态只给已安装且版本达标的项。"""
-    host = host or host_platform()
-    probe = environment_command_for(entry, "probe", host)
-    result = {
-        "id": str(entry.get("id") or ""),
-        "installed": False,
-        "version": "",
-    }
-    if result["id"] == "__git__":
-        result.update(github_ssh_key_status())
-    if not probe:
-        return result
-    try:
-        completed = subprocess.run(
-            shlex.split(probe, posix=host != "windows"),
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            timeout=3,
-        )
-    except (OSError, subprocess.SubprocessError, ValueError):
-        return result
-    if completed.returncode != 0:
-        return result
-    version_match = VERSION_RE.search(completed.stdout or "")
-    version = version_match.group(1) if version_match else ""
-    minimum = str(entry.get("minimumVersion") or "")
-    result["version"] = version
-    result["installed"] = not minimum or bool(version and version_at_least(version, minimum))
-    return result
+from delivery_bridge.git_ops import (
+    GIT_BRANCH_FORBIDDEN_RE,
+    GIT_REMOTE_PREFIX,
+    GIT_REMOTE_NAME_RE,
+    GIT_REPOSITORY_URL_RE,
+    valid_git_branch_name,
+    valid_git_remote_name,
+    run_git,
+    git_output,
+    git_workspace_probe,
+    require_git_workspace,
+    git_current_branch,
+    git_default_branch,
+    git_fetch_all,
+    git_branch_catalog,
+    normalized_git_remote_url,
+    git_remote_url,
+    git_worktree_summary,
+    MAX_GIT_CHANGE_FILES,
+    MAX_GIT_CHANGE_FILE_BYTES,
+    run_git_bytes,
+    git_has_head,
+    git_change_kind_of,
+    git_numstat_totals,
+    git_untracked_line_count,
+    git_change_files,
+    git_change_text,
+    git_change_detail,
+    git_local_branch_for_reference,
+    git_checkout_reference,
+    git_workspace_status,
+    git_prepare_branch,
+    git_branch_exists,
+    git_worktree_dirty,
+    git_submodule_workspaces,
+    git_dirty_submodule_workspaces,
+    git_submodule_label,
+    git_sync_unselected_submodules,
+    GIT_SUBPROJECT_SKIP_DIRS,
+    git_subproject_workspaces,
+    git_subproject_workspace_of,
+    git_branch_reference_exists,
+    git_project_snapshot,
+    git_workspace_projects,
+    git_subproject_targets_of,
+    git_checkout_branch,
+    git_default_remote,
+    GIT_PUSH_REPAIR_TIMEOUT_SECONDS,
+    git_branch_synced,
+    build_git_push_repair_prompt,
+    MAX_GIT_COMMIT_MESSAGE_BYTES,
+    git_commit_message_of,
+    git_rebase_onto_remote,
+    git_push_branch,
+    git_remote_ref_merged,
+    git_pull_branch,
+    git_sync_base_branch,
+    git_create_branch,
+    git_effective_base_branch,
+    git_create_branch_targets,
+    git_prepare_branch_targets,
+    GIT_MERGE_REPAIR_TIMEOUT_SECONDS,
+    git_merge_resolved_ref,
+    git_merge_changed_files,
+    git_merge_ahead_commits,
+    git_merge_project_preview,
+    git_merge_preview,
+    build_git_merge_repair_prompt,
+    git_merge_conflict_files,
+    git_merge_in_progress,
+    git_merge_one,
+    git_repository_url_of,
+    git_initializable_workspace_of,
+    git_workspace_check,
+    git_adopt_remote_branch,
+    git_pending_submodules,
+    git_initialize_submodules,
+    git_initialize_workspace,
+)
 
 
-def environment_probe_statuses(use_git: bool, environments: list[dict[str, Any]], host: str = "") -> list[dict[str, Any]]:
-    """只检查前端当前列出的预设项；自定义项没有固定命令，不进行臆测。"""
-    entries = list(environments)
-    if use_git:
-        entries.insert(0, {"id": "__git__", **GIT_PRESET})
-    return [environment_probe_status(entry, host) for entry in entries]
+
+
+
+
+
+from delivery_bridge.environments import (
+    MAX_ENVIRONMENT_SETUP_ITEMS,
+    GLOBAL_ENVIRONMENT_SETUP_PROGRAM_ID,
+    ENVIRONMENT_PRESETS,
+    GIT_PRESET,
+    environment_selection_of,
+    validate_environment_setup_payload,
+    environment_command_for,
+    VERSION_RE,
+    version_at_least,
+    environment_probe_status,
+    environment_probe_statuses,
+)
 
 
 def build_environment_setup_prompt(
@@ -4563,265 +2645,63 @@ def conversation_references_of(value: Any) -> list[dict[str, str]]:
     return references
 
 
-def requirement_prototype_directory_of(requirement_key: str) -> Path:
-    """Return the only workspace-relative directory a requirement prototype may use."""
-    value = str(requirement_key or "").strip()
-    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value):
-        raise BridgeFailure("需求原型标识无效")
-    return Path("doc") / "requirements" / value / "prototype"
 
 
-def requirement_outline_path_of(requirement_key: str) -> Path:
-    """Return the one workspace-relative file a requirement breakdown outline may use."""
-    value = str(requirement_key or "").strip()
-    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value):
-        raise BridgeFailure("需求标识无效")
-    return Path("doc") / "requirements" / value / REQUIREMENT_OUTLINE_FILE_NAME
 
 
-def requirement_document_directory_of(requirement_key: str) -> Path:
-    """Return the requirement document directory for standalone deliverables."""
-    value = str(requirement_key or "").strip()
-    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value):
-        raise BridgeFailure("需求标识无效")
-    return Path("doc") / "requirements" / value
 
 
-def legacy_task_outline_path_of(requirement_key: str, item_key: str) -> Path:
-    """Return the retired per-task outline location for one-time migration only."""
-    requirement_value = str(requirement_key or "").strip()
-    item_value = str(item_key or "").strip()
-    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", requirement_value):
-        raise BridgeFailure("需求标识无效")
-    if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", item_value):
-        raise BridgeFailure("任务标识无效")
-    return Path("doc") / "requirements" / requirement_value / item_value / REQUIREMENT_OUTLINE_FILE_NAME
 
 
-def outline_file_in_workspace(workspace: Path, relative: Path) -> Path:
-    """Resolve an outline path and refuse anything that escapes the project workspace."""
-    path = (workspace / relative).resolve()
-    try:
-        path.relative_to(workspace.resolve())
-    except ValueError as exc:
-        raise BridgeFailure("需求大纲文件超出当前项目") from exc
-    return path
 
 
-def outline_document(workspace: Path, relative: Path) -> dict[str, Any]:
-    """Read one outline markdown file, or report that it has not been written yet."""
-    path = outline_file_in_workspace(workspace, relative)
-    if not path.is_file():
-        return {"path": relative.as_posix(), "exists": False, "markdown": "", "updatedAt": ""}
-    if path.stat().st_size > MAX_REQUIREMENT_OUTLINE_BYTES:
-        raise BridgeFailure("需求大纲超过 2 MB，无法预览")
-    try:
-        markdown = path.read_text(encoding="utf-8")
-    except UnicodeDecodeError as exc:
-        raise BridgeFailure("需求大纲不是 UTF-8 文本") from exc
-    return {
-        "path": relative.as_posix(),
-        "exists": True,
-        "markdown": markdown,
-        "updatedAt": datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat().replace("+00:00", "Z"),
-    }
 
 
-def write_outline_document(workspace: Path, relative: Path, markdown: str) -> dict[str, Any]:
-    """Overwrite one outline markdown file from the task board."""
-    if len(markdown.encode("utf-8")) > MAX_EDITABLE_OUTLINE_BYTES:
-        raise BridgeFailure("需求大纲不能超过 512 KB")
-    path = outline_file_in_workspace(workspace, relative)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(markdown, encoding="utf-8")
-    return outline_document(workspace, relative)
 
 
-def requirement_outline_document(workspace: Path, requirement_key: str) -> dict[str, Any]:
-    """Read the outline markdown without letting the requirement key escape the workspace."""
-    return outline_document(workspace, requirement_outline_path_of(requirement_key))
 
 
-def testing_asset_directory_of(key: str) -> Path:
-    """Return the workspace-relative directory the testing skills write for one requirement or task."""
-    value = str(key or "").strip()
-    if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", value):
-        raise BridgeFailure("测试资产标识无效")
-    return Path("doc") / TESTING_ASSET_ROOT / value
 
 
-def document_set_entries(workspace: Path, relative_directory: Path, recursive: bool) -> list[dict[str, Any]]:
-    """List the documents of one column, stable by path.
-
-    目录里真实存在的文件都要列出来：文本文档（Markdown、纯文本、HTML）能在面板里直接预览和编辑，
-    面板上传进来的 PDF、Word、图片这类文件同样属于这个栏目，只是 previewable 为假，
-    面板会把它们交给附件预览或下载，而不是当文本读。
-    """
-    root = workspace.resolve()
-    directory = (workspace / relative_directory).resolve()
-    try:
-        directory.relative_to(root)
-    except ValueError as exc:
-        raise BridgeFailure("文档目录超出当前项目") from exc
-    if not directory.is_dir():
-        return []
-    entries: list[dict[str, Any]] = []
-    for path in sorted(directory.rglob("*") if recursive else directory.glob("*")):
-        # 隐藏文件是工具自己的中间产物（.DS_Store、.gitkeep），不是这个栏目的文档。
-        if not path.is_file() or path.name.startswith("."):
-            continue
-        resolved = path.resolve()
-        try:
-            relative = resolved.relative_to(root)
-            name = resolved.relative_to(directory).as_posix()
-        except ValueError:
-            continue
-        stat = resolved.stat()
-        entries.append({
-            "path": relative.as_posix(),
-            "name": name,
-            "size": stat.st_size,
-            "updatedAt": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat().replace("+00:00", "Z"),
-            "previewable": resolved.suffix.lower() in DOCUMENT_SET_SUFFIXES,
-            "contentType": mimetypes.guess_type(resolved.name)[0] or "application/octet-stream",
-        })
-        if len(entries) >= MAX_DOCUMENT_SET_FILES:
-            break
-    return entries
 
 
-def document_in_set(
-    workspace: Path, relative_directory: Path, raw_path: str, previewable_only: bool = True,
-) -> Path:
-    """Resolve one document of a column and refuse anything outside that column's directory."""
-    value = str(raw_path or "").strip()
-    candidate = Path(value)
-    if not value or candidate.is_absolute() or ".." in candidate.parts:
-        raise BridgeFailure("文档路径无效")
-    if previewable_only and candidate.suffix.lower() not in DOCUMENT_SET_SUFFIXES:
-        raise BridgeFailure("该文档不支持预览")
-    path = (workspace / candidate).resolve()
-    directory = (workspace / relative_directory).resolve()
-    try:
-        path.relative_to(directory)
-    except ValueError as exc:
-        raise BridgeFailure("文档超出当前栏目目录") from exc
-    return path
 
 
-def document_upload_name(raw_name: str) -> str:
-    """把浏览器传上来的文件名收敛成栏目目录里的一个安全文件名。
-
-    只取最后一段文件名，去掉路径分隔符和控制字符：上传口子决定的是「写哪个文件」，
-    不能让文件名自己带着目录跳出这个栏目。
-    """
-    cleaned = re.sub(r"[\\/\x00-\x1f]", "", Path(str(raw_name or "").replace("\\", "/")).name).strip()
-    if not cleaned or cleaned in {".", ".."} or cleaned.startswith("."):
-        raise BridgeFailure("文档文件名无效")
-    if len(cleaned) > 120:
-        suffix = Path(cleaned).suffix[:20]
-        cleaned = cleaned[: 120 - len(suffix)] + suffix
-    return cleaned
 
 
-def available_document_name(directory: Path, name: str) -> Path:
-    """同名文档不覆盖：会话写的文档和手动上传的文档共用一个目录，重名时顺延成 名字-2.后缀。"""
-    target = directory / name
-    if not target.exists():
-        return target
-    stem, suffix = Path(name).stem, Path(name).suffix
-    for index in range(2, 100):
-        candidate = directory / f"{stem}-{index}{suffix}"
-        if not candidate.exists():
-            return candidate
-    raise BridgeFailure("同名文档过多，请换一个文件名")
 
 
-def html_asset_payloads(workspace: Path, boundary: Path, html_path: Path, html: str) -> list[dict[str, str]]:
-    """Read the sibling stylesheets and scripts one HTML file references by relative path.
-
-    只认相对路径、只认 css/js、只读边界目录里的文件：外链地址交给 iframe 自己去取，
-    绝对路径和越界路径一律跳过，避免预览成为读工作区任意文件的口子。
-    返回的 name 就是 HTML 里原样写的引用串，前端据此把对应的 link / script 标签换成内联正文。
-    """
-    root = workspace.resolve()
-    base = (boundary if boundary.is_absolute() else workspace / boundary).resolve()
-    try:
-        base.relative_to(root)
-    except ValueError:
-        return []
-    directory = html_path.resolve().parent
-    assets: list[dict[str, str]] = []
-    seen: set[str] = set()
-    total_bytes = 0
-    for match in HTML_ASSET_REFERENCE_RE.finditer(html):
-        reference = next((group for group in match.groups() if group), "")
-        value = reference.strip()
-        if not value or value in seen:
-            continue
-        # 协议地址、协议相对地址、站点绝对路径和内联数据都不是同目录文件。
-        if "://" in value or value.startswith(("//", "/", "#", "data:", "javascript:")):
-            continue
-        target = value.split("#", 1)[0].split("?", 1)[0]
-        if not target:
-            continue
-        candidate = Path(target)
-        if candidate.is_absolute() or candidate.suffix.lower() not in HTML_ASSET_SUFFIXES:
-            continue
-        seen.add(value)
-        resolved = (directory / candidate).resolve()
-        try:
-            resolved.relative_to(base)
-        except ValueError:
-            continue
-        if not resolved.is_file():
-            continue
-        size = resolved.stat().st_size
-        if total_bytes + size > MAX_HTML_ASSET_TOTAL_BYTES:
-            break
-        try:
-            content = resolved.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
-            continue
-        if "\x00" in content:
-            continue
-        total_bytes += size
-        assets.append({"name": value, "content": content})
-        if len(assets) >= MAX_HTML_ASSET_FILES:
-            break
-    return assets
 
 
-def document_payload(workspace: Path, path: Path, asset_boundary: Path | None = None) -> dict[str, Any]:
-    """Read one column document as UTF-8 text, or report that it has not been written yet."""
-    relative = path.relative_to(workspace.resolve()).as_posix()
-    if not path.exists():
-        return {"path": relative, "exists": False, "content": "", "size": 0, "modifiedAt": "", "assets": []}
-    if not path.is_file():
-        raise BridgeFailure("文档路径不是文件")
-    size = path.stat().st_size
-    if size > MAX_DOCUMENT_SET_FILE_BYTES:
-        raise BridgeFailure("文档超过 2 MB，无法预览")
-    try:
-        content = path.read_text(encoding="utf-8")
-    except UnicodeDecodeError as exc:
-        raise BridgeFailure("文档不是 UTF-8 文本文件") from exc
-    if "\x00" in content:
-        raise BridgeFailure("文档不是可预览的文本文件")
-    # HTML 文档的样式和脚本可能拆在同目录的独立文件里，一并带上，否则预览只剩裸结构。
-    assets = (
-        html_asset_payloads(workspace, asset_boundary, path, content)
-        if asset_boundary is not None and path.suffix.lower() in HTML_SUFFIXES
-        else []
-    )
-    return {
-        "path": relative,
-        "exists": True,
-        "content": content,
-        "size": size,
-        "modifiedAt": datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat().replace("+00:00", "Z"),
-        "assets": assets,
-    }
+from delivery_bridge.documents import (
+    REQUIREMENT_OUTLINE_FILE_NAME,
+    MAX_REQUIREMENT_OUTLINE_BYTES,
+    MAX_EDITABLE_OUTLINE_BYTES,
+    DOCUMENT_SET_SUFFIXES,
+    MAX_DOCUMENT_SET_FILES,
+    MAX_DOCUMENT_SET_FILE_BYTES,
+    TESTING_ASSET_ROOT,
+    HTML_SUFFIXES,
+    HTML_ASSET_SUFFIXES,
+    MAX_HTML_ASSET_FILES,
+    MAX_HTML_ASSET_TOTAL_BYTES,
+    HTML_ASSET_REFERENCE_RE,
+    requirement_prototype_directory_of,
+    requirement_outline_path_of,
+    requirement_document_directory_of,
+    legacy_task_outline_path_of,
+    outline_file_in_workspace,
+    outline_document,
+    write_outline_document,
+    requirement_outline_document,
+    testing_asset_directory_of,
+    document_set_entries,
+    document_in_set,
+    document_upload_name,
+    available_document_name,
+    html_asset_payloads,
+    document_payload,
+)
 
 
 def document_attachment_item_key(scope: str, key: str) -> str:
@@ -5615,11 +3495,11 @@ class AppServerClient:
         self.event_callback = event_callback
         process_environment = os.environ.copy()
         process_environment.update(environment or {})
-        codex_cli = provision_codex_cli()
-        if not codex_cli:
+        codex_command = provision_codex_cli()
+        if not codex_command:
             raise BridgeFailure("未找到 Codex CLI 或 Codex Desktop 资源目录中的可执行文件")
         self.process = subprocess.Popen(
-            [codex_cli, "app-server"],
+            [codex_command, "app-server"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -9029,9 +6909,9 @@ class ExecutionBridge:
 
     def health(self, provider: str = "codex") -> dict[str, Any]:
         provider = ai_provider_of(provider)
-        codex_cli = available_codex_cli()
+        codex_command = available_codex_cli()
         claude_cli = shutil.which("claude")
-        executable_available = bool(codex_cli) if provider == "codex" else claude_cli is not None
+        executable_available = bool(codex_command) if provider == "codex" else claude_cli is not None
         configured = True
         api_reachable = True
         message = "ready"
@@ -9041,7 +6921,7 @@ class ExecutionBridge:
         return {
             "ready": ready,
             "bridge": True,
-            "codex": bool(codex_cli),
+            "codex": bool(codex_command),
             "claude": claude_cli is not None,
             "configured": configured,
             "apiReachable": api_reachable,
@@ -13032,235 +10912,55 @@ class ExecutionBridge:
         raise last_error
 
 
-EXECUTION_OUTPUT_LIMIT = 8 * 1024 * 1024
-
-# 这一轮真正动了工作区的条目类型。只有 agentMessage / reasoning 的回合等于什么都没做。
-TOOL_CALL_ITEM_TYPES = {"commandExecution", "fileChange", "fileEdit", "mcpToolCall", "dynamicToolCall"}
-# 模型没能把工具调用发成调用帧时，会把工具 schema 连同超时毫秒数一起写进正文，
-# 而且开头那个 T 经常被吃掉（实测出现过 `ARGET_TOOL_SCHEMA={...}"120000`），
-# 所以这里故意只匹配后半截，两种写法都能命中。
-LEAKED_TOOL_CALL_MARKER = "ARGET_TOOL_SCHEMA"
-# 这两个阶段的产物就是代码和验证结果，不可能只靠一段文字交付。
-# 梳理需求阶段允许只写文档，不能套用这条判定。
-WORKING_PHASES = {"development", "testing"}
 
 
-def turn_agent_text(turn: dict[str, Any]) -> str:
-    parts = [
-        str(item.get("text") or item.get("content") or "").strip()
-        for item in turn.get("items") or []
-        if str(item.get("type") or "") == "agentMessage"
-    ]
-    return "\n".join(part for part in parts if part)
 
 
-def turn_tool_call_count(turn: dict[str, Any]) -> int:
-    return sum(
-        1 for item in turn.get("items") or []
-        if str(item.get("type") or "") in TOOL_CALL_ITEM_TYPES
-    )
 
 
-def corrupted_turn_reason(turn_status: str, turn: dict[str, Any], phase: str) -> str:
-    """回合自称成功、实际什么都没干时给出原因，否则返回空串。
-
-    这是 gpt-5.6-terra 走自建中转时实测到的失败形态：模型没有发出任何工具调用，
-    把本该是调用的内容写进了最终回复，还顺带自证「本会话没有暴露 shell/exec 工具」。
-    这种回复以前会被当成动作执行产物存进任务，任务直接被判成 done。
-    """
-    if turn_status != "completed":
-        # 非正常结束本来就会被判成 blocked，交给既有路径处理。
-        return ""
-    if LEAKED_TOOL_CALL_MARKER in turn_agent_text(turn):
-        return "最终回复里混进了工具调用的 schema 残片，说明这一轮的工具调用没有真正发出去"
-    if phase in WORKING_PHASES and turn_tool_call_count(turn) == 0:
-        return "整轮没有任何命令执行或文件改动，动作执行/测试阶段不可能只靠一段文字完成"
-    return ""
 
 
-def execution_output(turn_status: str, turn: dict[str, Any]) -> str:
-    """Persist a readable Markdown summary instead of exposing protocol JSON."""
-    lines = ["# Codex 执行结果", "", f"- 状态：{turn_status}", f"- 完成时间：{datetime.now(timezone.utc).isoformat()}", ""]
-    for item in turn.get("items") or []:
-        item_type = str(item.get("type") or "")
-        if item_type == "agentMessage":
-            text = str(item.get("text") or item.get("content") or "").strip()
-            if text:
-                lines.extend(["## 进度说明", "", text, ""])
-        elif item_type == "commandExecution":
-            command = item.get("command") or item.get("commands") or ""
-            if isinstance(command, list):
-                command = "\n".join(str(part) for part in command)
-            lines.extend(["## 执行命令", "", "```sh", str(command), "```", ""])
-            exit_code = item.get("exitCode")
-            if exit_code not in (None, 0):
-                lines.extend([f"命令结果：失败（退出码 {exit_code}）", ""])
-    raw = "\n".join(lines).strip() + "\n"
-    encoded = raw.encode("utf-8")
-    if len(encoded) <= EXECUTION_OUTPUT_LIMIT:
-        return raw
-    truncated = encoded[: EXECUTION_OUTPUT_LIMIT - 128].decode("utf-8", errors="ignore")
-    return truncated + "\n\n[执行记录过长，已在 8MB 处截断]"
 
 
-def merged_execution_output(previous: str, incoming: str) -> str:
-    """把本轮产物接在任务已有产物后面，而不是整段覆盖掉。
-
-    面板的「设计文档」和「成品测试报告」页签读的就是 actionOutput / testingReport。
-    一次追加对话只会产出增量，直接覆盖等于把前几轮的产物删掉，用户看到的文档
-    就只剩最后一次追加的内容。
-    """
-    previous_text = (previous or "").strip()
-    incoming_text = (incoming or "").strip()
-    if not previous_text:
-        return f"{incoming_text}\n" if incoming_text else ""
-    if not incoming_text or incoming_text in previous_text:
-        return f"{previous_text}\n"
-    merged = f"{previous_text}\n\n---\n\n{incoming_text}\n"
-    encoded = merged.encode("utf-8")
-    if len(encoded) <= EXECUTION_OUTPUT_LIMIT:
-        return merged
-    # 超限时丢最早的回合：最近的产物才是用户正在看的那一份。
-    note = "[更早的执行记录已按 8MB 上限截断]\n\n"
-    kept = encoded[-(EXECUTION_OUTPUT_LIMIT - len(note.encode("utf-8")) - 128):].decode("utf-8", errors="ignore")
-    return note + kept
 
 
-def final_agent_text_from_output(output: str) -> str:
-    marker = "## 进度说明\n\n"
-    if marker not in output:
-        return output.strip()
-    sections = [section.strip() for section in output.split(marker)[1:]]
-    cleaned = [section.split("\n\n## 执行命令", 1)[0].strip() for section in sections if section.strip()]
-    return cleaned[-1] if cleaned else output.strip()
 
 
-def testing_verdict_from_output(output: str) -> str:
-    """Read the exact verdict required by the testing skill from the final reply."""
-    final_text = final_agent_text_from_output(output)
-    match = re.search(r"(?m)^\s*验收判定\s*[:：]\s*(通过|不通过|受阻)\s*$", final_text)
-    return match.group(1) if match else ""
 
 
-BATCH_OUTCOME_RE = re.compile(r"(?m)^\s*批量判定\s*[:：]\s*(完成|可忽略|需人工处理)\s*$")
-BATCH_TURN_STATUS_RE = re.compile(r"(?m)^\s*-?\s*状态\s*[:：]\s*([A-Za-z]+)\s*$")
-# These markers are intentionally limited to evidence of a deliverable-level
-# problem. A generic "warning" or a command mention must not stop a queue.
-BATCH_HARD_PROBLEM_RE = re.compile(
-    r"(?:无法(?:完成|实现|继续|验证)|(?:编译|构建|测试|命令).{0,20}(?:失败|错误|不通过)|"
-    r"命令结果.{0,12}失败|退出码\s*[1-9]\d*|"
-    r"(?:需要|需)(?:人工|处理)|(?:权限|依赖|数据).{0,12}(?:不足|缺少|错误)|阻塞|受阻|冲突)",
-    re.IGNORECASE,
+
+
+
+
+
+
+
+
+
+
+
+from delivery_bridge.turn_output import (
+    EXECUTION_OUTPUT_LIMIT,
+    TOOL_CALL_ITEM_TYPES,
+    LEAKED_TOOL_CALL_MARKER,
+    WORKING_PHASES,
+    turn_agent_text,
+    turn_tool_call_count,
+    corrupted_turn_reason,
+    execution_output,
+    merged_execution_output,
+    final_agent_text_from_output,
+    testing_verdict_from_output,
+    BATCH_OUTCOME_RE,
+    BATCH_TURN_STATUS_RE,
+    BATCH_HARD_PROBLEM_RE,
+    batch_task_outcome,
+    text_from_user_item,
+    FILE_CHANGE_KINDS,
+    FILE_CHANGE_ALIASES,
+    diff_line_counts,
+    file_changes_of,
 )
-
-
-def batch_task_outcome(task: dict[str, Any]) -> tuple[str, str]:
-    """Classify a finished queue item without changing its authoritative task status.
-
-    ``completed`` means the task board already accepted the task. ``ignorable``
-    is a queue-local skip for a transient interruption; the task remains
-    blocked so the user can inspect and retry it later. Everything else is a
-    real queue blocker.
-    """
-    status = str(task.get("status") or "").strip().lower()
-    if status == "done":
-        return "completed", "任务已完成"
-
-    output = str(task.get("actionOutput") or task.get("testingReport") or "").strip()
-    final_text = final_agent_text_from_output(output)
-    explicit = BATCH_OUTCOME_RE.search(final_text)
-    if explicit:
-        verdict = explicit.group(1)
-        if verdict == "完成" and status == "done":
-            return "completed", "任务已完成"
-        if verdict == "可忽略":
-            return "ignorable", "执行回合已中断，但未发现代码、编译、测试或权限阻塞证据。"
-        return "hard", "执行器报告存在需要人工处理的实质问题。"
-
-    turn_status_match = BATCH_TURN_STATUS_RE.search(output)
-    turn_status = turn_status_match.group(1).lower() if turn_status_match else ""
-    if BATCH_HARD_PROBLEM_RE.search(final_text):
-        return "hard", "执行结果包含代码、编译、测试、权限、依赖或其他实质阻塞信息。"
-
-    # An interrupted turn with no substantive failure evidence is safe to
-    # bypass in the current queue. It is still blocked on the board and will
-    # remain visible for a later manual retry.
-    if turn_status in {"interrupted", "failed"}:
-        return "ignorable", "执行回合意外终止，未发现实质阻塞信息。"
-
-    return "hard", f"任务状态为 {status or 'unknown'}，且没有可忽略判定。"
-
-
-def text_from_user_item(item: dict[str, Any]) -> str:
-    content = item.get("content") or item.get("input") or []
-    if isinstance(content, str):
-        return content.strip()
-    if not isinstance(content, list):
-        return ""
-    parts: list[str] = []
-    for part in content:
-        if isinstance(part, str):
-            parts.append(part)
-            continue
-        if isinstance(part, dict) and str(part.get("type") or "") == "text":
-            parts.append(str(part.get("text") or ""))
-    return "\n".join(part.strip() for part in parts if part.strip())
-
-
-FILE_CHANGE_KINDS = {"add", "added", "create", "created", "delete", "deleted", "remove", "removed", "modify", "modified", "update", "updated", "rename", "renamed"}
-FILE_CHANGE_ALIASES = {
-    "added": "add",
-    "create": "add",
-    "created": "add",
-    "deleted": "delete",
-    "remove": "delete",
-    "removed": "delete",
-    "modified": "modify",
-    "update": "modify",
-    "updated": "modify",
-    "renamed": "rename",
-}
-
-
-def diff_line_counts(diff: Any) -> tuple[int, int]:
-    """数一份 unified diff 的增删行数，面板据此显示 `+74 -4`。"""
-    if not isinstance(diff, str) or not diff:
-        return 0, 0
-    added = removed = 0
-    for line in diff.splitlines():
-        if line.startswith("+++") or line.startswith("---"):
-            continue
-        if line.startswith("+"):
-            added += 1
-        elif line.startswith("-"):
-            removed += 1
-    return added, removed
-
-
-def file_changes_of(item: dict[str, Any]) -> list[dict[str, Any]]:
-    """Normalize one file-change item into `[{path, kind, added, removed}]`.
-
-    Codex 和 Claude 给的字段名不完全一样，面板只认 path + add/modify/delete/rename。
-    Codex 的 `kind` 实测是对象（`{"type": "update", "move_path": null}`），
-    当字符串读会一律退化成 modify，新增和删除就分不出来了。
-    """
-    normalized: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for change in item.get("changes") or []:
-        if not isinstance(change, dict):
-            continue
-        path = str(change.get("path") or change.get("file") or change.get("filePath") or "").strip()
-        if not path or path in seen:
-            continue
-        seen.add(path)
-        kind_value = change.get("kind") or change.get("type") or change.get("changeType") or ""
-        if isinstance(kind_value, dict):
-            kind_value = kind_value.get("type") or kind_value.get("kind") or ""
-        raw_kind = str(kind_value).strip().lower()
-        kind = FILE_CHANGE_ALIASES.get(raw_kind, raw_kind if raw_kind in FILE_CHANGE_KINDS else "modify")
-        added, removed = diff_line_counts(change.get("diff") or change.get("unifiedDiff") or change.get("unified_diff"))
-        normalized.append({"path": path, "kind": kind, "added": added, "removed": removed})
-    return normalized
 
 
 def chat_archive_component(value: Any, fallback: str, max_bytes: int) -> str:

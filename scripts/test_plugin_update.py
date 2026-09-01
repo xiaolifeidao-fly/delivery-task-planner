@@ -30,9 +30,24 @@ def make_package(root: Path, version: str = "0.3.0") -> Path:
     (root / "skills" / "delivery-task-planner" / "SKILL.md").write_text("# skill\n", encoding="utf-8")
     for name in ("http_bridge.py", "server.py", "taskboard.py"):
         (root / name).write_text(f"# {version}\n", encoding="utf-8")
-    (root / "delivery_bridge" / "update_manager.py").write_text(f"# {version}\n", encoding="utf-8")
-    (root / "delivery_bridge" / "restart_helper.py").write_text(f"# {version}\n", encoding="utf-8")
-    (root / "delivery_bridge" / "windows_supervisor.py").write_text(f"# {version}\n", encoding="utf-8")
+    for name in (
+        "update_manager.py",
+        "restart_helper.py",
+        "windows_supervisor.py",
+        "errors.py",
+        "prompt_context.py",
+        "workspaces.py",
+        "git_ops.py",
+        "turn_output.py",
+        "github_ssh.py",
+        "documents.py",
+        "runtime.py",
+        "hostinfo.py",
+        "codex_cli.py",
+        "providers.py",
+        "environments.py",
+    ):
+        (root / "delivery_bridge" / name).write_text(f"# {version}\n", encoding="utf-8")
     return root
 
 

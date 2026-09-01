@@ -494,6 +494,18 @@ class PluginUpdateManager:
             root / "delivery_bridge" / "update_manager.py",
             root / "delivery_bridge" / "restart_helper.py",
             root / "delivery_bridge" / "windows_supervisor.py",
+            root / "delivery_bridge" / "errors.py",
+            root / "delivery_bridge" / "prompt_context.py",
+            root / "delivery_bridge" / "workspaces.py",
+            root / "delivery_bridge" / "git_ops.py",
+            root / "delivery_bridge" / "turn_output.py",
+            root / "delivery_bridge" / "github_ssh.py",
+            root / "delivery_bridge" / "documents.py",
+            root / "delivery_bridge" / "runtime.py",
+            root / "delivery_bridge" / "hostinfo.py",
+            root / "delivery_bridge" / "codex_cli.py",
+            root / "delivery_bridge" / "providers.py",
+            root / "delivery_bridge" / "environments.py",
         ]
         if any(not path.exists() for path in required):
             raise UpdateFailure("发布包缺少插件清单、Skills 或桥接核心代码")

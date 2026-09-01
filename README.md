@@ -55,6 +55,25 @@ The Go service sends only a logical workspace name in the form `{username}/业�
 
 The bridge entry point remains `http_bridge.py`, but reusable runtime concerns live under `delivery_bridge/`:
 
+Modules are imported back into `http_bridge.py` by name so existing callers keep resolving them there. When a test needs to patch one of these functions, it must patch the module that owns it (for example `delivery_bridge.git_ops.run_git`) — patching the re-exported name on `http_bridge` has no effect on callers that already live inside the package.
+
+- `errors.py` owns `BridgeFailure`, the one business-failure exception every lower layer raises so no module has to import the entry point back.
+- `workspaces.py` resolves the project working directory and the server-supplied `{username}/业务空间/{projectName}` business workspace, enforcing the containment check in one place.
+- `prompt_context.py` owns the `delivery-bridge-context` wrapper that separates board-assembled prompt context from the words the user actually typed.
+- `git_ops.py` owns every local Git command behind requirement branches — branch catalog, change detail, push/rebase, merge preview, submodules and subprojects. Arguments are always fixed and branch names are validated before reaching Git.
+- `turn_output.py` turns an executor turn's item stream into what the board renders: whether the turn really touched the workspace, whether it counts as finished, the testing verdict, and per-file change counts.
+- `errors.py` owns `BridgeFailure`, the one business-failure exception every lower layer raises so no module has to import the entry point back.
+- `runtime.py` resolves the runtime directory (logs, caches, queued syncs), overridable through `DELIVERY_TASK_PLANNER_RUNTIME_DIR`.
+- `hostinfo.py` owns the macOS / Windows / Linux decision that several modules branch on.
+- `codex_cli.py` enumerates every codex build on the machine (PATH, local cache, Codex Desktop resources), compares versions, and copies the newest one out when needed.
+- `providers.py` normalizes executor identity: which AI, which purpose, reasoning effort, fast mode.
+- `workspaces.py` resolves the project working directory and the server-supplied `{username}/业务空间/{projectName}` business workspace, enforcing the containment check in one place.
+- `github_ssh.py` inspects and configures the plugin's own GitHub SSH key, rewriting only the block between its own markers in `~/.ssh/config`.
+- `environments.py` holds the preset-environment catalog with its version floors, probe commands, and per-platform install commands.
+- `prompt_context.py` owns the `delivery-bridge-context` wrapper that separates board-assembled prompt context from the words the user actually typed.
+- `documents.py` owns the on-disk shape of the outline, task, design, and test-case document sets, including HTML companion assets.
+- `git_ops.py` owns every local Git command behind requirement branches — branch catalog, change detail, push/rebase, merge preview, submodules and subprojects. Arguments are always fixed and branch names are validated before reaching Git.
+- `turn_output.py` turns an executor turn's item stream into what the board renders: whether the turn really touched the workspace, whether it counts as finished, the testing verdict, and per-file change counts.
 - `versioning.py` owns SemVer comparison shared by update checks and installation.
 - `update_manager.py` resolves an immutable Git commit, downloads and validates the release archive, backs up the active package, refreshes Codex and Claude Code caches, and persists bounded installation logs.
 - `restart_helper.py` preserves the bridge command-line arguments and restarts the bridge after the HTTP response is delivered. On macOS it hands control back to the per-user LaunchAgent. On Windows the logon task runs `windows_supervisor.py`, which relaunches a stopped bridge worker in under a second instead of waiting for Task Scheduler's one-minute failure interval; an update also migrates an older direct-bridge task to the supervisor action and waits for `/healthz` before declaring the restart usable. Restart diagnostics are written to the platform runtime directory, and a stale `restarting` job becomes retryable after 45 seconds instead of polling forever.

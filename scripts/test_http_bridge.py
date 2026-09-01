@@ -1633,8 +1633,8 @@ class HttpBridgeTest(unittest.TestCase):
             copied_cli.write_bytes(b"codex")
             executor = bridge.ExecutionBridge(Path.cwd())
             with patch.object(bridge.shutil, "which", return_value=None):
-                with patch.object(bridge, "host_platform", return_value="windows"):
-                    with patch.object(bridge, "RUNTIME_DIR", Path(directory)):
+                with patch.object(bridge.hostinfo, "host_platform", return_value="windows"):
+                    with patch.object(bridge.runtime, "RUNTIME_DIR", Path(directory)):
                         self.assertTrue(executor.health("codex")["ready"])
 
     def test_codex_desktop_resource_is_copied_when_the_cli_is_missing(self):
@@ -1645,7 +1645,7 @@ class HttpBridgeTest(unittest.TestCase):
             source.write_bytes(b"desktop-codex")
             runtime = root / "runtime"
             with patch.object(bridge.shutil, "which", return_value=None):
-                with patch.object(bridge, "codex_desktop_resource_paths", return_value=[source]):
+                with patch.object(bridge.codex_cli, "codex_desktop_resource_paths", return_value=[source]):
                     copied = bridge.provision_codex_cli("windows", runtime)
 
             self.assertEqual(runtime / "bin" / "codex.exe", Path(copied))
@@ -1661,9 +1661,9 @@ class HttpBridgeTest(unittest.TestCase):
             desktop.write_bytes(b"desktop-codex")
             versions = {"/usr/local/bin/codex": "0.134.0", str(desktop): "0.149.0-alpha.4.1"}
             with patch.object(bridge.shutil, "which", return_value="/usr/local/bin/codex"):
-                with patch.object(bridge, "host_platform", return_value="macos"):
-                    with patch.object(bridge, "codex_desktop_resource_paths", return_value=[desktop]):
-                        with patch.object(bridge, "codex_cli_version", side_effect=lambda command: versions.get(command, "")):
+                with patch.object(bridge.hostinfo, "host_platform", return_value="macos"):
+                    with patch.object(bridge.codex_cli, "codex_desktop_resource_paths", return_value=[desktop]):
+                        with patch.object(bridge.codex_cli, "codex_cli_version", side_effect=lambda command: versions.get(command, "")):
                             self.assertEqual(str(desktop), bridge.provision_codex_cli("macos", root / "runtime"))
                             self.assertEqual(str(desktop), bridge.available_codex_cli("macos", root / "runtime"))
 
@@ -1676,9 +1676,9 @@ class HttpBridgeTest(unittest.TestCase):
             # 版本问不出来时保持原来的优先级：PATH 上的 CLI 仍然优先。
             versions = {"/usr/local/bin/codex": "0.150.0", str(desktop): ""}
             with patch.object(bridge.shutil, "which", return_value="/usr/local/bin/codex"):
-                with patch.object(bridge, "host_platform", return_value="macos"):
-                    with patch.object(bridge, "codex_desktop_resource_paths", return_value=[desktop]):
-                        with patch.object(bridge, "codex_cli_version", side_effect=lambda command: versions.get(command, "")):
+                with patch.object(bridge.hostinfo, "host_platform", return_value="macos"):
+                    with patch.object(bridge.codex_cli, "codex_desktop_resource_paths", return_value=[desktop]):
+                        with patch.object(bridge.codex_cli, "codex_cli_version", side_effect=lambda command: versions.get(command, "")):
                             self.assertEqual("/usr/local/bin/codex", bridge.provision_codex_cli("macos", root / "runtime"))
 
     def test_bridge_rejects_project_code_as_program_id(self):
@@ -5130,13 +5130,15 @@ class GitBranchTest(unittest.TestCase):
         self.assertEqual(["galactus"], bridge.git_pending_submodules(self.workspace))
 
         calls: list[list[str]] = []
-        real_run_git = bridge.run_git
+        real_run_git = bridge.git_ops.run_git
 
         def record(workspace, args, **kwargs):
             calls.append(list(args))
             return real_run_git(workspace, args, **kwargs)
 
-        with patch.object(bridge, "run_git", side_effect=record):
+        # git_create_branch_targets 和 run_git 同在 delivery_bridge.git_ops 里，
+        # 打桩必须打在它真正解析名字的那个模块上，打在 http_bridge 的再导出名上是无效的。
+        with patch.object(bridge.git_ops, "run_git", side_effect=record):
             bridge.git_create_branch_targets(self.workspace, "main", "feature/issue_req-1", [])
 
         self.assertNotEqual([], calls)
