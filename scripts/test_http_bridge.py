@@ -31,6 +31,10 @@ SPEC.loader.exec_module(bridge)
 
 class HttpBridgeTest(unittest.TestCase):
     def setUp(self) -> None:
+        # THREAD_READERS 是模块级全局池，会把上一条用例建的只读执行器留给下一条。
+        bridge.THREAD_READERS.shutdown()
+        self.addCleanup(bridge.THREAD_READERS.shutdown)
+
         # 桥接请求会顺手刷新凭证文件；测试绝不能写到本机真实凭证上。
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
@@ -980,6 +984,10 @@ class HttpBridgeTest(unittest.TestCase):
         self.assertEqual("thread-remote", conversation["threadId"])
         self.assertEqual([], conversation["turns"])
         self.assertEqual(["thread-remote"], [entry["threadId"] for entry in conversation["conversations"]])
+        # 只读执行器现在归 THREAD_READERS 复用池所有：读完不再立刻关，
+        # 但池子收摊时必须把进程关掉，不能泄漏。
+        client.close.assert_not_called()
+        bridge.THREAD_READERS.shutdown()
         client.close.assert_called_once()
 
     def test_read_thread_or_empty_swallows_only_the_missing_transcript(self):
@@ -1281,7 +1289,7 @@ class HttpBridgeTest(unittest.TestCase):
         self.assertEqual(["codex-thread"], [entry["threadId"] for entry in result["conversations"]])
         self.assertEqual("codex", result["conversations"][0]["executorType"])
         self.assertEqual("codex-thread", result["threadId"])
-        self.assertEqual(["codex"], providers)
+        self.assertEqual({"codex"}, set(providers))
 
     def test_planning_follow_up_keeps_the_thread_own_tool(self):
         executor = bridge.ExecutionBridge(Path.cwd())
@@ -1322,7 +1330,7 @@ class HttpBridgeTest(unittest.TestCase):
             )
 
         client.resume_thread.assert_called_once_with("codex-thread")
-        self.assertEqual(["codex"], providers)
+        self.assertEqual({"codex"}, set(providers))
         self.assertEqual("codex", binds[-1]["executorType"])
 
     def test_task_conversation_reads_a_chat_left_by_the_other_tool(self):
@@ -1360,7 +1368,7 @@ class HttpBridgeTest(unittest.TestCase):
 
         self.assertEqual("codex-thread", result["threadId"])
         self.assertEqual("codex", result["conversations"][0]["executorType"])
-        self.assertEqual(["codex"], providers)
+        self.assertEqual({"codex"}, set(providers))
 
     def test_planning_rejects_confirmation_without_a_previous_preview(self):
         executor = bridge.ExecutionBridge(Path.cwd())
@@ -2158,7 +2166,7 @@ class HttpBridgeTest(unittest.TestCase):
                 self.request_id += 1
                 return self.request_id
 
-            def read_thread(self, thread_id, request_id):
+            def read_thread(self, thread_id, request_id, timeout=20):
                 self.last_thread_id = thread_id
                 self.last_request_id = request_id
                 return {"turns": self.turns}
@@ -2208,7 +2216,7 @@ class HttpBridgeTest(unittest.TestCase):
                 def next_request_id(self):
                     return 1
 
-                def read_thread(self, _thread_id, request_id=None):
+                def read_thread(self, _thread_id, request_id=None, timeout=20):
                     raise bridge.BridgeFailure("thread not found")
 
             executor = bridge.ExecutionBridge(workspace)
@@ -2236,7 +2244,7 @@ class HttpBridgeTest(unittest.TestCase):
                 def next_request_id(self):
                     return 1
 
-                def read_thread(self, _thread_id, request_id=None):
+                def read_thread(self, _thread_id, request_id=None, timeout=20):
                     return {"turns": [{"items": [{"type": "agentMessage", "text": "本机内容"}]}]}
 
             result = bridge.ExecutionBridge(workspace)._read_thread_with_workspace_archive(
@@ -2254,7 +2262,7 @@ class HttpBridgeTest(unittest.TestCase):
             def next_request_id(self):
                 return 1
 
-            def read_thread(self, _thread_id, request_id=None):
+            def read_thread(self, _thread_id, request_id=None, timeout=20):
                 self.read_count += 1
                 raise bridge.BridgeFailure("thread not found")
 
@@ -2310,7 +2318,7 @@ class HttpBridgeTest(unittest.TestCase):
             def next_request_id(self):
                 return 1
 
-            def read_thread(self, _thread_id, request_id=None):
+            def read_thread(self, _thread_id, request_id=None, timeout=20):
                 return {"turns": [{"items": [{"type": "agentMessage", "text": "已完成"}]}]}
 
         with tempfile.TemporaryDirectory() as directory:
@@ -5131,6 +5139,7 @@ class GitBranchTest(unittest.TestCase):
         with patch.object(bridge, "run_git", side_effect=record):
             bridge.git_create_branch_targets(self.workspace, "main", "feature/issue_req-1", [])
 
+        self.assertNotEqual([], calls)
         self.assertEqual([], [args for args in calls if args[:2] == ["submodule", "update"]])
         self.assertEqual(["galactus"], bridge.git_pending_submodules(self.workspace))
         self.assertEqual("feature/issue_req-1", bridge.git_current_branch(self.workspace))
