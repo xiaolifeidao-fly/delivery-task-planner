@@ -40,6 +40,7 @@ def make_package(root: Path, version: str = "0.3.0") -> Path:
         "workspaces.py",
         "git_ops.py",
         "turn_output.py",
+        "turn_view.py",
         "github_ssh.py",
         "documents.py",
         "runtime.py",
@@ -51,6 +52,9 @@ def make_package(root: Path, version: str = "0.3.0") -> Path:
         "timeutil.py",
         "reasoning.py",
         "payloads.py",
+        "stores.py",
+        "chat_archive.py",
+        "artifacts.py",
     ):
         (root / "delivery_bridge" / name).write_text(f"# {version}\n", encoding="utf-8")
     for package, names in {

@@ -161,37 +161,11 @@ PLUGIN_UPDATES = PluginUpdateManager(
     PLUGIN_GITHUB_RAW_BASE_URL,
     PLUGIN_VERSION_CHECK_CACHE_SECONDS,
 )
-PENDING_SESSION_SYNCS_PATH = RUNTIME_DIR / "pending-session-syncs.json"
 MAX_CONVERSATIONS_PER_TASK = 12
-MAX_CONVERSATION_ATTACHMENT_BYTES = 20 * 1024 * 1024
-MAX_CONVERSATION_UPLOAD_BYTES = payloads.MAX_CONVERSATION_ATTACHMENTS * MAX_CONVERSATION_ATTACHMENT_BYTES + 128 * 1024
 MAX_REQUIREMENT_DOCUMENT_BYTES = 2 * 1024 * 1024
 MAX_REQUIREMENT_PROTOTYPE_FILES = 30
 MAX_REQUIREMENT_PROTOTYPE_FILE_BYTES = 2 * 1024 * 1024
 MAX_REQUIREMENT_PROTOTYPE_TOTAL_BYTES = 8 * 1024 * 1024
-# 每一轮结束后，把面板可见的聊天正文备份到当前项目工作目录。它是可随项目
-# 共享的人工可读副本，不替代 Codex / Claude 保留的原始执行器会话。
-CHAT_ARCHIVE_DIRECTORY_NAME = "chat"
-# New archives are grouped by the owning requirement, so requirement and task
-# conversations for the same delivery stay together in a repository.
-CHAT_ARCHIVE_REQUIREMENTS_DIRECTORY_NAME = "requirements"
-CHAT_ARCHIVE_TASK_DIRECTORY_NAME = "task"
-# 早期版本使用大写目录；只用于恢复既有记录，所有新归档一律写入 chat/。
-LEGACY_CHAT_ARCHIVE_DIRECTORY_NAME = "Chat"
-CHAT_ARCHIVE_MAX_NAME_BYTES = 96
-CHAT_ARCHIVE_MAX_THREAD_ID_BYTES = 72
-CHAT_ARCHIVE_MAX_FILES_TO_SCAN = 500
-CHAT_ARCHIVE_MAX_FILE_BYTES = 5 * 1024 * 1024
-# 云端同步与 Git 本地归档相互独立：Git 聊天同步开关决定 chat/ 是否落到工作目录，云端开关决定
-# 是否将用户明确选择的内容传给服务端。服务端也会复核这组类别，桥接不能绕过项目设置。
-CLOUD_SYNC_SCOPES = {"chat", "requirement", "design"}
-MAX_CLOUD_SYNC_FILE_BYTES = 8 * 1024 * 1024
-MAX_CLOUD_SYNC_FILES_PER_RUN = 500
-MAX_WORKSPACE_ARTIFACT_BYTES = 50 * 1024 * 1024
-# 回复正文里的文件链接常常只写文件名（`ShenShiAccessibilityService.kt`），
-# 按工作区根目录拼出来的路径并不存在，只能靠一份文件名索引反查真实路径。
-WORKSPACE_FILE_INDEX_TTL_SECONDS = 30
-MAX_WORKSPACE_FILE_INDEX_ENTRIES = 40000
 # 面板还可以直接往栏目目录里放文档（本地选文件或粘贴正文）：什么后缀都收得下，
 # 但只有文本类文档能在面板里预览编辑，其余的走附件预览与下载。
 MAX_DOCUMENT_UPLOAD_FILES = 10
@@ -199,8 +173,6 @@ MAX_DOCUMENT_UPLOAD_FILE_BYTES = 20 * 1024 * 1024
 MAX_DOCUMENT_UPLOAD_BYTES = MAX_DOCUMENT_UPLOAD_FILES * MAX_DOCUMENT_UPLOAD_FILE_BYTES + 128 * 1024
 TESTING_CASES_FILE_NAME = "测试用例.md"
 PLANNING_ITEM_KEY = "__project_planning__"
-GIT_ENVIRONMENT_SESSIONS_PATH = RUNTIME_DIR / "git-environment-sessions.json"
-MAX_GIT_ENVIRONMENT_CONVERSATIONS = 12
 # 项目偏好设置「高级设置 → 预设环境」的聊天：装的是本机全局环境，不挂在任何业务仓库上。
 ENVIRONMENT_SETUP_ITEM_KEY = "__environment_setup__"
 ENVIRONMENT_SETUP_SESSIONS_PATH = RUNTIME_DIR / "environment-setup-sessions.json"
@@ -212,12 +184,6 @@ REQUIREMENT_FINE_TUNING_ITEM_KEY = "__requirement_fine_tuning__"
 REQUIREMENT_REVIEW_SESSION_KIND = "requirement-review"
 REQUIREMENT_FINE_TUNING_SESSION_KIND = "requirement-fine-tuning"
 MAX_PLANNING_CONVERSATIONS = 12
-ATTACHMENT_DIRECTORY_NAME = "delivery-task-attachments"
-ARTIFACT_DIRECTORY_NAME = "delivery-task-artifacts"
-IMAGE_SUFFIXES = {".gif", ".jpeg", ".jpg", ".png", ".webp"}
-MARKDOWN_ARTIFACT_RE = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
-EXCLUDED_ARTIFACT_PARTS = {".codex", ".git"}
-EXCLUDED_ARTIFACT_NAMES = {".env", ".env.local", ".env.production", "credentials.json", "secrets.json"}
 CODEX_MODEL_CATALOG = [
     {"model": "gpt-5.6-sol", "displayName": "5.6 Sol", "description": ""},
     {"model": "gpt-5.6-terra", "displayName": "5.6 Terra", "description": ""},
@@ -455,16 +421,6 @@ def codex_local_projects() -> list[dict[str, Any]]:
     return sorted(result, key=lambda item: (item["name"].casefold(), item["id"]))
 
 
-def image_format(data: bytes) -> tuple[str, str]:
-    if data.startswith(b"\x89PNG\r\n\x1a\n"):
-        return "image/png", ".png"
-    if data.startswith(b"\xff\xd8\xff"):
-        return "image/jpeg", ".jpg"
-    if data.startswith((b"GIF87a", b"GIF89a")):
-        return "image/gif", ".gif"
-    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
-        return "image/webp", ".webp"
-    return "", ""
 
 
 def generated_image_from_event(message: dict[str, Any]) -> tuple[str, str] | None:
@@ -490,153 +446,18 @@ def generated_image_from_event(message: dict[str, Any]) -> tuple[str, str] | Non
     return None
 
 
-class ProgressStore:
-    def __init__(self) -> None:
-        self.events: dict[tuple[str, int, str], list[dict[str, Any]]] = {}
-        self.sequences: dict[tuple[str, int, str], int] = {}
-        self.conditions: dict[tuple[str, int, str], threading.Condition] = {}
-        self.lock = threading.Lock()
-
-    def publish(self, identity: tuple[str, int, str], kind: str, title: str, body: str = "", status: str = "running") -> None:
-        with self.lock:
-            sequence = self.sequences.get(identity, 0) + 1
-            self.sequences[identity] = sequence
-            event = {
-                "id": str(sequence),
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "kind": kind,
-                "title": title,
-                "body": body.strip(),
-                "status": status,
-            }
-            events = self.events.setdefault(identity, [])
-            events.append(event)
-            del events[:-500]
-            condition = self.conditions.setdefault(identity, threading.Condition(self.lock))
-            condition.notify_all()
-
-    def snapshot(self, identity: tuple[str, int, str]) -> list[dict[str, Any]]:
-        with self.lock:
-            return list(self.events.get(identity, []))
-
-    def latest_sequence(self, identity: tuple[str, int, str]) -> int:
-        with self.lock:
-            return self.sequences.get(identity, 0)
-
-    def wait(self, identity: tuple[str, int, str], cursor: int, timeout: float = 15) -> tuple[list[dict[str, Any]], int]:
-        with self.lock:
-            condition = self.conditions.setdefault(identity, threading.Condition(self.lock))
-        with condition:
-            condition.wait_for(lambda: self.sequences.get(identity, 0) > cursor, timeout=timeout)
-            events = [event for event in self.events.get(identity, []) if int(event["id"]) > cursor]
-            return list(events), self.sequences.get(identity, cursor)
 
 
-class PendingSessionSyncStore:
-    def __init__(self, path: Path = PENDING_SESSION_SYNCS_PATH) -> None:
-        self.path = path
-        self.lock = threading.Lock()
-
-    @staticmethod
-    def key_of(entry: dict[str, Any]) -> str:
-        return (
-            f"{entry['programId']}/{entry['itemKey']}/{entry['executorType']}/"
-            f"{entry.get('phase') or 'requirement'}"
-        )
-
-    @staticmethod
-    def legacy_key_of(entry: dict[str, Any]) -> str:
-        return f"{entry['programId']}/{entry['itemKey']}/{entry['executorType']}/{entry.get('phase') or 'requirement'}"
-
-    def _read(self) -> dict[str, dict[str, Any]]:
-        if not self.path.exists():
-            return {}
-        try:
-            value = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return {}
-        return value if isinstance(value, dict) else {}
-
-    def _write(self, entries: dict[str, dict[str, Any]]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = self.path.with_suffix(".tmp")
-        temp_path.write_text(json.dumps(entries, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        os.chmod(temp_path, 0o600)
-        os.replace(temp_path, self.path)
-
-    def add(self, entry: dict[str, Any]) -> None:
-        with self.lock:
-            entries = self._read()
-            entries[self.key_of(entry)] = entry
-            self._write(entries)
-
-    def remove(self, entry: dict[str, Any]) -> None:
-        with self.lock:
-            entries = self._read()
-            entries.pop(self.key_of(entry), None)
-            entries.pop(self.legacy_key_of(entry), None)
-            self._write(entries)
-
-    def snapshot(self) -> list[dict[str, Any]]:
-        with self.lock:
-            return list(self._read().values())
 
 
-class GitEnvironmentSessionStore:
-    """不挂服务端会话表的本机聊天，其会话目录的落盘实现。
-
-    这类聊天不属于任何项目，服务端没有对应的会话表可绑，所以目录直接落在运行时目录里，
-    一个执行器（codex / claude）一份，刷新页面后还能把之前聊过的会话找回来。
-    """
-
-    def __init__(self, path: Path = GIT_ENVIRONMENT_SESSIONS_PATH) -> None:
-        self.path = path
-        self.lock = threading.Lock()
-
-    def _read(self) -> dict[str, Any]:
-        if not self.path.exists():
-            return {}
-        try:
-            value = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return {}
-        return value if isinstance(value, dict) else {}
-
-    def _write(self, value: dict[str, Any]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = self.path.with_suffix(".tmp")
-        temp_path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        os.chmod(temp_path, 0o600)
-        os.replace(temp_path, self.path)
-
-    def catalog(self, provider: str) -> list[dict[str, Any]]:
-        with self.lock:
-            entries = self._read().get(provider) or []
-        return [entry for entry in entries if isinstance(entry, dict) and str(entry.get("threadId") or "")]
-
-    def load(self, provider: str, thread_id: str = "") -> dict[str, Any] | None:
-        catalog = self.catalog(provider)
-        if not catalog:
-            return None
-        current = next((entry for entry in catalog if entry.get("threadId") == thread_id), catalog[-1])
-        return {
-            "threadId": str(current.get("threadId") or ""),
-            "turnId": str(current.get("turnId") or ""),
-            "catalog": catalog,
-        }
-
-    def save(self, provider: str, session: dict[str, Any]) -> None:
-        thread_id = str(session.get("threadId") or "")
-        if not thread_id:
-            return
-        catalog = [entry for entry in session.get("catalog") or [] if isinstance(entry, dict) and entry.get("threadId")]
-        for entry in catalog:
-            if entry.get("threadId") == thread_id:
-                entry["turnId"] = str(session.get("turnId") or "")
-        with self.lock:
-            value = self._read()
-            value[provider] = catalog[-MAX_GIT_ENVIRONMENT_CONVERSATIONS:]
-            self._write(value)
+from delivery_bridge.stores import (
+    PENDING_SESSION_SYNCS_PATH,
+    GIT_ENVIRONMENT_SESSIONS_PATH,
+    MAX_GIT_ENVIRONMENT_CONVERSATIONS,
+    ProgressStore,
+    PendingSessionSyncStore,
+    GitEnvironmentSessionStore,
+)
 
 
 ENVIRONMENT_SETUP_SESSIONS = GitEnvironmentSessionStore(ENVIRONMENT_SETUP_SESSIONS_PATH)
@@ -1622,355 +1443,24 @@ from delivery_bridge.clients.pool import (
 )
 
 
-class ConversationAttachmentStore:
-    """Keeps browser uploads inside the workspace so the Codex sandbox can read them."""
-
-    def __init__(self, workspace: Path):
-        self.root = workspace / ".codex" / ATTACHMENT_DIRECTORY_NAME
-        self.lock = threading.Lock()
-
-    @staticmethod
-    def _safe_name(name: str) -> str:
-        cleaned = Path(name).name.strip().replace("\x00", "")
-        return cleaned[:160] or "attachment"
-
-    @staticmethod
-    def _attachment_id(value: str) -> str:
-        if not re.fullmatch(r"[A-Za-z0-9_-]{16,80}", value):
-            raise BridgeFailure("附件标识无效")
-        return value
-
-    def _manifest_path(self, attachment_id: str) -> Path:
-        return self.root / f"{self._attachment_id(attachment_id)}.json"
-
-    def save(self, biz_line: str, program_id: int, item_key: str, uploads: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        if not uploads or len(uploads) > MAX_CONVERSATION_ATTACHMENTS:
-            raise BridgeFailure(f"一次最多上传 {MAX_CONVERSATION_ATTACHMENTS} 个附件")
-        stored: list[dict[str, Any]] = []
-        with self.lock:
-            self.root.mkdir(parents=True, exist_ok=True)
-            for upload in uploads:
-                name = self._safe_name(str(upload.get("name") or ""))
-                data = upload.get("data")
-                if not isinstance(data, bytes) or not data:
-                    raise BridgeFailure(f"附件 {name} 为空")
-                if len(data) > MAX_CONVERSATION_ATTACHMENT_BYTES:
-                    raise BridgeFailure(f"附件 {name} 超过 10 MB")
-                suffix = Path(name).suffix.lower()
-                content_type = str(upload.get("contentType") or mimetypes.guess_type(name)[0] or "application/octet-stream")[:128]
-                is_image = content_type.startswith("image/") and suffix in IMAGE_SUFFIXES
-                attachment_id = secrets.token_urlsafe(24)
-                stored_name = f"{attachment_id}{suffix}" if suffix else attachment_id
-                path = self.root / stored_name
-                path.write_bytes(data)
-                manifest = {
-                    "id": attachment_id,
-                    "programId": program_id,
-                    "itemKey": item_key,
-                    "name": name,
-                    "contentType": content_type,
-                    "size": len(data),
-                    "isImage": is_image,
-                    "fileName": stored_name,
-                    "createdAt": utc_now(),
-                }
-                self._manifest_path(attachment_id).write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
-                stored.append(self._public(manifest))
-        return stored
-
-    def save_generated_image(
-        self,
-        biz_line: str,
-        program_id: int,
-        item_key: str,
-        thread_id: str,
-        turn_id: str,
-        call_id: str,
-        encoded: str,
-    ) -> dict[str, Any]:
-        attachment_id = hashlib.sha256(
-            f"generated\0{program_id}\0{item_key}\0{thread_id}\0{turn_id}\0{call_id}".encode("utf-8")
-        ).hexdigest()[:40]
-        manifest_path = self._manifest_path(attachment_id)
-        if manifest_path.exists():
-            try:
-                return self._public(json.loads(manifest_path.read_text(encoding="utf-8")))
-            except (OSError, json.JSONDecodeError):
-                pass
-        try:
-            data = base64.b64decode(encoded, validate=True)
-        except (binascii.Error, ValueError) as exc:
-            raise BridgeFailure("Codex 生成的图片数据无效") from exc
-        content_type, suffix = image_format(data)
-        if not content_type or not suffix:
-            raise BridgeFailure("Codex 生成的图片格式不受支持")
-        if len(data) > MAX_WORKSPACE_ARTIFACT_BYTES:
-            raise BridgeFailure("Codex 生成的图片超过 50 MB")
-        stored_name = f"{attachment_id}{suffix}"
-        manifest = {
-            "id": attachment_id,
-            "programId": program_id,
-            "itemKey": item_key,
-            "threadId": thread_id,
-            "turnId": turn_id,
-            "callId": call_id,
-            "name": f"codex-generated-{turn_id[-8:] or attachment_id[:8]}{suffix}",
-            "contentType": content_type,
-            "size": len(data),
-            "isImage": True,
-            "fileName": stored_name,
-            "source": "codex-image-generation",
-            "createdAt": utc_now(),
-        }
-        with self.lock:
-            self.root.mkdir(parents=True, exist_ok=True)
-            path = self.root / stored_name
-            if not path.exists():
-                path.write_bytes(data)
-            self._manifest_path(attachment_id).write_text(
-                json.dumps(manifest, ensure_ascii=False), encoding="utf-8"
-            )
-        return self._public(manifest)
-
-    def generated_for_turn(self, program_id: int, item_key: str, thread_id: str, turn_id: str) -> list[dict[str, Any]]:
-        if not self.root.exists():
-            return []
-        attachments: list[dict[str, Any]] = []
-        for manifest_path in self.root.glob("*.json"):
-            try:
-                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                continue
-            if (
-                manifest.get("source") == "codex-image-generation"
-                and manifest.get("programId") == program_id
-                and manifest.get("itemKey") == item_key
-                and manifest.get("threadId") == thread_id
-                and manifest.get("turnId") == turn_id
-            ):
-                attachments.append(self._public(manifest))
-        return sorted(attachments, key=lambda item: item["id"])
-
-    def recover_generated_images(self, biz_line: str, program_id: int, item_key: str, thread_id: str) -> None:
-        session_path = next((
-            path for path in (Path.home() / ".codex" / "sessions").glob(f"**/*{thread_id}.jsonl") if path.is_file()
-        ), None)
-        if session_path is None:
-            return
-        current_turn_id = ""
-        try:
-            lines = session_path.open("r", encoding="utf-8")
-        except OSError:
-            return
-        with lines:
-            for line in lines:
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                payload = event.get("payload") or {}
-                if event.get("type") != "event_msg" or not isinstance(payload, dict):
-                    continue
-                event_type = str(payload.get("type") or "")
-                if event_type == "task_started":
-                    current_turn_id = str(payload.get("turn_id") or "")
-                    continue
-                if event_type != "image_generation_end" or not current_turn_id:
-                    continue
-                result = str(payload.get("result") or "")
-                call_id = str(payload.get("call_id") or "")
-                if result and call_id:
-                    try:
-                        self.save_generated_image(
-                            biz_line, program_id, item_key, thread_id, current_turn_id, call_id, result
-                        )
-                    except BridgeFailure:
-                        continue
-
-    def resolve(self, program_id: int, item_key: str, attachment_ids: list[str]) -> list[dict[str, Any]]:
-        attachments: list[dict[str, Any]] = []
-        for attachment_id in attachment_ids:
-            manifest_path = self._manifest_path(attachment_id)
-            try:
-                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as exc:
-                raise BridgeFailure("附件不存在或已失效") from exc
-            if manifest.get("programId") != program_id or manifest.get("itemKey") != item_key:
-                raise BridgeFailure("附件不属于当前任务")
-            file_name = str(manifest.get("fileName") or "")
-            path = (self.root / file_name).resolve()
-            if path.parent != self.root.resolve() or not path.is_file():
-                raise BridgeFailure("附件不存在或已失效")
-            attachment = dict(manifest)
-            attachment["path"] = str(path)
-            attachment["relativePath"] = str(path.relative_to(self.root.parent.parent.resolve()))
-            attachments.append(attachment)
-        return attachments
-
-    def download(self, attachment_id: str) -> tuple[dict[str, Any], Path]:
-        manifest_path = self._manifest_path(attachment_id)
-        try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise BridgeFailure("附件不存在或已失效") from exc
-        path = (self.root / str(manifest.get("fileName") or "")).resolve()
-        if path.parent != self.root.resolve() or not path.is_file():
-            raise BridgeFailure("附件不存在或已失效")
-        return manifest, path
-
-    @staticmethod
-    def _public(manifest: dict[str, Any]) -> dict[str, Any]:
-        attachment_id = str(manifest.get("id") or "")
-        return {
-            "id": attachment_id,
-            "name": str(manifest.get("name") or "附件"),
-            "contentType": str(manifest.get("contentType") or "application/octet-stream"),
-            "size": int(manifest.get("size") or 0),
-            "isImage": bool(manifest.get("isImage")),
-            "relativePath": str(manifest.get("relativePath") or ""),
-            "url": f"/v1/codex/attachments/{attachment_id}",
-        }
 
 
-class WorkspaceArtifactStore:
-    """Registers Codex-created workspace files without copying them into the task service."""
-
-    def __init__(self, workspace: Path):
-        self.workspace = workspace.resolve()
-        self.root = self.workspace / ".codex" / ARTIFACT_DIRECTORY_NAME
-        self.lock = threading.Lock()
-        self.index_cache: dict[str, list[str]] | None = None
-        self.index_at = 0.0
-
-    def _file_index(self) -> dict[str, list[str]]:
-        """文件名 → 工作区相对路径。用 git 的清单，天然排除 .gitignore 里的构建产物。"""
-        now = time.monotonic()
-        if self.index_cache is not None and now - self.index_at < WORKSPACE_FILE_INDEX_TTL_SECONDS:
-            return self.index_cache
-        index: dict[str, list[str]] = {}
-        try:
-            completed = run_git(
-                self.workspace,
-                ["ls-files", "-z", "--cached", "--others", "--exclude-standard"],
-                timeout=30,
-            )
-            entries = (completed.stdout or "").split("\0") if completed.returncode == 0 else []
-        except BridgeFailure:
-            entries = []
-        for entry in entries[:MAX_WORKSPACE_FILE_INDEX_ENTRIES]:
-            relative_text = entry.strip()
-            if not relative_text:
-                continue
-            index.setdefault(relative_text.rsplit("/", 1)[-1], []).append(relative_text)
-        self.index_cache = index
-        self.index_at = now
-        return index
-
-    def _locate(self, raw_path: str) -> tuple[Path, Path]:
-        """把回复里的链接落到工作区里的真实文件。"""
-        candidate = unquote(str(raw_path or "").strip())
-        # 链接常带行号（`foo.kt:42`、`foo.kt#L42`），指的还是同一份文件。
-        candidate = re.sub(r"(?::\d+){1,2}$", "", candidate.split("#", 1)[0]).strip()
-        if not candidate:
-            raise BridgeFailure("产物路径为空")
-        # 外部链接、锚点不是工作区文件，绝不能靠文件名反查蒙到一份同名文件上。
-        if candidate.startswith("//") or re.match(r"^[a-zA-Z][a-zA-Z\d+.-]*:", candidate):
-            raise BridgeFailure("链接不是项目内文件")
-        try:
-            return self._resolve(candidate)
-        except BridgeFailure:
-            pass
-        # 只写了文件名或写了一截尾部路径：全工作区反查，命中唯一一份才认，
-        # 同名多份时宁可不给预览，也不能点开另一个目录下的同名文件。
-        normalized = re.sub(r"^(?:\./)+", "", candidate.replace("\\", "/")).lstrip("/")
-        if not normalized or ".." in normalized.split("/"):
-            raise BridgeFailure("产物路径无效")
-        matches = self._file_index().get(normalized.rsplit("/", 1)[-1]) or []
-        if "/" in normalized:
-            matches = [item for item in matches if item == normalized or item.endswith(f"/{normalized}")]
-        if len(matches) != 1:
-            raise BridgeFailure("产物文件不存在" if not matches else "同名文件不唯一，无法确定预览目标")
-        return self._resolve(matches[0])
-
-    def _resolve(self, raw_path: str) -> tuple[Path, Path]:
-        candidate = Path(raw_path.strip())
-        if not candidate.parts:
-            raise BridgeFailure("产物路径为空")
-        resolved = candidate.resolve() if candidate.is_absolute() else (self.workspace / candidate).resolve()
-        try:
-            relative = resolved.relative_to(self.workspace)
-        except ValueError as exc:
-            raise BridgeFailure("产物路径超出当前项目") from exc
-        if any(part in EXCLUDED_ARTIFACT_PARTS for part in relative.parts):
-            raise BridgeFailure("该项目路径不允许作为聊天附件")
-        if relative.name.lower() in EXCLUDED_ARTIFACT_NAMES or relative.name.lower().startswith(".env."):
-            raise BridgeFailure("敏感配置文件不允许作为聊天附件")
-        if not resolved.is_file():
-            raise BridgeFailure("产物文件不存在")
-        size = resolved.stat().st_size
-        if size <= 0 or size > MAX_WORKSPACE_ARTIFACT_BYTES:
-            raise BridgeFailure("产物文件为空或超过 50 MB")
-        return resolved, relative
-
-    def register(self, biz_line: str, program_id: int, item_key: str, paths: list[str]) -> list[dict[str, Any]]:
-        registered: list[dict[str, Any]] = []
-        seen: set[str] = set()
-        with self.lock:
-            self.root.mkdir(parents=True, exist_ok=True)
-            for raw_path in paths:
-                try:
-                    path, relative = self._locate(raw_path)
-                except BridgeFailure:
-                    continue
-                relative_text = relative.as_posix()
-                if relative_text in seen:
-                    continue
-                seen.add(relative_text)
-                attachment_id = hashlib.sha256(
-                    f"{program_id}\0{item_key}\0{relative_text}".encode("utf-8")
-                ).hexdigest()[:40]
-                content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-                manifest = {
-                    "id": attachment_id,
-                    "programId": program_id,
-                    "itemKey": item_key,
-                    "name": path.name,
-                    "relativePath": relative_text,
-                    "contentType": content_type,
-                    "size": path.stat().st_size,
-                    "isImage": content_type.startswith("image/") and path.suffix.lower() in IMAGE_SUFFIXES,
-                    "createdAt": utc_now(),
-                }
-                (self.root / f"{attachment_id}.json").write_text(
-                    json.dumps(manifest, ensure_ascii=False), encoding="utf-8"
-                )
-                registered.append(self._public(manifest))
-        return registered
-
-    def download(self, artifact_id: str) -> tuple[dict[str, Any], Path]:
-        if not re.fullmatch(r"[a-f0-9]{40}", artifact_id):
-            raise BridgeFailure("产物标识无效")
-        try:
-            manifest = json.loads((self.root / f"{artifact_id}.json").read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise BridgeFailure("产物不存在或已失效") from exc
-        path, relative = self._resolve(str(manifest.get("relativePath") or ""))
-        if relative.as_posix() != manifest.get("relativePath"):
-            raise BridgeFailure("产物路径无效")
-        return manifest, path
-
-    @staticmethod
-    def _public(manifest: dict[str, Any]) -> dict[str, Any]:
-        artifact_id = str(manifest.get("id") or "")
-        return {
-            "id": artifact_id,
-            "name": str(manifest.get("name") or "产物"),
-            "contentType": str(manifest.get("contentType") or "application/octet-stream"),
-            "size": int(manifest.get("size") or 0),
-            "isImage": bool(manifest.get("isImage")),
-            "relativePath": str(manifest.get("relativePath") or ""),
-            "url": f"/v1/codex/artifacts/{artifact_id}",
-        }
+from delivery_bridge.artifacts import (
+    MAX_CONVERSATION_UPLOAD_BYTES,
+    MAX_CONVERSATION_ATTACHMENT_BYTES,
+    MAX_WORKSPACE_ARTIFACT_BYTES,
+    WORKSPACE_FILE_INDEX_TTL_SECONDS,
+    MAX_WORKSPACE_FILE_INDEX_ENTRIES,
+    ATTACHMENT_DIRECTORY_NAME,
+    ARTIFACT_DIRECTORY_NAME,
+    IMAGE_SUFFIXES,
+    MARKDOWN_ARTIFACT_RE,
+    EXCLUDED_ARTIFACT_PARTS,
+    EXCLUDED_ARTIFACT_NAMES,
+    image_format,
+    ConversationAttachmentStore,
+    WorkspaceArtifactStore,
+)
 
 
 class ExecutionBridge:
@@ -8284,503 +7774,52 @@ from delivery_bridge.turn_output import (
 )
 
 
-def chat_archive_component(value: Any, fallback: str, max_bytes: int) -> str:
-    """Return one human-readable, cross-platform-safe filename component."""
-    text = re.sub(r"[\x00-\x1f\x7f/\\:*?\"<>|]+", "-", str(value or ""))
-    text = re.sub(r"\s+", " ", text).strip(" .-")
-    if not text:
-        text = fallback
-    while len(text.encode("utf-8")) > max_bytes:
-        text = text[:-1]
-    return text.rstrip(" .-") or fallback
 
 
-def chat_archive_relative_path(
-    resource_kind: str,
-    resource_key: str,
-    conversation_title: str,
-    thread_id: str,
-    requirement_key: str = "",
-) -> Path:
-    """Build a stable, readable workspace-relative path for one conversation."""
-    if resource_kind not in {"requirement", "task"}:
-        raise BridgeFailure("聊天归档类型无效")
-    owning_requirement_key = resource_key if resource_kind == "requirement" else requirement_key
-    owning_requirement_key = chat_archive_component(owning_requirement_key, "unassigned", 64)
-    # All current requirement keys are already `req-*`. Keep the expected
-    # directory convention for pre-migration or manually supplied keys too.
-    requirement_directory = (
-        owning_requirement_key
-        if owning_requirement_key.startswith("req-")
-        else f"req-{owning_requirement_key}"
-    )
-    title = chat_archive_component(conversation_title, resource_key or requirement_directory, CHAT_ARCHIVE_MAX_NAME_BYTES)
-    thread = chat_archive_component(thread_id, "thread", CHAT_ARCHIVE_MAX_THREAD_ID_BYTES)
-    directory = Path(CHAT_ARCHIVE_DIRECTORY_NAME) / CHAT_ARCHIVE_REQUIREMENTS_DIRECTORY_NAME / requirement_directory
-    if resource_kind == "task":
-        directory /= CHAT_ARCHIVE_TASK_DIRECTORY_NAME
-    return directory / f"{title}--{thread}.md"
 
 
-def visible_chat_archive_turns(turns: Any) -> list[dict[str, Any]]:
-    """Keep visible dialogue and display-safe reasoning summaries for restoration."""
-    if not isinstance(turns, list):
-        return []
-    visible: list[dict[str, Any]] = []
-    for turn in turns:
-        if not isinstance(turn, dict):
-            continue
-        items: list[dict[str, Any]] = []
-        for item in turn.get("items") or []:
-            if not isinstance(item, dict):
-                continue
-            item_type = str(item.get("type") or "")
-            if item_type == "userMessage":
-                text = text_without_attachment_context(text_from_user_item(item)).strip()
-                if text:
-                    items.append({"type": "userMessage", "content": [{"type": "text", "text": text}]})
-            elif item_type == "agentMessage":
-                text = str(item.get("text") or item.get("content") or "").strip()
-                if text:
-                    items.append({
-                        "type": "agentMessage", "text": text,
-                        "status": str(item.get("status") or ""),
-                        "phase": str(item.get("phase") or ""),
-                    })
-            elif item_type == "reasoning":
-                summary = reasoning_summary_text(item)
-                if summary:
-                    items.append({
-                        "type": "reasoning", "summary": summary.split("\n\n"),
-                        "status": str(item.get("status") or ""),
-                    })
-        visible.append({
-            "id": str(turn.get("id") or ""),
-            "status": str(turn.get("status") or ""),
-            "createdAt": turn.get("createdAt") or turn.get("startedAt") or "",
-            "completedAt": turn.get("completedAt") or "",
-            "items": items,
-        })
-    return visible
 
 
-def archived_chat_text(
-    *,
-    resource_kind: str,
-    resource_key: str,
-    resource_name: str,
-    requirement_key: str = "",
-    conversation_title: str,
-    thread_id: str,
-    provider: str,
-    phase: str,
-    terminal_status: str,
-    turns: Any,
-) -> str:
-    """Render visible dialogue and reasoning summaries, never raw tool output."""
-    kind_label = "需求" if resource_kind == "requirement" else "任务"
-    metadata = {
-        "format": "delivery-task-planner-chat/v1",
-        "resourceType": resource_kind,
-        "resourceKey": resource_key,
-        "requirementKey": resource_key if resource_kind == "requirement" else requirement_key,
-        "resourceName": resource_name,
-        "conversationTitle": conversation_title,
-        "threadId": thread_id,
-        "provider": provider,
-        "phase": phase,
-        "lastTurnStatus": terminal_status,
-        "archivedAt": utc_now(),
-    }
-    lines = ["---"]
-    lines.extend(f"{key}: {json.dumps(value, ensure_ascii=False)}" for key, value in metadata.items())
-    lines.extend(["---", "", f"# {kind_label}聊天 · {conversation_title or resource_name or resource_key}", ""])
-
-    visible_turns = visible_chat_archive_turns(turns)
-    for index, turn in enumerate(visible_turns, start=1):
-        if not isinstance(turn, dict):
-            continue
-        status = str(turn.get("status") or "")
-        turn_id = str(turn.get("id") or "")
-        suffix = f" · {status}" if status else ""
-        if turn_id:
-            suffix += f" · {turn_id}"
-        lines.extend([f"## 第 {index} 轮{suffix}", ""])
-        message_count = 0
-        for item in turn.get("items") or []:
-            if not isinstance(item, dict):
-                continue
-            item_type = str(item.get("type") or "")
-            if item_type == "userMessage":
-                text = text_without_attachment_context(text_from_user_item(item)).strip()
-                label = "用户"
-            elif item_type == "agentMessage":
-                text = str(item.get("text") or item.get("content") or "").strip()
-                label = "助手"
-            elif item_type == "reasoning":
-                text = reasoning_summary_text(item)
-                label = "推理摘要"
-            else:
-                # Raw tool/command payloads can expose hidden context or secrets.
-                # Reasoning is included only through the summary-only branch above.
-                continue
-            if not text:
-                continue
-            lines.extend([f"### {label}", "", text, ""])
-            message_count += 1
-        if message_count == 0:
-            lines.extend(["_本轮没有可归档的用户或助手消息。_", ""])
-
-    if not visible_turns:
-        lines.extend(["_会话未返回可归档的回合记录。_", ""])
-    # The visible Markdown above is for people. This data block is a compact, lossless
-    # representation of the same safe messages so a different machine can restore the
-    # project-local backup without trying to parse arbitrary Markdown written by an AI.
-    payload = json.dumps({"turns": visible_turns}, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    lines.extend(["<!-- delivery-task-planner-chat-data", base64.b64encode(payload).decode("ascii"), "-->", ""])
-    return "\n".join(lines).rstrip() + "\n"
 
 
-def archive_chat_snapshot(
-    workspace: Path,
-    *,
-    resource_kind: str,
-    resource_key: str,
-    resource_name: str,
-    requirement_key: str = "",
-    conversation_title: str,
-    thread_id: str,
-    provider: str,
-    phase: str,
-    terminal_status: str,
-    turns: Any,
-) -> Path:
-    """Atomically replace one thread's project-local Markdown snapshot."""
-    if not thread_id.strip():
-        raise BridgeFailure("聊天归档缺少会话标识")
-    relative = chat_archive_relative_path(
-        resource_kind,
-        resource_key,
-        conversation_title or resource_name,
-        thread_id,
-        requirement_key=requirement_key,
-    )
-    root = workspace.resolve()
-    destination = (root / relative).resolve()
-    try:
-        destination.relative_to(root)
-    except ValueError as exc:
-        raise BridgeFailure("聊天归档路径超出当前项目") from exc
-    content = archived_chat_text(
-        resource_kind=resource_kind,
-        resource_key=resource_key,
-        resource_name=resource_name,
-        requirement_key=requirement_key,
-        conversation_title=conversation_title,
-        thread_id=thread_id,
-        provider=provider,
-        phase=phase,
-        terminal_status=terminal_status,
-        turns=turns,
-    )
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_name(f".{destination.name}.{secrets.token_hex(6)}.tmp")
-    try:
-        temporary.write_text(content, encoding="utf-8")
-        os.chmod(temporary, 0o600)
-        os.replace(temporary, destination)
-    finally:
-        try:
-            temporary.unlink(missing_ok=True)
-        except OSError:
-            pass
-    return relative
 
 
-def chat_archive_metadata(content: str) -> dict[str, Any]:
-    """Read the small JSON-valued front matter written by `archived_chat_text`."""
-    if not content.startswith("---\n"):
-        return {}
-    end = content.find("\n---\n", 4)
-    if end < 0:
-        return {}
-    metadata: dict[str, Any] = {}
-    for line in content[4:end].splitlines():
-        key, separator, raw = line.partition(": ")
-        if not key or not separator:
-            continue
-        try:
-            metadata[key] = json.loads(raw)
-        except json.JSONDecodeError:
-            return {}
-    return metadata
 
 
-def archived_chat_turns(content: str) -> list[dict[str, Any]]:
-    marker = "<!-- delivery-task-planner-chat-data\n"
-    start = content.rfind(marker)
-    if start < 0:
-        return []
-    end = content.find("\n-->", start + len(marker))
-    if end < 0:
-        return []
-    encoded = "".join(content[start + len(marker):end].split())
-    try:
-        payload = json.loads(base64.b64decode(encoded, validate=True).decode("utf-8"))
-    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
-        return []
-    turns = payload.get("turns") if isinstance(payload, dict) else None
-    return [turn for turn in turns or [] if isinstance(turn, dict)]
 
 
-def read_workspace_chat_archive(
-    workspace: Path,
-    resource_kind: str,
-    resource_key: str,
-    thread_id: str,
-) -> dict[str, Any]:
-    """Find a thread snapshot by its immutable metadata, not by a mutable display name."""
-    if resource_kind not in {"requirement", "task"} or not resource_key or not thread_id:
-        return {}
-    workspace_root = workspace.resolve()
-    archive_roots = [
-        workspace_root / CHAT_ARCHIVE_DIRECTORY_NAME / CHAT_ARCHIVE_REQUIREMENTS_DIRECTORY_NAME,
-        # Keep restoring already-synced archives after moving to the English layout.
-        workspace_root / CHAT_ARCHIVE_DIRECTORY_NAME / ("需求" if resource_kind == "requirement" else "任务"),
-        workspace_root / LEGACY_CHAT_ARCHIVE_DIRECTORY_NAME / ("需求" if resource_kind == "requirement" else "任务"),
-    ]
-    for archive_root in archive_roots:
-        root = archive_root.resolve()
-        try:
-            root.relative_to(workspace_root)
-        except ValueError:
-            continue
-        if not root.is_dir():
-            continue
-        try:
-            candidates = root.rglob("*.md")
-            for count, candidate in enumerate(candidates, start=1):
-                if count > CHAT_ARCHIVE_MAX_FILES_TO_SCAN:
-                    break
-                try:
-                    resolved = candidate.resolve()
-                    resolved.relative_to(root)
-                    if not resolved.is_file() or resolved.stat().st_size > CHAT_ARCHIVE_MAX_FILE_BYTES:
-                        continue
-                    content = resolved.read_text(encoding="utf-8")
-                except (OSError, UnicodeDecodeError, ValueError):
-                    continue
-                metadata = chat_archive_metadata(content)
-                if (
-                    metadata.get("resourceType") != resource_kind
-                    or metadata.get("resourceKey") != resource_key
-                    or metadata.get("threadId") != thread_id
-                ):
-                    continue
-                turns = archived_chat_turns(content)
-                if turns:
-                    return {"id": thread_id, "turns": turns, "source": "workspaceArchive"}
-        except OSError:
-            continue
-    return {}
 
 
-def cloud_sync_workspace_entries(workspace: Path, scopes: set[str]) -> tuple[list[tuple[str, str, Path, str]], int]:
-    """Return only configured, workspace-contained files for a project cloud sync.
-
-    `chat/` is isolated from regular project files. Requirement documents are readable
-    document formats under `doc/` excluding prototype directories; design documents are
-    all regular files under a `prototype/` directory, including referenced images.
-    """
-    wanted = scopes & CLOUD_SYNC_SCOPES
-    if not wanted:
-        return [], 0
-    root = workspace.resolve()
-    entries: dict[str, tuple[str, str, Path, str]] = {}
-    skipped = 0
-
-    def offer(category: str, source: Path) -> None:
-        nonlocal skipped
-        if len(entries) >= MAX_CLOUD_SYNC_FILES_PER_RUN:
-            skipped += 1
-            return
-        try:
-            resolved = source.resolve()
-            relative = resolved.relative_to(root).as_posix()
-            if not resolved.is_file() or resolved.stat().st_size > MAX_CLOUD_SYNC_FILE_BYTES:
-                skipped += 1
-                return
-        except (OSError, ValueError):
-            skipped += 1
-            return
-        content_type = mimetypes.guess_type(relative)[0] or "application/octet-stream"
-        entries[relative] = (category, relative, resolved, content_type)
-
-    if "chat" in wanted:
-        chat_root = root / CHAT_ARCHIVE_DIRECTORY_NAME
-        if chat_root.is_dir():
-            try:
-                for source in chat_root.rglob("*.md"):
-                    offer("chat", source)
-            except OSError:
-                skipped += 1
-
-    document_root = root / "doc"
-    if document_root.is_dir() and ("requirement" in wanted or "design" in wanted):
-        try:
-            for source in document_root.rglob("*"):
-                if not source.is_file():
-                    continue
-                try:
-                    relative_to_document = source.resolve().relative_to(document_root.resolve())
-                except (OSError, ValueError):
-                    skipped += 1
-                    continue
-                in_prototype = "prototype" in relative_to_document.parts
-                if in_prototype:
-                    if "design" in wanted:
-                        offer("design", source)
-                elif "requirement" in wanted and source.suffix.lower() in DOCUMENT_SET_SUFFIXES:
-                    offer("requirement", source)
-        except OSError:
-            skipped += 1
-
-    return [entries[key] for key in sorted(entries)], skipped
+from delivery_bridge.chat_archive import (
+    CHAT_ARCHIVE_DIRECTORY_NAME,
+    CHAT_ARCHIVE_REQUIREMENTS_DIRECTORY_NAME,
+    CHAT_ARCHIVE_TASK_DIRECTORY_NAME,
+    LEGACY_CHAT_ARCHIVE_DIRECTORY_NAME,
+    CHAT_ARCHIVE_MAX_NAME_BYTES,
+    CHAT_ARCHIVE_MAX_THREAD_ID_BYTES,
+    CHAT_ARCHIVE_MAX_FILES_TO_SCAN,
+    CHAT_ARCHIVE_MAX_FILE_BYTES,
+    CLOUD_SYNC_SCOPES,
+    MAX_CLOUD_SYNC_FILE_BYTES,
+    MAX_CLOUD_SYNC_FILES_PER_RUN,
+    chat_archive_component,
+    chat_archive_relative_path,
+    visible_chat_archive_turns,
+    archived_chat_text,
+    archive_chat_snapshot,
+    chat_archive_metadata,
+    archived_chat_turns,
+    read_workspace_chat_archive,
+    cloud_sync_workspace_entries,
+)
 
 
-def serialize_turns(
-    turns: Any,
-    attachment_resolver: Any = None,
-    artifact_resolver: Any = None,
-    turn_attachment_resolver: Any = None,
-) -> list[dict[str, Any]]:
-    """Return a small, browser-safe conversation projection of Codex thread history."""
-    if not isinstance(turns, list):
-        return []
-    serialized: list[dict[str, Any]] = []
-    for turn in turns:
-        if not isinstance(turn, dict):
-            continue
-        turn_id = str(turn.get("id") or "")
-        turn_attachments = turn_attachment_resolver(turn_id) if turn_attachment_resolver else []
-        messages: list[dict[str, Any]] = []
-        for item in turn.get("items") or []:
-            if not isinstance(item, dict):
-                continue
-            item_type = str(item.get("type") or "")
-            text = ""
-            action = ""
-            attachments: list[dict[str, Any]] = []
-            changes: list[dict[str, Any]] = []
-            if item_type == "userMessage":
-                text = text_from_user_item(item)
-                attachment_ids = attachment_ids_from_text(text)
-                if attachment_ids and attachment_resolver:
-                    try:
-                        attachments = attachment_resolver(attachment_ids)
-                    except BridgeFailure:
-                        attachments = []
-                text = text_without_attachment_context(text)
-            elif item_type in {"agentMessage", "plan"}:
-                text = str(item.get("text") or item.get("content") or item.get("summary") or "").strip()
-                if artifact_resolver and item_type == "agentMessage" and str(item.get("phase") or "") == "final_answer":
-                    linked_paths = [match.strip().split("#", 1)[0] for match in MARKDOWN_ARTIFACT_RE.findall(text)]
-                    attachments = artifact_resolver(linked_paths[:20])
-            elif item_type == "reasoning":
-                # Do not fall back to `content`: it can contain a non-display
-                # reasoning payload. The protocol's `summary` is intentional
-                # user-facing content and is safe for the browser projection.
-                text = reasoning_summary_text(item)
-            elif item_type == "commandExecution":
-                command = item.get("command") or item.get("commands") or ""
-                text = "\n".join(str(part) for part in command) if isinstance(command, list) else str(command)
-            elif item_type in {"mcpToolCall", "dynamicToolCall"}:
-                # Claude 的读文件、检索是具名工具，命令行里没有可解析的字面量：
-                # 语义在 action/target 上，面板据此显示成「已读取 X」而不是「已调用 Read」。
-                action = str(item.get("action") or "")
-                text = str(item.get("pattern") or item.get("tool") or item.get("name") or item.get("server") or "")
-            elif item_type in {"fileChange", "fileEdit"}:
-                changes = file_changes_of(item)
-                paths = [change["path"] for change in changes]
-                text = "\n".join(paths)
-                if artifact_resolver and paths:
-                    attachments = artifact_resolver(paths)
-            if not text and item_type not in {"fileChange", "fileEdit"}:
-                continue
-            messages.append(
-                {
-                    "id": str(item.get("id") or ""),
-                    "type": item_type,
-                    "text": text,
-                    "action": action,
-                    "target": str(item.get("target") or ""),
-                    "status": str(item.get("status") or ""),
-                    "exitCode": item.get("exitCode"),
-                    "phase": str(item.get("phase") or ""),
-                    "attachments": attachments,
-                    # 结构化的改动清单：面板据此在回合末尾汇总「本次改动」，和直接用 CLI 时看到的一致。
-                    "changes": changes,
-                }
-            )
-        if turn_attachments:
-            target = next(
-                (
-                    item for item in reversed(messages)
-                    if item.get("type") == "agentMessage" and item.get("phase") == "final_answer"
-                ),
-                next((item for item in reversed(messages) if item.get("type") == "agentMessage"), None),
-            )
-            if target is not None:
-                known_ids = {str(item.get("id") or "") for item in target["attachments"]}
-                target["attachments"].extend(
-                    item for item in turn_attachments if str(item.get("id") or "") not in known_ids
-                )
-        serialized.append(
-            {
-                "id": turn_id,
-                "status": str(turn.get("status") or ""),
-                "createdAt": turn.get("createdAt") or turn.get("startedAt") or "",
-                "completedAt": turn.get("completedAt") or "",
-                "items": messages,
-            }
-        )
-    return serialized
 
 
-def ensure_terminal_result(
-    turns: list[dict[str, Any]],
-    task: dict[str, Any],
-    binding: dict[str, Any] | None,
-) -> list[dict[str, Any]]:
-    """Use the task board's persisted result while another Codex process has a stale thread snapshot."""
-    if str(task.get("status") or "") != "done":
-        return turns
-    for turn in turns:
-        for item in turn.get("items") or []:
-            if item.get("type") == "agentMessage" and item.get("phase") == "final_answer" and str(item.get("text") or "").strip():
-                return turns
-    phase = str(task.get("phase") or "requirement")
-    result_field = {"requirement": "requirementDocument", "development": "actionOutput", "testing": "testingReport"}.get(phase, "")
-    result = str(task.get(result_field) or "").strip() if result_field else ""
-    if not result:
-        return turns
-    metadata = (binding or {}).get("metadata") or {}
-    turn_id = str(metadata.get("turnId") or "task-board-result") if isinstance(metadata, dict) else "task-board-result"
-    if not turns:
-        turns.append({"id": turn_id, "status": "completed", "createdAt": 0, "completedAt": 0, "items": []})
-    turns[-1]["status"] = "completed"
-    turns[-1].setdefault("items", []).append(
-        {
-            "id": f"{turn_id}-persisted-result",
-            "type": "agentMessage",
-            "text": result,
-            "status": "completed",
-            "exitCode": None,
-            "phase": "final_answer",
-            "attachments": [],
-        }
-    )
-    return turns
+from delivery_bridge.turn_view import (
+    serialize_turns,
+    ensure_terminal_result,
+)
 
 
 class BridgeHandler(BaseHTTPRequestHandler):
