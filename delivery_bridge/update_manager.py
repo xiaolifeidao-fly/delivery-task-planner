@@ -509,11 +509,18 @@ class PluginUpdateManager:
             root / "delivery_bridge" / "attachments_text.py",
             root / "delivery_bridge" / "timeutil.py",
             root / "delivery_bridge" / "reasoning.py",
+            root / "delivery_bridge" / "payloads.py",
             root / "delivery_bridge" / "clients" / "journal.py",
             root / "delivery_bridge" / "clients" / "codex.py",
             root / "delivery_bridge" / "clients" / "claude.py",
             root / "delivery_bridge" / "clients" / "factory.py",
             root / "delivery_bridge" / "clients" / "pool.py",
+            root / "delivery_bridge" / "prompts" / "common.py",
+            root / "delivery_bridge" / "prompts" / "task.py",
+            root / "delivery_bridge" / "prompts" / "planning.py",
+            root / "delivery_bridge" / "prompts" / "conversation.py",
+            root / "delivery_bridge" / "prompts" / "requirement.py",
+            root / "delivery_bridge" / "prompts" / "environment.py",
         ]
         if any(not path.exists() for path in required):
             raise UpdateFailure("发布包缺少插件清单、Skills 或桥接核心代码")

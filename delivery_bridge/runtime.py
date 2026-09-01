@@ -25,3 +25,16 @@ def default_runtime_dir() -> Path:
 
 
 RUNTIME_DIR = default_runtime_dir()
+
+
+# 插件安装根目录。本文件在 delivery_bridge/ 下，所以要往上两层。
+# 需要在测试里改写它的模块，请按 ``runtime.PLUGIN_ROOT`` 带模块名访问。
+PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+
+
+# 执行器一律走这个命令行入口写任务面板。
+TASKBOARD_CLI = str(PLUGIN_ROOT / "taskboard.py")
+
+
+def taskboard_command(action: str) -> str:
+    return f'python3 "{TASKBOARD_CLI}" {action}'

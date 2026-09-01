@@ -33,7 +33,7 @@ from urllib.request import Request, urlopen
 
 import server as planner
 
-from delivery_bridge import clients
+from delivery_bridge import clients, payloads
 from delivery_bridge import (
     codex_cli,
     documents,
@@ -56,13 +56,8 @@ DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8765
 DEFAULT_BUSINESS_WORKSPACE_ROOT = Path.home() / ".local" / "share" / "delivery-task-planner" / "business-workspaces"
 PLUGIN_MANIFEST_PATH = Path(__file__).resolve().parent / ".codex-plugin" / "plugin.json"
-PLUGIN_ROOT = Path(__file__).resolve().parent
-# 执行器一律走这个命令行入口写任务面板。
-TASKBOARD_CLI = str(Path(__file__).resolve().parent / "taskboard.py")
 
 
-def taskboard_command(action: str) -> str:
-    return f'python3 "{TASKBOARD_CLI}" {action}'
 
 PLUGIN_GITHUB_REPOSITORY = "https://github.com/xiaolifeidao-fly/delivery-task-planner.git"
 PLUGIN_GITHUB_RAW_BASE_URL = "https://raw.githubusercontent.com/xiaolifeidao-fly/delivery-task-planner"
@@ -73,9 +68,6 @@ PLUGIN_UPDATE_RESTART_POLL_SECONDS = 2
 # loaded the new code instead of only replacing files on disk.
 PLUGIN_RUNTIME_TEST_VALUE = "delivery-task-planner-python-runtime-v6"
 
-# 刚起的会话有一小段时间读不出来：Codex 的 rollout 文件还没落盘，thread/read 直接报
-# 「rollout ... is empty」。这类失败是瞬时的，容忍这么久之后仍然读不到才当成真的失败。
-THREAD_READ_GRACE_SECONDS = 30.0
 
 PLUGIN_UPDATES: PluginUpdateManager
 
@@ -156,6 +148,9 @@ def plugin_update_status() -> dict[str, Any]:
 
 
 from delivery_bridge.runtime import (
+    TASKBOARD_CLI,
+    taskboard_command,
+    PLUGIN_ROOT,
     default_runtime_dir,
     RUNTIME_DIR,
 )
@@ -167,24 +162,9 @@ PLUGIN_UPDATES = PluginUpdateManager(
     PLUGIN_VERSION_CHECK_CACHE_SECONDS,
 )
 PENDING_SESSION_SYNCS_PATH = RUNTIME_DIR / "pending-session-syncs.json"
-# Claude 是 print 模式的一次性子进程，没有常驻线程服务可读；会话记录只能自己落盘。
-CLAUDE_TRANSCRIPTS_DIR = RUNTIME_DIR / "claude-transcripts"
-MAX_CLAUDE_TRANSCRIPT_TURNS = 60
-# Codex 的 `thread/read` / `thread/resume` 只持久化部分条目：命令执行、文件改动和推理
-# 摘要都读不回来（协议里对 thread/rollback 的说明写得很明确）。桌面版能显示完整过程，
-# 靠的是自己留着实时通知流，这里做同一件事：把 item/started、item/completed 落盘。
-CODEX_THREAD_ITEMS_DIR = RUNTIME_DIR / "codex-thread-items"
-# turn/start 的 summary 取值：auto / concise / detailed / none。auto 由模型自己决定详略，
-# 实测常常只给一两句。注意 app-server 会静默忽略不认识的字段，改名字前先实际验一遍。
-TURN_REASONING_SUMMARY = "detailed"
-# app-server 的 stderr 只在出问题时才有内容（MCP 启动超时、模型列表拉取失败之类），
-# 留最后这几行就够定位，全部堆在内存里没有意义。
-APP_SERVER_STDERR_TAIL = 40
 MAX_CONVERSATIONS_PER_TASK = 12
-MAX_CONVERSATION_ATTACHMENTS = 5
-MAX_CONVERSATION_REFERENCES = 16
 MAX_CONVERSATION_ATTACHMENT_BYTES = 20 * 1024 * 1024
-MAX_CONVERSATION_UPLOAD_BYTES = MAX_CONVERSATION_ATTACHMENTS * MAX_CONVERSATION_ATTACHMENT_BYTES + 128 * 1024
+MAX_CONVERSATION_UPLOAD_BYTES = payloads.MAX_CONVERSATION_ATTACHMENTS * MAX_CONVERSATION_ATTACHMENT_BYTES + 128 * 1024
 MAX_REQUIREMENT_DOCUMENT_BYTES = 2 * 1024 * 1024
 MAX_REQUIREMENT_PROTOTYPE_FILES = 30
 MAX_REQUIREMENT_PROTOTYPE_FILE_BYTES = 2 * 1024 * 1024
@@ -231,61 +211,13 @@ REQUIREMENT_FINE_TUNING_ITEM_KEY = "__requirement_fine_tuning__"
 # 需求的测试会话和 review 会话共用同一张会话表，靠 metadata.kind 分流；旧数据没有这个字段，按测试算。
 REQUIREMENT_REVIEW_SESSION_KIND = "requirement-review"
 REQUIREMENT_FINE_TUNING_SESSION_KIND = "requirement-fine-tuning"
-# review 永远跳过的目录：文档和聊天归档不是代码，评它们只会稀释真正该看的改动。
-REVIEW_EXCLUDED_DIRECTORIES = ("doc", "chat")
-# 通用评审准则：面板固定下发给每一次首轮 review，和范围、项目技能那几条规则叠加执行。
-REVIEW_GUIDELINES = """Code review guidelines:
-Review Guidelines
-You are acting as a reviewer for a proposed code change made by another engineer.
-
-Review the change and respond in normal Markdown. Do not return JSON, XML, a findings object, or any structured review schema.
-
-When feedback should be attached directly to a changed line, emit one ::code-comment{...} directive for that issue. The directive creates an inline code comment in the review UI; keep the visible response as normal Markdown. Emit no directives when there are no actionable inline comments.
-
-Required code-comment attributes: title, body, and file. Optional attributes: start, end, and priority. Use the shortest useful line range. file should be an absolute path or include the workspace folder segment.
-
-Focus on discrete, actionable issues the original author would likely fix if they knew about them. Prefer no issues over speculative or low-signal feedback.
-
-General guidelines for whether to call out an issue:
-
-It meaningfully impacts correctness, performance, security, or maintainability.
-It is discrete and actionable.
-It was introduced by the change under review.
-The author would likely fix it once aware.
-It does not rely on unstated assumptions about intent.
-It identifies the affected behavior clearly rather than speculating broadly.
-Repository Rule Attribution
-Use the root and scoped project instruction files applicable to changed files, respecting normal project-document precedence (AGENTS.override.md, AGENTS.md, then configured fallback filenames) and selecting at most one file per directory. Guidance may use headings, checklists, bullets, tables, or concise prose; do not require formal IDs or schemas. More-specific guidance wins on conflict, and user instructions about review scope or style take precedence.
-
-Review the diff independently and deduplicate findings by changed location and defect/remedy. A finding is rule-supported only when applicable guidance materially contributes repository-specific scope, an invariant, remedy, convention, or confirmation behavior beyond generic correctness advice. Preserve and union rule support when candidates merge, then check every final candidate against the applicable rules. Do not omit ordinary findings or invent findings solely because a rule file exists.
-
-When collaboration is available, use at most one focused investigator per applicable rule. For each rule-supported finding, verify the applicable project instruction file that supplies the rule and its smallest supporting line range, then include one compact Markdown or local-file reference in the visible comment body. Do not fabricate citations or add hidden metadata.
-
-When you call out an issue, include the relevant file and line or function in prose, explain the scenario where it matters, and keep the explanation concise. Use priority labels such as [P1] or [P2] only when helpful to communicate severity.
-
-If there are no actionable issues, say that directly and briefly. Review the current code changes (staged, unstaged, and untracked files) and provide concise, actionable feedback in a normal Markdown response."""
-# 任务生命周期的四个技能都在本插件 skills/ 下；执行时按阶段点名，别让执行器自己猜。
-PLANNING_SKILL = "delivery-task-planner"
-PHASE_SKILLS = {
-    "requirement": "delivery-requirement-grooming",
-    "development": "delivery-action-execution",
-    "testing": "delivery-testing-report",
-}
 MAX_PLANNING_CONVERSATIONS = 12
-# 拆解上下文只给当前需求：项目里其他需求的任务清单不再逐轮塞进提示词，
-# 既省上下文，也避免执行器拿无关需求的任务去做去重和依赖判断。
-REQUIREMENT_SCOPE_RULE = (
-    "上面只列出当前需求下的任务。项目里其他需求的任务不在本轮上下文中，"
-    "去重、复用和依赖判断都只在本需求范围内进行；需要参考其他需求或任务时，"
-    "只能用用户在需求详情或聊天里 @ 引用并单独给出的那些，不要自行假设项目里还存在哪些任务。"
-)
 ATTACHMENT_DIRECTORY_NAME = "delivery-task-attachments"
 ARTIFACT_DIRECTORY_NAME = "delivery-task-artifacts"
 IMAGE_SUFFIXES = {".gif", ".jpeg", ".jpg", ".png", ".webp"}
 MARKDOWN_ARTIFACT_RE = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
 EXCLUDED_ARTIFACT_PARTS = {".codex", ".git"}
 EXCLUDED_ARTIFACT_NAMES = {".env", ".env.local", ".env.production", "credentials.json", "secrets.json"}
-RUNTIME_CONFIG_KEY = "_deliveryRuntimeConfig"
 CODEX_MODEL_CATALOG = [
     {"model": "gpt-5.6-sol", "displayName": "5.6 Sol", "description": ""},
     {"model": "gpt-5.6-terra", "displayName": "5.6 Terra", "description": ""},
@@ -484,20 +416,12 @@ from delivery_bridge.codex_cli import (
 )
 
 
-def environment_setup_workspace() -> Path:
-    """「预设环境」的专用工作目录。
-
-    装 Python / Node / Go 走的是本机全局包管理器，和项目代码没有关系，
-    所以和初始化 Git 环境一样给一个运行时目录下的空目录当 cwd，别把安装痕迹落进业务仓库。
-    """
-    root = RUNTIME_DIR / "environment-setup"
-    root.mkdir(parents=True, exist_ok=True)
-    return root.resolve()
 
 
 
 
 from delivery_bridge.workspaces import (
+    environment_setup_workspace,
     BUSINESS_WORKSPACE_SCOPE,
     workspace_path_of,
     business_workspace_path_of,
@@ -783,1031 +707,115 @@ from delivery_bridge.prompt_context import (
 )
 
 
-def document_path_of(task: dict[str, Any]) -> str:
-    """任务需求文档在工作区里的相对路径；面板没给就按 doc/<模块>/<任务键>/文档.md 兜底。"""
-    explicit = str(task.get("requirementDocumentPath") or "").strip()
-    if explicit:
-        return explicit
-    return f"doc/{task.get('moduleKey') or 'module'}/{task.get('itemKey') or 'item'}/文档.md"
-
-
-def document_revision_rule(document_path: str) -> str:
-    """需求文档是跨回合累积的文档，追加需求时最容易被整段覆盖成只剩本轮内容。"""
-    return (
-        f"`{document_path}` 是跨回合累积的文档，不是本轮回复的存档。要改它就必须："
-        "先把现有内容完整读一遍，再把本轮新增或调整的部分合并进去，最后整篇写回同一路径；"
-        "本轮没有讨论到的章节原样保留，只有用户明确要求删除的内容才能删。"
-        "禁止只把本轮追加的需求写进文件，那会把之前几轮的需求文档整段丢掉。"
-    )
-
-
-def follow_up_context_lines(task: dict[str, Any]) -> list[str]:
-    """续聊回合也要带上任务、阶段和文档纪律：首轮提示词可能已经被会话压缩掉了。"""
-    phase = str(task.get("phase") or "requirement")
-    lines = [
-        "这是同一条任务上的追加回合，任务和当前阶段都没有变化。",
-        f"任务键: {task.get('itemKey') or '未指定'}",
-        f"当前执行阶段: {phase}（对应技能：{PHASE_SKILLS.get(phase, '按任务当前阶段处理')}）",
-    ]
-    # 面板没给出文档路径也没给模块时，document_path_of 只能兜出一个 doc/module/... 的假路径；
-    # 那会把执行器引到错误的文件上，不如不提，让它沿用本会话里已经拿到的路径。
-    if str(task.get("requirementDocumentPath") or "").strip() or str(task.get("moduleKey") or "").strip():
-        document_path = document_path_of(task)
-        lines.extend([
-            f"需求文档路径: {document_path}（本任务唯一的需求文档）",
-            document_revision_rule(document_path),
-        ])
-    return lines
-
-
-def prototype_directory_of(task: dict[str, Any]) -> str:
-    """Return the fixed task-local directory for generated prototype images."""
-    document_path = Path(document_path_of(task))
-    return (document_path.parent / "prototype").as_posix()
-
-
-def readable_document(workspace: Path | None, relative: str) -> bool:
-    """文档是否真的落盘了。没写过的任务不该出现在清单里，否则执行器会去读一堆不存在的路径。"""
-    if not workspace or not relative:
-        return False
-    candidate = Path(relative)
-    if candidate.is_absolute() or ".." in candidate.parts:
-        return False
-    try:
-        return (workspace / candidate).resolve().is_file()
-    except OSError:
-        return False
-
-
-def requirement_document_catalog(
-    items: list[Any],
-    task: dict[str, Any],
-    workspace: Path | None,
-    limit: int = 60,
-) -> list[str]:
-    """List the sibling tasks under the same requirement whose documents are already written.
-
-    只给清单不给正文：一条需求可能拆出几十个任务，把每份文档都塞进提示词会挤掉真正要干的活，
-    也会把上下文烧在无关任务上。执行器按标题和依赖关系判断相关性，需要哪份自己去读哪份。
-    """
-    requirement_key = str(task.get("requirementKey") or "").strip()
-    if not requirement_key:
-        return []
-    current_key = str(task.get("itemKey") or "")
-    dependencies = {str(key) for key in task.get("dependsOnItemKeys") or []}
-    lines: list[str] = []
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        item_key = str(item.get("itemKey") or "")
-        if not item_key or item_key == current_key:
-            continue
-        if str(item.get("requirementKey") or "").strip() != requirement_key:
-            continue
-        path = document_path_of(item)
-        if not readable_document(workspace, path):
-            continue
-        marks = ["前置依赖"] if item_key in dependencies else []
-        if str(item.get("status") or "") == "done":
-            marks.append("已完成")
-        suffix = f"（{'、'.join(marks)}）" if marks else ""
-        lines.append(f"- {item_key}: {item.get('title') or item_key}{suffix} → {path}")
-        if len(lines) >= limit:
-            break
-    return lines
-
-
-def sibling_document_lines(catalog: Any) -> list[str]:
-    """把同需求的文档清单渲染成提示词片段，并交代按需加载的规则。"""
-    entries = [str(line) for line in catalog or [] if str(line).strip()]
-    if not entries:
-        return []
-    return [
-        "",
-        "本需求下其他任务已写好的需求文档（按需加载，不是让你全读）:",
-        *entries,
-        "加载规则：先看标题和依赖判断相关性——与本任务有接口、数据结构、字段口径或前置产出关系的才打开；"
-        "无关的不要读，避免上下文被无关任务占满。读过哪几份、为什么读，在最终回复里说明。",
-    ]
-
-
-def git_branch_lines(branch: str) -> list[str]:
-    """需求启用了 Git 分支时，明确告诉执行器改动应留在这条分支上。"""
-    if not branch:
-        return []
-    return [
-        f"Git 需求分支: {branch}（工作目录已切到该分支）。本任务的所有改动都留在这条分支上，"
-        "不要切换分支、不要合并回主干，也不要执行 push。",
-    ]
-
-
-def build_task_prompt(payload: dict[str, Any], workspace: Path | None = None) -> str:
-    """`workspace` 是项目管理里绑定的工作目录，也是本轮 cwd；四个阶段都要靠它去读代码和项目技能。"""
-    task = payload["task"]
-    dependencies = task.get("dependsOnItemKeys") or []
-    phase = str(task.get("phase") or "requirement")
-    phase_name = {"requirement": "梳理需求", "development": "动作执行", "testing": "成品测试"}.get(phase, phase)
-    document_path = document_path_of(task)
-    document_directory = Path(document_path).parent.as_posix()
-    design_directory = (Path(document_path).parent / "design").as_posix()
-    prototype_directory = prototype_directory_of(task)
-    test_artifact_directory = Path("doc") / "test" / str(task.get("itemKey") or "task")
-    # 每个阶段各有一个技能，明确点名让执行器去加载，别让它自己猜「当前项目的 skill」是哪个。
-    phase_instruction = {
-        "requirement": (
-            f"本次只进行梳理需求：遵循 {PHASE_SKILLS['requirement']} 技能，创建或更新工作区中的 `{document_path}`。"
-            "每次后续会话都会从这个文件读取需求上下文；文档结论必须基于工作目录里的真实代码，不要凭业务名词推演。"
-        ),
-        "development": (
-            f"本次只进行动作执行：遵循 {PHASE_SKILLS['development']} 技能，先读取 `{document_path}`，"
-            "再按需求文档和当前项目的开发技能实现并交付产物。"
-        ),
-        "testing": (
-            f"本次只进行成品测试：遵循 {PHASE_SKILLS['testing']} 技能，先读取 `{document_path}`，"
-            f"再读取已有 `{test_artifact_directory / '测试用例.md'}`（不存在时说明缺口并补充最小用例），"
-            "先准备环境、账号、鉴权和测试数据，再按代码与业务依赖编排实测；"
-            f"验证命令沿用当前项目开发技能里的约定；所有测试资产必须写入 `{test_artifact_directory}/`，该目录支持多份文档；"
-            "并生成带明确验收判定的测试报告。"
-        ),
-    }.get(phase, "按任务当前阶段执行。")
-    prototype_instruction = (
-        [
-            "这是需求拆解自动追加的原型图生成任务，不能只写文字说明："
-            f"使用可用的图像生成能力产出真实原型图，并保存至少一张 PNG、JPG、WEBP 或 GIF 到 {prototype_directory}/。",
-            "原型图应基于本任务、需求文档和全部前置任务产物；完成后在最终回复中列出图片的工作区相对路径。",
-            "图片是本任务文档的附属材料，不改业务代码；目录中存在图片后，任务详情会提供“打开原型图目录”按钮。",
-        ]
-        if bool(task.get("prototypeTask")) else []
-    )
-    lines = [
-        f"执行下面这个交付任务的「{phase_name}」阶段。直接检查当前项目并完成真实工作，不要只给方案。",
-        workspace_instruction(workspace),
-        "该任务已由 HTTP 执行桥领取并绑定到当前会话。不要调用 claim_next_task、bind_task_execution_session、finish_execution_task 或其他任务状态流转工具；桥接器会根据本回合最终状态自动同步任务面板。",
-        f"项目 program_id: {payload['programId']}",
-        f"任务键: {task['itemKey']}",
-        f"标题: {task['title']}",
-        f"说明: {task.get('description') or '无'}",
-        f"需求文档路径: {document_path}（本任务唯一的需求文档；默认加载：开始前先完整读一遍）",
-        f"任务需求文档目录: `{document_directory}/`，支持多份文档；`文档.md` 是主文档，独立任务说明使用独立文件名写在此目录。",
-        f"任务设计文档目录: `{design_directory}/`，支持多份文档；需要交付独立设计说明时写入此目录，不要写入 `.codex/visualizations` 或其他工作区外路径。",
-        document_revision_rule(document_path),
-        phase_instruction,
-        *prototype_instruction,
-        f"阶段: {task.get('stageKey') or '未指定'}",
-        f"模块: {task.get('moduleKey') or '未指定'}",
-        f"前置任务: {', '.join(dependencies) if dependencies else '无'}",
-        *git_branch_lines(str(payload.get("gitBranch") or "")),
-        "完成后说明修改内容和验证结果；无法完成时明确说明阻塞原因。",
-        "如果生成了用户需要查看或下载的文件、文档或图片，请在最终回复中用 Markdown 链接列出其工作区相对路径。",
-    ]
-    if bool(payload.get("batchMode")):
-        lines.extend(
-            [
-                "这是批量执行队列中的一项任务。完成时在最终回复最后单独输出一行："
-                "`批量判定：完成`、`批量判定：可忽略` 或 `批量判定：需人工处理`。",
-                "只有短暂的连接/会话中断，或不影响交付物的命令、验收提示噪声，才能判定为可忽略；"
-                "代码、编译、测试、权限、依赖、数据或实际实现问题必须判定为需人工处理，并说明原因。",
-            ]
-        )
-    lines.extend(sibling_document_lines(payload.get("requirementDocuments")))
-    execution_constraints = str(payload.get("executionConstraints") or "").strip()
-    if execution_constraints:
-        lines.extend(["", "本次队列的前置任务约束条件说明:", execution_constraints])
-    mention_context = payload.get("conversationMentionContext") or []
-    if isinstance(mention_context, list):
-        lines.extend(str(line) for line in mention_context if isinstance(line, str) and line.strip())
-    follow_up = str(payload.get("followUp") or "").strip()
-    if follow_up:
-        lines.append("本上下文标记闭合之后的内容，是用户本轮追加的原话。")
-    # 面板组装的这一大段只给执行器看；聊天记录里留一句人话，外加用户自己写的追加要求。
-    spoken = f"执行「{phase_name}」阶段：{task['title']}"
-    return wrap_bridge_context(lines, f"{spoken}\n\n{follow_up}" if follow_up else spoken)
-
-
-def build_task_testing_cases_prompt(
-    program_id: int, task: dict[str, Any], context: dict[str, Any], message: str, workspace: Path | None = None,
-    follow_up: bool = False,
-) -> str:
-    """Build a design-only prompt that remains safe while development is in progress."""
-    item_key = str(task.get("itemKey") or "").strip()
-    if not item_key:
-        raise BridgeFailure("任务测试用例缺少任务标识")
-    if follow_up:
-        # 追加回合不重发技能说明和同需求文档清单，只留红线、会变的任务状态和输出格式。
-        return wrap_bridge_context(
-            [
-                "这是同一条任务测试用例会话的追加回合，模式没变：只设计用例，"
-                "绝不调用接口、UI、脚本或构建命令执行真实测试，不得输出验收判定、不得创建测试报告、不得修改业务实现或任务状态。",
-                "首轮已交代过技能、同需求文档清单和输出要求，这里不再重复，按本会话已确认的约定继续。",
-                workspace_instruction(workspace),
-                f"项目 program_id: {program_id}",
-                f"任务键 item_key: {item_key}",
-                f"当前阶段（仅供了解，不可改变）: {task.get('phase') or 'requirement'}/{task.get('status') or 'todo'}",
-                f"任务需求文档: {document_path_of(task)}",
-                f"已知动作执行产物: {'有' if task.get('actionOutput') else '无'}",
-                f"测试用例资产目录: doc/test/{item_key}/；必须写入测试用例.md，按需写入测试计划.md 或其他补充文档。",
-                "研发未完成的部分仍然列为执行前置或待补输入，不得猜造结果。",
-                "最终回复第一行必须是“测试用例已生成”，后面给出测试准备、用例表、执行顺序和待确认项。",
-                "本会话如果被压缩过，先读上面给出的任务需求文档和已生成的测试用例把上下文接回来，不要凭印象往下接。",
-                "本上下文标记闭合之后的内容，是用户额外补充的测试范围、环境、账号来源或数据要求。",
-            ],
-            message or "请继续完善本任务的测试用例。",
-        )
-    return wrap_bridge_context(
-        [
-            "这是交付任务面板的「预先生成测试用例」回合。遵循 delivery-testing-report 技能的测试用例设计模式。",
-            "本回合只读取需求、关联任务、代码和已有产物，设计测试范围、输入数据、依赖顺序、步骤、预期和证据。",
-            "绝不调用接口、UI、脚本或构建命令执行真实测试；不得输出验收判定、不得创建测试报告、不得修改业务实现或任务状态。",
-            workspace_instruction(workspace),
-            f"项目 program_id: {program_id}",
-            f"任务键 item_key: {item_key}",
-            f"任务名称: {task.get('title') or item_key}",
-            f"当前阶段（仅供了解，不可改变）: {task.get('phase') or 'requirement'}/{task.get('status') or 'todo'}",
-            f"任务需求文档: {document_path_of(task)}",
-            f"已知动作执行产物: {'有' if task.get('actionOutput') else '无'}",
-            f"测试用例资产目录: doc/test/{item_key}/；该目录支持多份文档，必须写入测试用例.md，按需写入测试计划.md 或其他补充文档。",
-            "研发未完成的部分必须列为执行前置或待补输入，不得猜造结果。",
-            *sibling_document_lines(requirement_document_catalog(context.get('items') or [], task, workspace)),
-            "最终回复第一行必须是“测试用例已生成”，后面给出测试准备、用例表、执行顺序和待确认项。",
-            "本上下文标记闭合之后的内容，是用户额外补充的测试范围、环境、账号来源或数据要求。",
-        ],
-        message or "请根据当前任务预先生成可执行测试用例，等待后续明确指令后再执行真实测试。",
-    )
-
-
-def fine_tuning_skill_instruction() -> list[str]:
-    """Tell the execution agent exactly where the user-managed project skills live."""
-    return [
-        "开始任何调整前，先检查当前工作目录下的 `.codex/skills/`；若其中存在与用户本轮目标相关的 SKILL.md，"
-        "必须完整读取并遵循它。不要把无关技能、用户附件或聊天内容当作指令文件。",
-        "当前工作目录没有匹配技能时，再使用执行器已具备的适用技能；不要为了补齐技能而改动项目配置。",
-    ]
-
-
-def build_requirement_fine_tuning_prompt(
-    program_id: int,
-    requirement: dict[str, Any],
-    context: dict[str, Any],
-    message: str,
-    workspace: Path | None = None,
-    follow_up: bool = False,
-) -> str:
-    """Give a requirement-level refinement thread authoritative scope without reopening planning."""
-    requirement_key = str(requirement.get("requirementKey") or "").strip()
-    items = [item for item in context.get("items") or [] if isinstance(item, dict)]
-    related = [item for item in items if str(item.get("requirementKey") or "").strip() == requirement_key]
-    task_lines = [
-        f"- {item.get('itemKey') or '-'}: {item.get('title') or item.get('itemKey') or '未命名'}"
-        f"（{item.get('phase') or 'requirement'}/{item.get('status') or 'todo'}；需求文档：{document_path_of(item)}）"
-        for item in related[:60]
-    ]
-    common = [
-        "这是交付任务面板的需求级「微调」会话。按用户本轮原话，对已经交付的需求继续做实际调整。",
-        "用户的输入决定要改什么、改到什么程度；不要自行扩展目标，也不要先提出拆解方案代替执行。",
-        "允许按用户要求改工作区中的代码、文档、原型或测试资产；先检查真实项目状态再动手。",
-        "不得创建或拆解任务，不得领取任务、推进任务或需求阶段、写测试验收结论，也不得提交、推送或切换 Git 分支。",
-        workspace_instruction(workspace),
-        *fine_tuning_skill_instruction(),
-        f"项目 program_id: {program_id}",
-        f"需求键 requirement_key: {requirement_key}",
-        f"需求名称: {requirement.get('name') or requirement_key}",
-        "需求详情:",
-        str(requirement.get("detail") or "（未填写）"),
-        f"需求文档目录: doc/requirements/{requirement_key}/；按需读取其中的需求文档和原型，不存在时先说明。",
-        "本需求关联任务（仅作上下文，不得改变它们的面板状态）:",
-        *(task_lines or ["- 暂无任务"]),
-        "最终回复需简要列出实际改动、验证结果，以及仍需用户决定的事项。",
-        "本上下文标记闭合之后的内容，是用户本轮输入的原文。",
-    ]
-    if follow_up:
-        common = [
-            "这是同一条需求微调会话的追加回合。保持首轮已确定的微调边界，按用户本轮原话继续实际调整。",
-            "不得创建或拆解任务，不得改变需求或任务的面板状态，不得提交、推送或切换 Git 分支。",
-            workspace_instruction(workspace),
-            *fine_tuning_skill_instruction(),
-            f"项目 program_id: {program_id}",
-            f"需求键 requirement_key: {requirement_key}",
-            "本上下文标记闭合之后的内容，是用户本轮输入的原文。",
-        ]
-    return wrap_bridge_context(common, message)
-
-
-def build_task_fine_tuning_prompt(
-    program_id: int,
-    task: dict[str, Any],
-    context: dict[str, Any],
-    requirement: dict[str, Any] | None,
-    message: str,
-    workspace: Path | None = None,
-    follow_up: bool = False,
-) -> str:
-    """Task refinement gets the task, its parent requirement, and nearby documents automatically."""
-    item_key = str(task.get("itemKey") or "").strip()
-    requirement_key = str(task.get("requirementKey") or "").strip()
-    requirement_label = requirement_key or "未关联"
-    if requirement:
-        requirement_label = f"{requirement_label} · {requirement.get('name') or requirement_key}"
-    common = [
-        "这是交付任务面板的任务级「微调」会话。按用户本轮原话，对这一条任务已交付的产物继续做实际调整。",
-        "用户的输入决定要改什么、改到什么程度；不要自行扩大为需求拆解、任务执行或测试流程。",
-        "允许按用户要求改工作区中的代码、文档、原型或测试资产；先检查真实项目状态再动手。",
-        "不得领取任务、推进任务或需求阶段、写测试验收结论，也不得提交、推送或切换 Git 分支。",
-        workspace_instruction(workspace),
-        *fine_tuning_skill_instruction(),
-        f"项目 program_id: {program_id}",
-        f"任务键 item_key: {item_key}",
-        f"任务名称: {task.get('title') or item_key}",
-        f"任务当前阶段（只读）: {task.get('phase') or 'requirement'}/{task.get('status') or 'todo'}",
-        f"任务说明: {task.get('description') or '（未填写）'}",
-        f"任务需求文档: {document_path_of(task)}（开始前优先读取）",
-        f"所属需求: {requirement_label}",
-        "所属需求详情:",
-        str((requirement or {}).get("detail") or "（未填写）"),
-        *sibling_document_lines(requirement_document_catalog(context.get("items") or [], task, workspace)),
-        "最终回复需简要列出实际改动、验证结果，以及仍需用户决定的事项。",
-        "本上下文标记闭合之后的内容，是用户本轮输入的原文。",
-    ]
-    if follow_up:
-        common = [
-            "这是同一条任务微调会话的追加回合。保持首轮已确定的微调边界，按用户本轮原话继续实际调整。",
-            "不得领取或推进任务，不得改变需求或任务的面板状态，不得提交、推送或切换 Git 分支。",
-            workspace_instruction(workspace),
-            *fine_tuning_skill_instruction(),
-            f"项目 program_id: {program_id}",
-            f"任务键 item_key: {item_key}",
-            f"任务需求文档: {document_path_of(task)}",
-            "本上下文标记闭合之后的内容，是用户本轮输入的原文。",
-        ]
-    return wrap_bridge_context(common, message)
-
-
-def build_conversation_prompt(
-    program_id: int,
-    task: dict[str, Any],
-    message: str,
-    workspace: Path | None = None,
-    requirement_documents: list[str] | None = None,
-    mention_context: list[str] | None = None,
-) -> str:
-    """Start an independent Codex thread with enough task context to be useful."""
-    dependencies = task.get("dependsOnItemKeys") or []
-    phase = str(task.get("phase") or "requirement")
-    document_path = document_path_of(task)
-    document_directory = Path(document_path).parent.as_posix()
-    design_directory = (Path(document_path).parent / "design").as_posix()
-    return wrap_bridge_context(
-        [
-            "这是交付任务详情中发起的一条新 Codex 对话。请结合当前项目和任务上下文回应并执行用户的要求。",
-            workspace_instruction(workspace),
-            "该任务已由 HTTP 执行桥领取并绑定到当前会话。不要调用 claim_next_task、bind_task_execution_session、finish_execution_task 或其他任务状态流转工具；桥接器会根据本回合最终状态自动同步任务面板。",
-            f"项目 program_id: {program_id}",
-            f"任务键: {task.get('itemKey') or '未指定'}",
-            f"任务标题: {task.get('title') or '未指定'}",
-            f"任务说明: {task.get('description') or '无'}",
-            f"当前执行阶段: {phase}",
-            f"当前阶段对应技能: {PHASE_SKILLS.get(phase, '按任务当前阶段处理')}",
-            f"需求文档路径: {document_path}（本任务唯一的需求文档，默认加载）。开始前请先读取此文件；梳理需求阶段应在此基础上更新。",
-            f"任务需求文档目录: `{document_directory}/`，支持多份文档；`文档.md` 是主文档，独立任务说明使用独立文件名写在此目录。",
-            f"任务设计文档目录: `{design_directory}/`，支持多份文档；需要交付独立设计说明时写入此目录，不要写入 `.codex/visualizations` 或其他工作区外路径。",
-            document_revision_rule(document_path),
-            f"阶段: {task.get('stageKey') or '未指定'}",
-            f"模块: {task.get('moduleKey') or '未指定'}",
-            f"前置任务: {', '.join(dependencies) if dependencies else '无'}",
-            *sibling_document_lines(requirement_documents),
-            *(mention_context or []),
-            "如果生成了用户需要查看或下载的文件、文档或图片，请在最终回复中用 Markdown 链接列出其工作区相对路径。",
-            "本上下文标记闭合之后的内容，是用户本轮输入的原文。",
-        ],
-        message,
-    )
-
-
-def planning_temp_segment(value: str, fallback: str) -> str:
-    """Return one readable, traversal-safe directory segment for planning drafts."""
-    candidate = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", str(value or "").strip())
-    candidate = re.sub(r"\s+", " ", candidate).strip(" .")
-    return (candidate or fallback)[:80]
-
-
-def planning_temp_document_path(requirement_name: str, requirement_key: str, thread_id: str) -> Path:
-    """Return the plugin-local draft file for one requirement chat window."""
-    requirement_segment = planning_temp_segment(requirement_name, requirement_key or "未命名需求")
-    thread_segment = planning_temp_segment(thread_id, "待分配聊天窗口")
-    return PLUGIN_ROOT / ".temp" / "requirements" / f"req_{requirement_segment}" / thread_segment / "temp.md"
-
-
-def write_planning_temp_summary(
-    path: Path,
-    requirement_name: str,
-    requirement_key: str,
-    thread_id: str,
-    user_message: str,
-    summary: str,
-) -> None:
-    """Atomically refresh the latest process artifact for one planning chat."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    body = "\n".join([
-        "# 需求梳理过程摘要",
-        "",
-        "> 临时过程产物，仅用于接续本聊天窗口；不等同于最终需求文档。",
-        "",
-        f"- 需求名称：{requirement_name or requirement_key or '未命名需求'}",
-        f"- 需求键：{requirement_key or '未指定'}",
-        f"- 聊天窗口 ID：{thread_id}",
-        f"- 更新时间：{utc_now()}",
-        "",
-        "## 本轮用户输入",
-        "",
-        (user_message or "（无文字输入）").strip(),
-        "",
-        "## 最新总结性产物",
-        "",
-        (summary or "（本轮没有可保存的总结）").strip(),
-        "",
-    ])
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(body, encoding="utf-8")
-    os.chmod(temporary, 0o600)
-    os.replace(temporary, path)
-
-
-def delete_planning_temp_summary(path: Path) -> bool:
-    """Delete only one managed planning draft after a successful confirmation."""
-    managed_root = (PLUGIN_ROOT / ".temp" / "requirements").resolve()
-    candidate = path.resolve(strict=False)
-    try:
-        candidate.relative_to(managed_root)
-    except ValueError as exc:
-        raise BridgeFailure("需求过程摘要路径超出插件临时目录") from exc
-    if not path.is_file():
-        return False
-    path.unlink()
-    return True
-
-
-def planning_temp_rule_lines(temp_path: str, read_required: bool = False) -> list[str]:
-    if not temp_path:
-        return [
-            "本轮过程总结由桥接器在聊天窗口建立后自动写入插件安装目录的 `.temp/requirements/req_<需求名称>/<聊天窗口ID>/temp.md`；"
-            "不要为保存过程数据而创建或修改正式需求大纲。",
-        ]
-    read_rule = (
-        "本轮是确认写入回合：写最终需求文档前必须完整读取这份过程总结。"
-        if read_required
-        else "正常连续对话直接使用当前聊天上下文，不要重复读取这个文件；只有会话被压缩、恢复后上下文缺失，"
-        "或当前上下文已找不到此前确认结论时，才读取它作为恢复点。"
-    )
-    return [
-        f"本聊天窗口的过程总结文件: `{temp_path}`（插件安装目录内，不属于项目正式交付文档）。",
-        read_rule,
-        "每轮结束后桥接器会用本轮输入和最新总结性产物整篇刷新它，"
-        "不要把过程记录、未确认方案或聊天流水写入正式需求大纲。",
-    ]
-
-
-def requirement_outline_rule_lines(outline_path: str, write_allowed: bool = False, temp_path: str = "") -> list[str]:
-    """Keep the final outline immutable until the board grants write confirmation."""
-    if not outline_path:
-        return planning_temp_rule_lines(temp_path)
-    if not write_allowed:
-        return [
-            f"最终需求大纲: `{outline_path}`（相对项目工作目录）。预览和讨论阶段它是只读的最终产物：存在时可读取其中已确认内容，"
-            "不存在时也不得创建；只有用户点击「确认并写入」后才能改变它。",
-            *planning_temp_rule_lines(temp_path),
-        ]
-    return [
-        f"最终需求大纲: `{outline_path}`（相对项目工作目录）。用户已点击「确认并写入」，本轮必须把最终确认结果写入这个文件。",
-        *planning_temp_rule_lines(temp_path, read_required=True),
-        "写入前先完整读取既有最终大纲（如存在）和本聊天窗口的过程总结，把用户最终确认的方案合并成一份完整需求产物；"
-        "过程聊天、被否决方案和未确认草稿不要带入最终文档。",
-        "`temp.md` 只是候选材料，禁止整段复制或按聊天顺序改写。先分析每条信息是否直接有助于需求目标、交付范围、实现约束、"
-        "关键业务规则、验收标准、测试准备或最终决策；只把有实际交付价值且已经确认的内容提炼成清晰、可执行、可验证的需求表述。",
-        "合并重复内容，删除寒暄、反复确认、讨论过程、未采纳备选、无结论推演、工具日志和关于聊天本身的元信息。"
-        "但不得借精简遗漏已确认的非目标、兼容性要求、异常与边界场景、风险约束或仍会影响交付的待确认问题。",
-        "写回是「读全文 → 合并本轮增量 → 整篇覆盖」：先完整读一遍现有大纲（用户可能在面板上直接编辑过），"
-        "把本轮追加或调整的需求并进对应章节，本轮没聊到的章节原样保留，只有用户明确要求删除的内容才能删。"
-        "禁止只把本轮追加的那段需求写进文件，那等于把之前几轮的需求大纲整段丢掉。",
-        "大纲用 Markdown 组织，至少包含：需求背景与目标、范围与不做的事、关键约束、勘察到的落点（真实模块/目录/接口）、任务拆解表（与预览一致）、验收标准、待确认问题。",
-        "把大纲里任务表的最终状态同步成实际落库的那一版。",
-    ]
-
-
-def requirement_document_rule_lines(requirement_key: str) -> list[str]:
-    """Keep standalone requirement files in the requirement document directory."""
-    if not requirement_key:
-        return []
-    document_directory = requirement_document_directory_of(requirement_key).as_posix()
-    prototype_directory = requirement_prototype_directory_of(requirement_key).as_posix()
-    testing_directory = testing_asset_directory_of(requirement_key).as_posix()
-    return [
-        f"需求文档目录: `{document_directory}/`。这是一个支持多份文档的目录，`需求大纲.md` 是主文档；用户明确要求独立流程图、图表、HTML 或其他文件时，"
-        "不要把完整内容嵌进需求大纲，也不要只在对话里展示，必须使用独立文件名直接写入这个目录。",
-        f"需求原型目录: `{prototype_directory}/`，支持多个独立 `.html` / `.htm` 页面；需求测试资产目录: `{testing_directory}/`，支持 `测试用例.md`、`测试计划.md`、`测试报告.md` 及其他补充文档。",
-        "独立需求资产是项目交付文件，不是临时可视化：不得写入 `.codex/visualizations`、系统临时目录或其他工作区外路径。"
-        "不要把 visualize 工具的默认输出路径当成交付路径；如果工具先生成了临时预览，必须把最终文件复制到上述需求目录后再回复。生成后在最终回复中只列工作区相对路径，确保面板能登记和预览它。",
-        "未明确要求独立文件时不要创建额外文件；除当前需求文档目录外仍不得修改工作区其他文件。",
-    ]
-
-
-def build_planning_prompt(
-    program_id: int,
-    context: dict[str, Any],
-    message: str,
-    selected_stage: str = "",
-    selected_module: str = "",
-    selected_kind: str = "",
-    requirement: dict[str, Any] | None = None,
-    write_allowed: bool = False,
-    workspace: Path | None = None,
-    mention_context: list[str] | None = None,
-    thread_id: str = "",
-) -> str:
-    """Give a project-level Codex turn the precise planner-tool contract and scope.
-
-    需求梳理分两步：默认只出可评审的拆解预览（`write_allowed=False`），
-    用户在面板上点「确认并写入」后才带着 `write_allowed=True` 再来一轮真正落库。
-    面板上下文整段包在 <delivery-planning-context> 里，聊天记录只回显用户自己输入的内容。
-    `workspace` 是项目管理里绑定的工作目录，也就是本轮的 cwd；写进提示词是为了让执行器
-    知道该去哪儿读代码和项目技能，而不是只盯着任务面板返回的那点结构化上下文。
-    """
-    stage_lines = [
-        f"- {item.get('stageKey')}: {item.get('tag') or item.get('title') or item.get('stageKey')}"
-        for item in context.get("stages") or []
-    ]
-    module_lines = [
-        f"- {item.get('moduleKey')}: {item.get('name') or item.get('moduleKey')}"
-        for item in context.get("modules") or []
-    ]
-    requirement = requirement or {}
-    requirement_key = str(requirement.get("requirementKey") or "")
-    temp_path = (
-        planning_temp_document_path(str(requirement.get("name") or ""), requirement_key, thread_id).as_posix()
-        if thread_id else ""
-    )
-    # 同一条需求可能被反复追问，已经拆出来的任务要显式列出来：
-    # 不给这份清单，第二轮会把第一轮建过的任务再建一遍。
-    requirement_items = [
-        item
-        for item in context.get("items") or []
-        if requirement_key and str(item.get("requirementKey") or "") == requirement_key
-    ]
-    requirement_item_lines = [
-        f"- {item.get('itemKey')}: {item.get('title') or item.get('itemKey')}"
-        f"（{item.get('phase') or '-'}/{item.get('status') or '-'}；收益：{'、'.join(item.get('benefitTags') or []) or '未标注'}）"
-        for item in requirement_items[:100]
-    ]
-    mode_lines = (
-        [
-            f"本轮用户已在任务面板点击「确认并写入」，请遵循 {PLANNING_SKILL} 技能执行写入："
-            f"把上一轮预览过的方案（含用户后续提出的修改）用 `{taskboard_command('create-task-board-tasks')}` 一次性提交。",
-            f"任务面板数据只能通过这个命令行写入：`{taskboard_command('<动作>')}`（参数用连字符，数组参数走 `--json`，内容长时先写文件再 `--json @文件`）。不要自己拼 HTTP 请求、也不要手工改文件来创建任务面板数据。",
-            "可用动作：get-task-board-context、create-task-board-stage、create-task-board-module、create-task-board-tasks；"
-            f"`{taskboard_command('actions')}` 可以打印全部动作和参数，拿不准时先看它。"
-            "当前项目已确定，所有动作的 --program-id 一律传下面给出的项目表数值主键，不要传项目名称或项目编码。",
-            "任务描述应包含目标、范围和验收标准；依赖仅表达真正的前置关系，"
-            "depends_on 只能引用本轮新建的任务或下方「本需求已建任务」里的任务键，不要跨需求建立依赖。",
-            "每个任务必须传 benefit_tags：用 1-3 个不超过 32 字的简短标签描述该任务完成后带来的收益或作用，不能留空，也不要把任务标题重复写成标签。",
-            "任务负责人由写入命令从下面这条需求的主负责人自动继承：任务模型只能保存一位负责人，因此会使用需求的第一位主负责人；不要在任务数组中自行改写负责人。",
-            "执行 create-task-board-tasks 时必须原样传入下面给出的 requirement_key 和 phase，让新任务挂回本需求并落在指定的起始阶段。",
-            "用户已选择里程碑或模块时，将相同的 stage_key/module_key 传给 create-task-board-tasks 并不要自行改写；未选择时根据当前项目已有选项为每项任务分配归属。",
-            "本需求已有任务列表在下方给出：只补齐缺少的部分，不要重建已经存在的任务；若本轮无需新建任务，直接说明原因。",
-            "不重复创建与本需求已有任务语义相同的任务。完成后用简洁中文总结实际创建的里程碑、模块和任务。",
-        ]
-        if write_allowed
-        else [
-            f"这是交付任务面板的需求梳理会话，请遵循 {PLANNING_SKILL} 技能。本轮只做梳理和预览，禁止写入任何任务面板数据。",
-            "禁止执行 create-task-board-tasks、create-task-board-stage、create-task-board-module，也不要借 HTTP 请求或手工改文件绕过任务面板写入限制；未确认前这些写入命令会被命令行直接拒绝。",
-            "本轮的限制只针对任务面板数据：正式需求大纲保持只读；如果用户明确要求生成或更新独立的流程图、图表、HTML 或其他需求资产，允许写入当前需求文档目录，但只能写该目录。过程总结由桥接器写入插件安装目录。已授予项目工作目录及需求指定关联目录的只读勘察权限；可使用终端的只读命令和当前会话可用的读取工具列目录、搜索并读取代码、配置、技能和文档。某个可选读取工具不可用时，改用其他可用的只读工具继续勘察，不要因此停止。",
-            "拆解前必须先勘察下方给出的项目工作目录：加载该目录下项目自己的开发技能（如 backend-development、web-development），读相关目录和现有实现，据此判断需求真正的落点。get-task-board-context 只给出面板侧上下文，不包含工程现状，不能拿它替代看代码。",
-            "任务要落到勘察出的真实模块、目录或接口上，不要只按业务名词泛化出通用分层；工作区里找不到需求所指的模块时，先向用户说明并确认工作目录或范围，不要硬拆。",
-            "请与用户对话把需求问清楚，然后输出一份可评审的拆解预览：先用 Markdown 表格列出「序号 / 任务标题 / 收益标签 / 负责人 / 里程碑 / 模块 / 类型 / 前置依赖」，每项给 1-3 个简短收益或作用标签；负责人统一展示为该需求的第一位主负责人（未指定则标为未指派）；再在表格下方逐条补充目标、范围和验收标准。",
-            "里程碑、模块、类型的取值只能来自下方给出的现有选项；预览里也要说明哪些是新建、哪些复用本需求已有任务。",
-            "本需求已有任务列表在下方给出：预览里只列本轮打算新增的任务，不要重复已经存在的任务。",
-            "回复结尾提示用户：确认无误后点击输入框旁的「确认并写入」按钮，需要调整就直接回复修改意见，本轮继续讨论不会写入任何数据。",
-        ]
-    )
-    # 关掉「拆解成多条任务」时，整条需求只落一条任务：改动本来就不可分的小需求，拆开只会平添依赖和空跑。
-    split_tasks = bool(requirement.get("splitTasks", True))
-    split_lines = (
-        []
-        if split_tasks
-        else (
-            [
-                "本需求已关闭「拆解成多条任务」：执行 create-task-board-tasks 时 tasks 数组只能包含一条覆盖整条需求的任务，"
-                "该任务的 depends_on 传空数组；启用原型图时命令行自动追加的原型任务不计入这条限制。",
-            ]
-            if write_allowed
-            else [
-                "本需求已关闭「拆解成多条任务」：预览里只输出一条覆盖整条需求的任务，任务表只有一行，不要拆成多条，也不要用依赖把它串成多步。"
-                "该任务的目标、范围和验收标准要覆盖整条需求。",
-            ]
-        )
-    )
-    prototype_enabled = bool(requirement.get("generatePrototype"))
-    prototype_lines = (
-        [
-            "本需求已启用“拆解后生成原型图”。预览时必须在任务表的最后列出一条“生成需求原型图”任务，"
-            "并说明它依赖本轮其余任务；确认写入时，执行 create-task-board-tasks 必须传 generate_prototype: true。"
-            "命令行会自动创建并标识这条末尾任务，任务执行时将把图片保存到自身文档目录的 prototype/ 中。",
-        ]
-        if prototype_enabled else []
-    )
-    # 任务需求文档是任务级的唯一需求沉淀。单任务模式无需额外勾选预生成：
-    # 唯一任务就是这条需求的交付载体，确认写入后必须直接收到完整需求文档。
-    pre_generate_task_documents = bool(
-        requirement.get("preGenerateTaskDocuments", requirement.get("generateTaskOutline", False))
-    )
-    task_document_required = pre_generate_task_documents or not split_tasks
-    task_document_lines = (
-        [
-            "本需求已关闭“拆解成多条任务”：确认写入后，create-task-board-tasks 返回的唯一业务任务（prototypeTask=false）"
-            "就是本条需求的交付载体。必须把本轮梳理出的完整需求文档直接创建或覆盖到该任务返回的 requirementDocumentPath"
-            "（即 `doc/<moduleKey>/<itemKey>/文档.md`），不能只留在需求级大纲或任务数据库的简短说明中。",
-            "这条规则不依赖“预生成任务需求文档”开关；若同时生成原型图，不要把需求正文写进 prototypeTask=true 的原型任务文档。",
-            "正文需完整保留本轮已确认的需求背景与目标、范围与非目标、工程事实与落点、设计要求、验收标准、测试准备及待确认项；"
-            "后续任务“梳理需求”和“动作执行”只读取并继续完善这一份文件。",
-            "写完后在总结里列出唯一业务任务键和实际写入的需求文档路径。",
-        ]
-        if write_allowed and not split_tasks
-        else [
-            "本需求已启用“预生成任务需求文档”。create-task-board-tasks 返回每条任务的 moduleKey 和 itemKey 后，"
-            "必须为本轮每条新建任务创建或覆盖 `doc/<moduleKey>/<itemKey>/文档.md`，一条任务一份，不能另建任务需求大纲。",
-            "这份文件是后续任务“梳理需求”和“动作执行”共同读取的唯一需求文档；先写可实施初稿，"
-            "再由梳理需求阶段基于真实代码增量校正和补全。",
-            "初稿用 Markdown 组织，至少包含：任务目标、范围与不做的事、已知落点（真实模块/目录/接口）、实现要点、前置依赖、验收标准与待确认项。",
-            "写完后在总结里列出实际写入的任务需求文档路径。",
-        ]
-        if write_allowed and pre_generate_task_documents
-        else (
-            [
-                "本需求已关闭“拆解成多条任务”：确认写入后会为唯一业务任务直接写入完整需求文档；"
-                "本轮仍处于预览，尚未取得任务键，先不要创建任务需求文档。",
-            ]
-            if not split_tasks
-            else [
-                "任务确认写入后，会为每条新建任务预生成 `doc/<moduleKey>/<itemKey>/文档.md` 作为需求梳理初稿；"
-                "本轮只做预览，先不要创建这些文件。",
-            ]
-            if pre_generate_task_documents else []
-        )
-    )
-    # 正式大纲只在确认轮更新；预览轮由插件安装目录里的聊天级 temp.md 接续上下文。
-    outline_path = requirement_outline_path_of(requirement_key).as_posix() if requirement_key else ""
-    outline_lines = requirement_outline_rule_lines(outline_path, write_allowed, temp_path)
-    document_lines = requirement_document_rule_lines(requirement_key)
-    # 被 @ 的历史需求：只给大纲产物地址，读不读、读哪一段由执行器按需决定。
-    references = requirement.get("references") or []
-    reference_lines = (
-        [
-            "本需求在详情里 @ 引用了下面这些历史需求。它们各自的需求大纲产物地址已列出（相对项目工作目录）：",
-            *(
-                f"- {item.get('name') or item.get('requirementKey')}"
-                f"（requirement_key: {item.get('requirementKey')}）: "
-                f"`{requirement_outline_path_of(str(item.get('requirementKey'))).as_posix()}`"
-                for item in references
-            ),
-            "这些文件不会随提示词发给你：需要参考时按上面的路径自行读取，并且只读与本需求真正相关的章节，不要为了凑上下文把它们整段搬进回复。",
-            "文件不存在说明那条需求还没沉淀大纲：如实说明，不要臆造它的内容。",
-            "引用只作为背景和既有约定的来源，本轮拆解的范围仍然只限当前这条需求。",
-        ]
-        if references else []
-    )
-    # 被 @ 的既有任务从当前项目目录重新解析，不能采信浏览器提交的任务标题或文档路径。
-    item_references = requirement.get("itemReferences") or []
-    items_by_key = {
-        str(item.get("itemKey") or ""): item
-        for item in context.get("items") or []
-        if isinstance(item, dict) and str(item.get("itemKey") or "")
-    }
-    item_reference_lines: list[str] = []
-    if item_references:
-        item_reference_lines.append("本需求在详情里 @ 引用了下面这些既有任务。需要参考时先读取对应任务需求文档：")
-        for reference in item_references:
-            item_key = str(reference.get("itemKey") or "")
-            item = items_by_key.get(item_key)
-            if item is None:
-                item_reference_lines.append(f"- {item_key}：当前项目中已找不到该任务，不能据此推断实现细节。")
-                continue
-            item_reference_lines.append(
-                f"- {item.get('title') or item_key}（item_key: {item_key}）: "
-                f"`{document_path_of(item)}`"
-            )
-        item_reference_lines.extend([
-            "这些任务仅作为已有实现和约定的参考，不能改变本轮拆解范围或重复创建同一项工作。",
-            "任务文档不存在时如实说明，不要臆造其中的实现细节。",
-        ])
-    instruction = [
-        *mode_lines,
-        *split_lines,
-        *prototype_lines,
-        *outline_lines,
-        *document_lines,
-        *reference_lines,
-        *item_reference_lines,
-        *(mention_context or []),
-        *task_document_lines,
-        "",
-        f"项目 program_id: {program_id}",
-        f"项目名称（仅供理解，不要作为参数）: {context.get('program', {}).get('name') or program_id}",
-        workspace_instruction(workspace),
-        f"需求键 requirement_key: {requirement_key or '未指定'}",
-        f"任务起始阶段 phase: {requirement.get('startPhase') or 'requirement'}",
-        f"拆解成多条任务: {'是' if split_tasks else '否（只建一条任务）'}",
-        f"预生成任务需求文档: {'是（单任务模式强制写入）' if not split_tasks else '是' if task_document_required else '否（由任务梳理阶段创建）'}",
-        f"拆解后生成原型图: {'是' if prototype_enabled else '否'}",
-        f"需求名称: {requirement.get('name') or '未命名'}",
-        f"主负责人: {requirement.get('owners') or '未指定'}",
-        f"辅助人: {requirement.get('assistants') or '未指定'}",
-        f"@ 引用的历史需求: {'、'.join(str(item.get('name') or item.get('requirementKey')) for item in references) or '无'}",
-        "需求详细信息:",
-        str(requirement.get("detail") or "（未填写）"),
-        "",
-        f"已选里程碑: {selected_stage or '未选择'}",
-        f"已选模块: {selected_module or '未选择'}",
-        f"任务类型偏好: {selected_kind or '由你判断'}",
-        "现有里程碑:", *(stage_lines or ["- 无"]),
-        "现有模块:", *(module_lines or ["- 无"]),
-        "本需求已建任务:", *(requirement_item_lines or ["- 无"]),
-        REQUIREMENT_SCOPE_RULE,
-        "",
-        "本上下文标记闭合之后的内容，是用户本轮输入的原文。",
-    ]
-    return wrap_bridge_context(instruction, message)
-
-
-def planning_detail_digest(requirement: dict[str, Any] | None) -> str:
-    """需求正文的指纹。续聊回合靠它判断用户是不是在面板上改过需求详情。"""
-    detail = str((requirement or {}).get("detail") or "")
-    return hashlib.sha256(detail.encode("utf-8")).hexdigest()
-
-
-# 新建聊天首回合结束后用一轮短会话补标题。标题既用于需求，也用于任务会话；
-# 保持简短，才能在左侧会话列表完整辨认。
-CONVERSATION_TITLE_TIMEOUT_SECONDS = 3 * 60
-MAX_CONVERSATION_TITLE_CHARS = 30
-
-
-def build_conversation_title_prompt(user_message: str, reply: str) -> str:
-    """根据新聊天的首条用户消息和首轮回复，生成一个面板会话标题。
-
-    命名是面板内务，不能出现在用户可见的正式聊天里，也不应让模型读取代码或执行命令。
-    """
-    return wrap_bridge_context(
-        [
-            "这是交付任务面板的「聊天自动命名」回合：请根据一条新聊天的首轮沟通内容起标题。",
-            "",
-            "用户的首条需求或任务说明:",
-            (user_message or "").strip() or "（用户本轮没有文字输入）",
-            "",
-            "AI 首轮回复（可能很长，只取其中的主旨）:",
-            (reply or "").strip()[:4000] or "（本轮没有回复正文）",
-            "",
-            "要求:",
-            f"- 只输出标题本身，一行，不超过 {MAX_CONVERSATION_TITLE_CHARS} 个字，用中文。",
-            "- 标题要说清本次要做的事，能在聊天列表里被一眼认出，不要写成「需求」「任务」「优化」这类空话。",
-            "- 回复正文可能还没生成，这时只按用户的说明起名，不要等也不要追问。",
-            "- 不要引号、句号、序号、Markdown 记号，不要任何解释或前后缀。",
-            "- 不要读代码、不要执行命令、不要修改任何文件，也不要调用任务面板命令。",
-        ],
-        "请为这条聊天起一个标题，只回标题本身。",
-    )
-
-
-def conversation_title_of(text: str) -> str:
-    """把命名回合的回复收敛成一行标题：模型偶尔会带上引号、前缀或多余的说明。"""
-    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
-    # 「标题如下：」这类引导行不是标题，丢掉之后再取第一行。
-    lines = [line for line in lines if not line.endswith((":", "："))] or lines
-    if not lines:
-        return ""
-    candidate = re.sub(r"^[#>*\-\d.、\s]+", "", lines[0])
-    candidate = re.sub(r"^(?:标题|聊天标题|会话标题|需求标题|需求名称|任务标题)\s*[:：]\s*", "", candidate)
-    candidate = candidate.strip("*_`\"'“”‘’「」《》【】 \t").strip()
-    candidate = candidate.rstrip("。.！!")
-    return candidate[:MAX_CONVERSATION_TITLE_CHARS]
-
-
-# 需求名称留空时仍复用同一套标题生成和清洗规则；保留旧函数名，避免插件扩展脚本失效。
-REQUIREMENT_NAME_TIMEOUT_SECONDS = CONVERSATION_TITLE_TIMEOUT_SECONDS
-MAX_REQUIREMENT_NAME_CHARS = MAX_CONVERSATION_TITLE_CHARS
-
-
-def build_requirement_name_prompt(user_message: str, reply: str) -> str:
-    return build_conversation_title_prompt(user_message, reply)
-
-
-def requirement_name_of(text: str) -> str:
-    return conversation_title_of(text)
-
-
-# 开聊那一刻先用首条消息的前几个字占住需求名称：起名要跑一轮模型，最快也要几秒，
-# 这几秒里面板上只能显示需求编号，用户看着就像没生效。占位名等 AI 起好名再换掉。
-MAX_REQUIREMENT_PLACEHOLDER_CHARS = 10
-
-
-def placeholder_requirement_name(user_message: str) -> str:
-    """用户首条消息的前几个字，去掉附件上下文和 Markdown 记号后取头一段。"""
-    text = text_without_attachment_context(str(user_message or ""))
-    text = re.sub(r"^[#>*\-\d.、\s]+", "", " ".join(text.split()))
-    text = text.strip("*_`\"'“”‘’「」《》【】 \t")
-    return text[:MAX_REQUIREMENT_PLACEHOLDER_CHARS].strip()
-
-
-def build_planning_follow_up_prompt(
-    program_id: int,
-    context: dict[str, Any],
-    message: str,
-    selected_stage: str = "",
-    selected_module: str = "",
-    selected_kind: str = "",
-    requirement: dict[str, Any] | None = None,
-    workspace: Path | None = None,
-    mention_context: list[str] | None = None,
-    include_detail: bool = False,
-    thread_id: str = "",
-) -> str:
-    """同一条需求拆解会话的追加回合，只带会变的和丢不起的那几项。
-
-    首轮的角色说明、勘察纪律、文档目录纪律和现有里程碑/模块明细不再逐轮重发；这里保留三类：
-    随轮次变化的（已选里程碑/模块、改动过的需求正文、本轮 @ 的实体）、
-    被会话压缩掉就会出事的（本需求已建任务清单、需求大纲读写纪律），
-    以及取值必须合法的现有里程碑/模块键。确认写入那一轮仍走 build_planning_prompt 全量。
-    """
-    requirement = requirement or {}
-    requirement_key = str(requirement.get("requirementKey") or "")
-    requirement_item_lines = [
-        f"- {item.get('itemKey')}: {item.get('title') or item.get('itemKey')}"
-        f"（{item.get('phase') or '-'}/{item.get('status') or '-'}；收益：{'、'.join(item.get('benefitTags') or []) or '未标注'}）"
-        for item in context.get("items") or []
-        if requirement_key and str(item.get("requirementKey") or "") == requirement_key
-    ][:100]
-    stage_keys = [str(item.get("stageKey") or "") for item in context.get("stages") or [] if item.get("stageKey")]
-    module_keys = [str(item.get("moduleKey") or "") for item in context.get("modules") or [] if item.get("moduleKey")]
-    split_tasks = bool(requirement.get("splitTasks", True))
-    outline_path = requirement_outline_path_of(requirement_key).as_posix() if requirement_key else ""
-    document_directory = requirement_document_directory_of(requirement_key).as_posix() if requirement_key else ""
-    temp_path = (
-        planning_temp_document_path(str(requirement.get("name") or ""), requirement_key, thread_id)
-        if thread_id else None
-    )
-    # 正式大纲在预览期不落盘；由聊天级 temp.md 接管压缩后的上下文。
-    temp_written = bool(temp_path and temp_path.is_file())
-    detail_lines = (
-        [
-            "需求详细信息（用户已在面板上改过，以这一版为准）:"
-            if include_detail
-            else "需求详细信息（聊天过程摘要尚未落盘，这里重发一份，避免会话压缩后丢失）:",
-            str(requirement.get("detail") or "（未填写）"),
-        ]
-        if include_detail or not temp_written
-        else [
-            "需求详细信息与本会话首轮给出的一致，没有变化；"
-            f"若上下文里已经找不到，就去读 `{temp_path.as_posix()}` 里的上一轮总结。",
-        ]
-    )
-    prototype_lines = (
-        [
-            "本需求已启用“拆解后生成原型图”：预览的任务表最后必须固定列出一条“生成需求原型图”任务，"
-            "并说明它依赖本轮其余任务。",
-        ]
-        if bool(requirement.get("generatePrototype")) else []
-    )
-    document_lines = (
-        [
-            f"需求文档目录: `{document_directory}/`（`需求大纲.md` 是主文档）。用户要独立流程图、图表、HTML 等资产时，"
-            "写成该目录下的独立文件，不要写进 `.codex/visualizations`、临时目录或工作区外路径；除该目录外不修改工作区其他文件。",
-        ]
-        if document_directory else []
-    )
-    lines = [
-        "这是同一条需求拆解会话的追加回合：需求和梳理模式都没有变化，本轮仍然只做梳理和预览，"
-        "禁止执行 create-task-board-tasks、create-task-board-stage、create-task-board-module，也不要绕过任务面板写入限制。",
-        "首轮已经交代过角色、技能、勘察纪律和输出格式，这里不再重复，按本会话已确认的约定继续；"
-        "拆解结论仍然要落在工作目录里的真实模块、目录或接口上。",
-        workspace_instruction(workspace),
-        f"项目 program_id: {program_id}",
-        f"需求键 requirement_key: {requirement_key or '未指定'}",
-        f"需求名称: {requirement.get('name') or '未命名'}",
-        f"拆解成多条任务: {'是' if split_tasks else '否（预览里只输出一条覆盖整条需求的任务，不要拆分也不要串依赖）'}",
-        *detail_lines,
-        f"已选里程碑: {selected_stage or '未选择'}",
-        f"已选模块: {selected_module or '未选择'}",
-        f"任务类型偏好: {selected_kind or '由你判断'}",
-        f"现有里程碑键（取值只能从中选）: {'、'.join(stage_keys) or '无'}",
-        f"现有模块键（取值只能从中选）: {'、'.join(module_keys) or '无'}",
-        *requirement_outline_rule_lines(outline_path, False, temp_path.as_posix() if temp_path else ""),
-        *document_lines,
-        *prototype_lines,
-        *(mention_context or []),
-        "本需求已建任务:",
-        *(requirement_item_lines or ["- 无"]),
-        REQUIREMENT_SCOPE_RULE,
-        "预览里只列本轮打算新增的任务，不要重复上面已经存在的任务；"
-        "输出格式沿用首轮：先用 Markdown 表格列出「序号 / 任务标题 / 收益标签 / 负责人 / 里程碑 / 模块 / 类型 / 前置依赖」，"
-        "再在表格下方逐条补充目标、范围和验收标准；"
-        "回复结尾照旧提示用户：确认无误后点「确认并写入」，要调整就直接回复修改意见。",
-        (
-            f"本会话如果被压缩过，上面提到的需求背景和既往结论你在上下文里可能已经找不到："
-            f"先读 `{temp_path.as_posix()}` 把上下文接回来再动手，不要凭印象往下接。"
-            if temp_path
-            else "本会话如果被压缩过，先向用户确认需求背景和既往结论，不要凭印象往下接。"
-        ),
-        "本上下文标记闭合之后的内容，是用户本轮输入的原文。",
-    ]
-    return wrap_bridge_context(lines, message)
-
-
-def build_requirement_testing_prompt(
-    program_id: int,
-    context: dict[str, Any],
-    requirement: dict[str, Any],
-    message: str,
-    workspace: Path | None = None,
-    test_case_only: bool = False,
-    follow_up: bool = False,
-    include_detail: bool = False,
-    mention_context: list[str] | None = None,
-) -> str:
-    """Give the requirement-level testing skill one requirement and its real task inventory."""
-    requirement_key = str(requirement.get("requirementKey") or "").strip()
-    requirement_items = [
-        item for item in context.get("items") or []
-        if str(item.get("requirementKey") or "") == requirement_key
-    ]
-    item_lines = [
-        f"- {item.get('itemKey')}: {item.get('title') or item.get('itemKey')}"
-        f"（{item.get('phase') or '-'}/{item.get('status') or '-'}；"
-        f"需求文档：{item.get('requirementDocumentPath') or '未生成'}；"
-        f"动作产物：{'有' if item.get('actionOutput') else '无'}；"
-        f"任务测试：{'有' if item.get('testingReport') else '无'}；"
-        f"测试用例：{item.get('testingCasesStatus') or 'todo'}）"
-        for item in requirement_items[:100]
-    ]
-    mode_lines = (
-        [
-            "这是交付任务面板的一次需求级「预先生成测试用例」回合。遵循 delivery-requirement-testing 技能的测试用例设计模式。",
-            "本回合只能读取需求、关联任务、代码和既有产物，设计范围、准备、顺序、步骤、预期及证据；绝不调用接口、UI、脚本或构建命令执行真实测试。",
-            "不得输出验收判定、不得创建或覆盖测试报告、不得修改业务实现。",
-        ]
-        if test_case_only else [
-            "这是交付任务面板的一次需求总体测试。遵循 delivery-requirement-testing 技能执行真实测试，不要执行任务拆解命令或修改业务实现。",
-            "先读取已有 doc/test/<需求键>/测试用例.md 并按其中用例真实验证；没有明确执行和证据，不得写通过。",
-        ]
-    )
-    final_instruction = (
-        "最终必须把测试用例写入 doc/test/<需求键>/测试用例.md；按需写入测试计划.md，最终回复第一行必须为“测试用例已生成”。"
-        if test_case_only else
-        "最终必须把完整报告写入 doc/test/<需求键>/测试报告.md，并且最终回复第一行给出“验收判定：通过 / 不通过 / 受阻”。"
-    )
-    if follow_up:
-        # 关联任务清单每轮都要刷新：任务状态、产物和报告在测试过程中会变，那是这类会话真正的工作数据。
-        # 重复的技能说明、目录划分和需求正文才是该省的。
-        return wrap_bridge_context(
-            [
-                "这是同一条需求测试会话的追加回合，模式没变："
-                + (
-                    "仍然只设计用例，绝不调用接口、UI、脚本或构建命令执行真实测试，不得输出验收判定或覆盖测试报告。"
-                    if test_case_only
-                    else "按已有用例真实验证，没有明确执行和证据不得写通过。"
-                ),
-                "首轮已交代过技能、目录划分和输出要求，这里不再重复，按本会话已确认的约定继续。",
-                workspace_instruction(workspace),
-                f"项目 program_id: {program_id}",
-                f"需求键 requirement_key: {requirement_key}",
-                *(
-                    ["需求详情（用户已在面板上改过，以这一版为准）:", str(requirement.get("detail") or "（未填写）")]
-                    if include_detail
-                    else ["需求详情与本会话首轮一致，没有变化；若上下文里已经找不到，读本需求的大纲和任务文档接回来。"]
-                ),
-                f"需求总体测试资产目录: doc/test/{requirement_key}/（计划、报告、脚本、夹具和证据都归档到这里）。",
-                "关联任务清单（状态每轮刷新；按需读对应文档、产物和代码，清单不是完整上下文）：",
-                *(item_lines or ["- 该需求目前没有关联任务；先说明总体测试范围和受阻项，不要假装已覆盖任务链路。"]),
-                final_instruction,
-                "本会话如果被压缩过，先读上面的测试资产目录和任务文档把上下文接回来，不要凭印象往下接。",
-                *(mention_context or []),
-                "本上下文标记闭合之后的内容，是用户本轮补充的测试要求、环境或数据说明。",
-            ],
-            message,
-        )
-    return wrap_bridge_context(
-        [
-            *mode_lines,
-            workspace_instruction(workspace),
-            f"项目 program_id: {program_id}",
-            f"需求键 requirement_key: {requirement_key}",
-            f"需求名称: {requirement.get('name') or '未命名'}",
-            "需求详情:", str(requirement.get("detail") or "（未填写）"),
-            f"需求总体测试资产目录: doc/test/{requirement_key}/（测试计划、报告、脚本、夹具和证据必须归档到此处）",
-            f"需求文档目录: doc/requirements/{requirement_key}/（支持多份需求文档）；需求原型目录: doc/requirements/{requirement_key}/prototype/（支持多个 HTML）；需求测试目录: doc/test/{requirement_key}/（支持多份测试文档）。",
-            "需求大纲、原型和测试是三个独立栏目：不要把测试计划或报告写进需求大纲/原型目录，也不要把独立流程图写进测试资产目录。",
-            "关联任务清单（先按需读对应文档、产物和代码；清单不是完整上下文）：",
-            *(item_lines or ["- 该需求目前没有关联任务；先说明总体测试范围和受阻项，不要假装已覆盖任务链路。"]),
-            final_instruction,
-            *(mention_context or []),
-            "本上下文标记闭合之后的内容，是用户本轮补充的测试要求、环境或数据说明。",
-        ],
-        message,
-    )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+from delivery_bridge.prompts.common import (
+    PLANNING_SKILL,
+    PHASE_SKILLS,
+    REQUIREMENT_SCOPE_RULE,
+    document_path_of,
+    document_revision_rule,
+    follow_up_context_lines,
+    prototype_directory_of,
+    readable_document,
+    requirement_document_catalog,
+    sibling_document_lines,
+    git_branch_lines,
+    requirement_document_rule_lines,
+)
+
+
+
+
+
+
+
+
+
+
+from delivery_bridge.prompts.task import (
+    build_task_prompt,
+    build_task_testing_cases_prompt,
+    fine_tuning_skill_instruction,
+    build_requirement_fine_tuning_prompt,
+    build_task_fine_tuning_prompt,
+)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+from delivery_bridge.prompts.conversation import (
+    CONVERSATION_TITLE_TIMEOUT_SECONDS,
+    REQUIREMENT_NAME_TIMEOUT_SECONDS,
+    MAX_REQUIREMENT_NAME_CHARS,
+    MAX_CONVERSATION_TITLE_CHARS,
+    MAX_REQUIREMENT_PLACEHOLDER_CHARS,
+    build_conversation_prompt,
+    build_conversation_title_prompt,
+    conversation_title_of,
+    build_requirement_name_prompt,
+    requirement_name_of,
+    placeholder_requirement_name,
+)
+
+
+from delivery_bridge.prompts.planning import (
+    planning_temp_segment,
+    planning_temp_document_path,
+    write_planning_temp_summary,
+    delete_planning_temp_summary,
+    planning_temp_rule_lines,
+    requirement_outline_rule_lines,
+    build_planning_prompt,
+    planning_detail_digest,
+    build_planning_follow_up_prompt,
+)
+
+
 
 
 
@@ -2091,536 +1099,43 @@ from delivery_bridge.environments import (
     environment_selection_of,
     validate_environment_setup_payload,
     environment_command_for,
-    VERSION_RE,
+    PROBE_VERSION_RE,
     version_at_least,
     environment_probe_status,
     environment_probe_statuses,
 )
 
 
-def build_environment_setup_prompt(
-    use_git: bool, environments: list[dict[str, Any]], message: str, first_turn: bool, host: str = "",
-) -> str:
-    """项目偏好「预设环境」的提示词：先检测，只补装缺的，装完把版本核一遍。
-
-    macOS 和 Windows 的命令名、包管理器、权限模型都不一样，所以清单按本机系统生成，
-    只把该系统那一套命令写进去，不给执行器留自由发挥的余地。
-    """
-    host = host or host_platform()
-    label = host_platform_label(host)
-    privilege = "管理员" if host == "windows" else "sudo"
-    if not first_turn:
-        return wrap_bridge_context(
-            [
-                f"这是「预设环境」会话的续聊，本机是 {label}，继续按既定顺序把本机全局环境补齐。",
-                "已经装好并且版本达标的环境不要重装、不要升级、不要改用户已有的版本管理器配置。",
-                "每装完一项都要确认它的可执行文件目录已经持久化写进本机 PATH 环境变量（新开终端仍然生效），"
-                "Git、Node.js、Python 尤其要逐个核对；缺了就补写，补完新开终端复检。",
-                f"需要 {privilege} 权限的命令，如果当前拿不到权限，就把命令原样交给用户执行，然后等用户回话。",
-                "本上下文标记闭合之后的内容，是用户本轮说的话。",
-            ],
-            message,
-        )
-    checklist = []
-    if use_git:
-        checklist.append(
-            f"- Git：先执行 `{environment_command_for(GIT_PRESET, 'probe', host)}` 检测；未安装才装"
-            f"（{environment_command_for(GIT_PRESET, 'install', host)}）。"
-            "装好后顺带确认 `git config --global user.name` 与 `git config --global user.email` 是否已配置，"
-            "缺了就问用户要，不要自己编。"
-            "随后检查 `~/.ssh/config` 中 `Host github.com` 的 `IdentityFile`，且对应 `.pub` 文件必须是有效 SSH 公钥。"
-            "已有有效 GitHub 密钥时不要重建、不要覆盖；没有有效配置时，生成新的 ed25519 密钥对"
-            " `~/.ssh/id_ed25519_github_delivery_task_planner`，并在配置文件最前面写入带"
-            " `delivery-task-planner GitHub SSH key` 标记的 `Host github.com` 配置块。"
-            "绝不读取、展示或输出私钥；最后只输出公钥，并明确提示用户将它添加到 GitHub 账户的 SSH keys。"
-        )
-    for entry in environments:
-        probe = environment_command_for(entry, "probe", host)
-        install = environment_command_for(entry, "install", host)
-        probe_text = f"`{probe}`" if probe else f"该环境在 {label} 上对应的版本命令"
-        requirement = f"版本要求 {entry['requirement']}" if entry.get("requirement") else "版本由用户在偏好设置里自定义，按字面理解"
-        install_text = f"（{label} 上装：{install}）" if install else f"（自定义项，按 {label} 的常规装法安装）"
-        checklist.append(
-            f"- {entry['label']}：先执行 {probe_text} 检测，{requirement}。"
-            f"低于要求或没装才安装/升级到满足要求的版本{install_text}。"
-        )
-    if host == "windows":
-        platform_rules = [
-            "7. 命令用 PowerShell 执行；包管理器优先 winget，没有 winget 再退到 scoop / choco 或官网安装包，并把选择理由说清楚。",
-            "8. 装完要开新的 PowerShell 会话或先刷新 PATH（`$env:Path = [System.Environment]::GetEnvironmentVariable('Path','Machine') "
-            "+ ';' + [System.Environment]::GetEnvironmentVariable('Path','User')`）再复检，"
-            "否则复检读到的是旧 PATH，会把装好的环境误判成没装上。",
-            "9. Windows 的 PATH 必须写进持久化的环境变量，不能只用 `set` 或 `$env:Path=`（那只对当前会话有效）："
-            "用 `[System.Environment]::SetEnvironmentVariable('Path', $新值, 'User')` 追加（拿得到管理员权限时才用 'Machine'），"
-            "$新值 由先读出的原值加分号拼上新目录得到，重复的目录不要再加。"
-            "常见目录：Git 是 `C:\\Program Files\\Git\\cmd`，Node.js 是 `C:\\Program Files\\nodejs`（npm 全局包在 `%APPDATA%\\npm`），"
-            "Python 是安装目录本身和它下面的 `Scripts`（用 winget 装的一般在 `%LOCALAPPDATA%\\Programs\\Python\\PythonXXX`）；"
-            "实际目录以 `where.exe git`、`where.exe node`、`py -3 -c \"import sys;print(sys.prefix)\"` 的真实输出为准，不要照抄路径。",
-            "10. Windows 上 Python 的命令是 `py -3` 或 `python`，没有 `python3`；"
-            "如果 `python` 打开的是微软商店占位程序，说明真实 Python 目录没进 PATH 或被商店别名挡住，"
-            "要在「应用执行别名」里关掉 python.exe / python3.exe 的别名并把真实目录加进 PATH。"
-            "winget 触发 UAC 弹窗时当前会话无法确认，直接把命令交给用户以管理员身份运行。",
-        ]
-    elif host == "macos":
-        platform_rules = [
-            "7. 包管理器用 Homebrew；没有 brew 就先把官方安装命令交给用户，或退到官网安装包，并把选择理由说清楚。",
-            "8. Apple Silicon 的 brew 前缀是 /opt/homebrew、Intel 是 /usr/local；装完 `which` 找不到命令时，"
-            "先确认对应的 bin 目录在 PATH 里再判定失败。"
-            "需要补 PATH 时写进用户默认 shell 的配置文件（zsh 是 `~/.zshrc`，bash 是 `~/.bash_profile`），"
-            "以 `export PATH=\"<新目录>:$PATH\"` 追加，写之前先确认文件里还没有同一行，然后 `source` 或新开终端复检。",
-            "9. 不要用 sudo 跑 brew。",
-        ]
-    else:
-        platform_rules = [
-            "7. 按发行版选包管理器（Debian/Ubuntu 用 apt，RHEL/CentOS 用 yum/dnf）；"
-            "官方源版本低于要求时改用官网安装包或版本管理器，并把选择理由说清楚。",
-            "8. 需要补 PATH 时写进用户默认 shell 的配置文件（`~/.bashrc` 或 `~/.zshrc`），"
-            "以 `export PATH=\"<新目录>:$PATH\"` 追加，写之前先确认没有重复行，然后新开终端复检。",
-        ]
-    return wrap_bridge_context(
-        [
-            "这是交付任务面板「项目管理 → 偏好设置 → 高级设置 → 预设环境」发起的一次本机环境预设。",
-            "它装的是本机全局环境，不属于任何项目：不要读取、修改或提交任何业务仓库的代码，"
-            "也不要执行任务面板的任务拆解、执行或测试命令。",
-            f"本机系统是 {label}，下面的命令已经按 {label} 给好了，照着执行，不要换成别的系统那一套。",
-            f"本轮 cwd 是一个专用空目录：{environment_setup_workspace()}；只在需要落临时文件时用它。",
-            "只做下面这份清单，逐项先检测再动手，并把执行过的命令和真实输出讲清楚：",
-            *checklist,
-            "硬约束：",
-            "1. 只装缺的。检测到已安装且版本满足要求的，直接跳过并说明当前版本，"
-            "绝不重装、降级或顶掉用户已有的版本管理器（nvm / nvm-windows / pyenv / asdf / conda 等）配置。",
-            "2. 全局安装，不要建项目级虚拟环境。",
-            f"3. 需要 {privilege} 权限而当前拿不到时不要硬闯，把命令原样交给用户执行，然后等用户回话。",
-            "4. 装完再跑一次检测命令核对版本，用一个表格列出每项环境的「安装前状态 / 处理动作 / 安装后版本」。",
-            "5. 每一项装完都必须把它的可执行文件目录持久化写进本机 PATH 环境变量，"
-            "Git、Node.js、Python 三项无论是不是本轮新装的，都要逐个确认 PATH 里有；"
-            "npm 全局 bin、Python 的 Scripts/bin 这类附带目录同样要在 PATH 里。"
-            "只在当前会话里临时设置不算数，必须新开一个终端复检命令仍然可用。"
-            "追加 PATH 前先读出原值，只做追加和去重，绝不整体覆盖用户已有的 PATH。",
-            "6. 清单以外的环境一律不装。",
-            *platform_rules,
-            "最终回复末尾单独给出「下一步」，写清还需要用户自己动手的事项；全部就绪就明说无需额外操作。",
-            "本上下文标记闭合之后的内容，是用户本轮补充的说明。",
-        ],
-        message,
-    )
-
-def validate_planning_payload(value: Any) -> tuple[int, str, str, bool, str, str, str, str, str, bool, dict[str, Any], list[str], list[dict[str, str]], bool]:
-    if not isinstance(value, dict):
-        raise BridgeFailure("请求体必须是 JSON 对象")
-    program_id = program_id_of(value.get("programId"))
-    message = str(value.get("message") or "").strip()
-    thread_id = str(value.get("threadId") or "").strip()
-    selected_stage = str(value.get("stageKey") or "").strip()
-    selected_module = str(value.get("moduleKey") or "").strip()
-    selected_kind = str(value.get("kind") or "").strip()
-    model = str(value.get("model") or "").strip()
-    provider = ai_provider_of(value)
-    reasoning_effort = reasoning_effort_of(value, provider)
-    fast_mode = fast_mode_of(value, provider)
-    requirement = planning_requirement_of(value)
-    attachment_ids = value.get("attachmentIds") or []
-    if not isinstance(attachment_ids, list) or len(attachment_ids) > MAX_CONVERSATION_ATTACHMENTS:
-        raise BridgeFailure("附件数量无效")
-    attachment_ids = [str(attachment_id).strip() for attachment_id in attachment_ids if str(attachment_id).strip()]
-    chat_references = conversation_references_of(value.get("chatReferences"))
-    # 只带附件不写字也是一次有效的追问，图片本身就是需求说明。
-    if not message and not attachment_ids:
-        raise BridgeFailure("请输入要拆解的需求")
-    if len(message) > 32 * 1024:
-        raise BridgeFailure("需求内容不能超过 32KB")
-    if len(thread_id) > 255 or len(model) > 128:
-        raise BridgeFailure("会话或模型标识无效")
-    if selected_kind and selected_kind not in {"gap", "capability", "asset"}:
-        raise BridgeFailure("任务类型无效")
-    return (
-        program_id,
-        message,
-        thread_id,
-        bool(value.get("newConversation")),
-        selected_stage,
-        selected_module,
-        selected_kind,
-        model,
-        reasoning_effort,
-        fast_mode,
-        requirement,
-        attachment_ids,
-        chat_references,
-        # 只有面板上的「确认并写入」会带上这个标记，其余轮次一律是只读的预览。
-        bool(value.get("confirmWrite")),
-    )
+from delivery_bridge.prompts.environment import (
+    build_environment_setup_prompt,
+)
 
 
-def session_kind_of(row: Any) -> str:
-    """会话表里这一行属于哪类会话；老数据没写 kind，一律按需求测试处理。"""
-    metadata = row.get("metadata") if isinstance(row, dict) else None
-    if not isinstance(metadata, dict):
-        return "requirement-testing"
-    return str(metadata.get("kind") or "requirement-testing").strip() or "requirement-testing"
 
 
-def review_scope_of(value: Any) -> list[dict[str, Any]]:
-    """前端勾选的 review 范围：一个 Git 工程一条，files 为空表示这个工程整体都要看。"""
-    if value is None:
-        return []
-    if not isinstance(value, list):
-        raise BridgeFailure("review 范围必须是数组")
-    if len(value) > 64:
-        raise BridgeFailure("review 范围最多 64 个工程")
-    scope: list[dict[str, Any]] = []
-    for raw in value:
-        if not isinstance(raw, dict):
-            raise BridgeFailure("review 范围里的工程必须是对象")
-        path = str(raw.get("path") or "").strip().strip("/")
-        name = str(raw.get("name") or "").strip() or (path or "根工程")
-        if len(path) > 255 or ".." in Path(path).parts:
-            raise BridgeFailure("review 范围里的工程路径无效")
-        files = raw.get("files") or []
-        if not isinstance(files, list) or len(files) > 500:
-            raise BridgeFailure("单个工程的 review 文件最多 500 个")
-        cleaned = []
-        for item in files:
-            file_path = str(item or "").strip()
-            if not file_path:
-                continue
-            if len(file_path) > 512 or ".." in Path(file_path).parts:
-                raise BridgeFailure("review 范围里的文件路径无效")
-            cleaned.append(file_path)
-        scope.append({
-            "path": path, "name": name, "files": cleaned,
-            "changed": max(int(raw.get("changed") or 0), len(cleaned)),
-        })
-    return scope
 
 
-def review_scope_lines(scope: list[dict[str, Any]]) -> list[str]:
-    """把勾选范围铺成提示词里的清单：多工程时逐个列，单工程时直接列文件。"""
-    if not scope:
-        return ["- 用户没有勾选任何变更范围；先说明这一点并让用户确认范围，不要自行扩大到整个仓库。"]
-    lines: list[str] = []
-    for project in scope:
-        location = project["path"] or "（根工程）"
-        lines.append(f"- 工程 {project['name']}（相对工作目录路径：{location}）：变更 {project['changed']} 个文件")
-        for file_path in project["files"][:200]:
-            lines.append(f"  - {file_path}")
-        if len(project["files"]) > 200:
-            lines.append(f"  - …… 还有 {len(project['files']) - 200} 个文件，按同一范围自行读取")
-        if not project["files"]:
-            lines.append("  - 用户按工程整体勾选，这个工程里所有未提交改动都在范围内")
-    return lines
 
 
-def requirement_review_report_relative_path(requirement_key: str) -> Path:
-    return Path("doc") / "review" / requirement_key / "review报告.md"
 
 
-def build_requirement_review_prompt(
-    program_id: int,
-    requirement: dict[str, Any],
-    message: str,
-    workspace: Path | None,
-    scope: list[dict[str, Any]],
-    follow_up: bool = False,
-    generate_report: bool = False,
-    mention_context: list[str] | None = None,
-) -> str:
-    """代码 review 会话的提示词：范围来自用户勾选，规则是固定三条加用户本轮补充。"""
-    requirement_key = str(requirement.get("requirementKey") or "").strip()
-    excluded = "、".join(f"{name}/" for name in REVIEW_EXCLUDED_DIRECTORIES)
-    rules = [
-        f"规则一（范围排除）：{excluded} 目录下的内容一律不 review，即使它们出现在变更清单里也跳过，也不要因为它们没更新而提意见。",
-        "规则二（项目技能）：动手前先加载当前工作目录里项目自己的技能（如 backend-development、web-development 等），"
-        "按技能里写明的分层、依赖方向、命名、封装和接口约定来判断对错；技能没覆盖的地方再看仓库现有实现的通行写法，不要套用通用最佳实践下结论。",
-        "规则三（用户规则）：用户在本轮聊天里写的检查重点和额外规则，优先级最高，与上面两条叠加执行。",
-        "规则四（评审准则）：下面这份通用评审准则与上面三条叠加执行；准则里的输出格式要求，"
-        "与本轮「输出要求」冲突时以本轮输出要求为准。",
-        REVIEW_GUIDELINES,
-    ]
-    report_path = requirement_review_report_relative_path(requirement_key).as_posix()
-    output = (
-        (
-            "本轮是「确认生成 review 报告」：按上面的范围和规则把完整评审结论写成报告，"
-            f"必须写入 `{report_path}`（同一条需求重复生成就覆盖这一份），"
-            "报告里先写本轮范围和结论摘要，再按工程和文件列问题：每条写明文件路径、行号或函数、问题、影响、"
-            "具体可执行的修改建议，并标注严重级别（阻断 / 建议 / 提示）；最终回复第一行必须是“review 报告已生成”。"
-            "本轮的产出是这份报告：用户没有在本轮明确要求改代码，就不要动业务文件；"
-            "无论是否改代码，都不要提交、推送或切换分支。"
-        )
-        if generate_report else
-        "输出要求：先说明本轮实际读过的范围，再按工程和文件给出问题清单；"
-        "每条写明文件路径、行号或函数、问题、影响，以及具体可执行的修改建议，并标注严重级别（阻断 / 建议 / 提示）；"
-        "最后给一句总体结论。本轮不写报告文件。"
-        "用户没有要求动代码时就只给意见；一旦用户要求修改（例如「按上面的意见改」或点名其中几条），"
-        "就直接改工作区里的业务文件，改完逐条说明改了哪些文件、对应哪条意见。"
-        "无论是否改代码，都不要提交、推送或切换分支。"
-    )
-    if follow_up:
-        return wrap_bridge_context(
-            [
-                "这是同一条需求 review 会话的追加回合：默认只读代码给意见；"
-                "用户要求修改时可以直接改工作区里的业务文件，改完说明改了哪些文件、对应哪条意见。"
-                "始终不提交、不推送、不切换分支。",
-                "首轮已交代过规则和输出格式，这里不再重复；下面是本轮最新的变更范围（可能和上一轮不同，以这份为准）。",
-                output,
-                workspace_instruction(workspace),
-                f"项目 program_id: {program_id}",
-                f"需求键 requirement_key: {requirement_key}",
-                "本轮 review 范围：",
-                *review_scope_lines(scope),
-                f"提醒：{excluded} 目录始终不在 review 范围内。",
-                *(mention_context or []),
-                "本上下文标记闭合之后的内容，是用户本轮补充的 review 规则或检查重点。",
-            ],
-            message,
-        )
-    return wrap_bridge_context(
-        [
-            "这是交付任务面板的一次代码 review 会话：读当前工作区里这条需求的未提交改动，给出评审意见。",
-            "这个会话对工作区有写权限：用户要求按 review 意见修改，或在聊天里直接提出改动要求时，就动手改业务文件；"
-            "用户没提修改要求的回合只给意见，不要自作主张改代码。",
-            "任何情况下都不要执行任务拆解、提交、推送或切分支，也不要生成任务或测试用例。",
-            workspace_instruction(workspace),
-            f"项目 program_id: {program_id}",
-            f"需求键 requirement_key: {requirement_key}",
-            f"需求名称: {requirement.get('name') or '未命名'}",
-            "需求详情:", str(requirement.get("detail") or "（未填写）"),
-            "本轮 review 范围（用户在面板上勾选，逐个工程列出）：",
-            *review_scope_lines(scope),
-            "review 规则：",
-            *rules,
-            output,
-            *(mention_context or []),
-            "本上下文标记闭合之后的内容，是用户本轮补充的 review 规则或检查重点。",
-        ],
-        message,
-    )
 
 
-def validate_requirement_review_payload(value: Any) -> tuple[int, str, str, str, bool, str, str, bool, list[dict[str, Any]], list[dict[str, str]], bool]:
-    if not isinstance(value, dict):
-        raise BridgeFailure("请求体必须是 JSON 对象")
-    program_id = program_id_of(value.get("programId"))
-    requirement_key = str(value.get("requirementKey") or "").strip()
-    message = str(value.get("message") or "").strip()
-    thread_id = str(value.get("threadId") or "").strip()
-    model = str(value.get("model") or "").strip()
-    provider = ai_provider_of(value)
-    reasoning_effort = reasoning_effort_of(value, provider)
-    fast_mode = fast_mode_of(value, provider)
-    scope = review_scope_of(value.get("scope"))
-    if not program_id or not requirement_key or len(requirement_key) > 64:
-        raise BridgeFailure("缺少或无效的项目、需求标识")
-    if not message:
-        raise BridgeFailure("请输入本轮 review 的重点或规则")
-    if len(message) > 32 * 1024:
-        raise BridgeFailure("review 要求不能超过 32KB")
-    if len(thread_id) > 255 or len(model) > 128:
-        raise BridgeFailure("会话或模型标识无效")
-    return (
-        program_id, requirement_key, message, thread_id, bool(value.get("newConversation")), model,
-        reasoning_effort, fast_mode, scope, conversation_references_of(value.get("chatReferences")),
-        bool(value.get("generateReport")),
-    )
 
 
-def validate_requirement_testing_payload(value: Any) -> tuple[int, str, str, str, bool, str, str, bool, list[str], list[dict[str, str]], bool]:
-    if not isinstance(value, dict):
-        raise BridgeFailure("请求体必须是 JSON 对象")
-    program_id = program_id_of(value.get("programId"))
-    requirement_key = str(value.get("requirementKey") or "").strip()
-    message = str(value.get("message") or "").strip()
-    thread_id = str(value.get("threadId") or "").strip()
-    model = str(value.get("model") or "").strip()
-    provider = ai_provider_of(value)
-    reasoning_effort = reasoning_effort_of(value, provider)
-    fast_mode = fast_mode_of(value, provider)
-    attachment_ids = value.get("attachmentIds") or []
-    if not program_id or not requirement_key or len(requirement_key) > 64:
-        raise BridgeFailure("缺少或无效的项目、需求标识")
-    if not isinstance(attachment_ids, list) or len(attachment_ids) > MAX_CONVERSATION_ATTACHMENTS:
-        raise BridgeFailure("附件数量无效")
-    attachment_ids = [str(attachment_id).strip() for attachment_id in attachment_ids if str(attachment_id).strip()]
-    if not message and not attachment_ids:
-        raise BridgeFailure("请输入测试要求或上传测试资料")
-    if len(message) > 32 * 1024:
-        raise BridgeFailure("测试要求不能超过 32KB")
-    if len(thread_id) > 255 or len(model) > 128:
-        raise BridgeFailure("会话或模型标识无效")
-    return (
-        program_id, requirement_key, message, thread_id, bool(value.get("newConversation")), model,
-        reasoning_effort, fast_mode, attachment_ids, conversation_references_of(value.get("chatReferences")),
-        bool(value.get("testCaseOnly")),
-    )
 
 
-def validate_task_testing_cases_payload(value: Any) -> tuple[int, str, str, str, bool, str, str, bool]:
-    if not isinstance(value, dict):
-        raise BridgeFailure("请求体必须是 JSON 对象")
-    program_id = program_id_of(value.get("programId"))
-    item_key = str(value.get("itemKey") or "").strip()
-    message = str(value.get("message") or "").strip()
-    thread_id = str(value.get("threadId") or "").strip()
-    model = str(value.get("model") or "").strip()
-    provider = ai_provider_of(value)
-    if not item_key or len(item_key) > 64:
-        raise BridgeFailure("缺少或无效的项目、任务标识")
-    if len(message) > 32 * 1024:
-        raise BridgeFailure("测试要求不能超过 32KB")
-    if len(thread_id) > 255 or len(model) > 128:
-        raise BridgeFailure("会话或模型标识无效")
-    return (
-        program_id, item_key, message, thread_id, bool(value.get("newConversation")), model,
-        reasoning_effort_of(value, provider), fast_mode_of(value, provider),
-    )
 
 
-def validate_fine_tuning_payload(
-    value: Any, scope: str, message_required: bool = True,
-) -> tuple[int, str, str, str, bool, str, str, str, bool]:
-    """Validate the common free-form refinement request without introducing task actions."""
-    if not isinstance(value, dict):
-        raise BridgeFailure("请求体必须是 JSON 对象")
-    program_id = program_id_of(value.get("programId"))
-    key_name = "requirementKey" if scope == "requirement" else "itemKey"
-    subject_name = "需求" if scope == "requirement" else "任务"
-    key = str(value.get(key_name) or "").strip()
-    message = str(value.get("message") or "").strip()
-    thread_id = str(value.get("threadId") or "").strip()
-    model = str(value.get("model") or "").strip()
-    provider = ai_provider_of(value)
-    if not program_id or not key or len(key) > 64:
-        raise BridgeFailure(f"缺少或无效的项目、{subject_name}标识")
-    if message_required and not message:
-        raise BridgeFailure("请输入微调要求")
-    if len(message) > 32 * 1024:
-        raise BridgeFailure("微调要求不能超过 32KB")
-    if len(thread_id) > 255 or len(model) > 128:
-        raise BridgeFailure("会话或模型标识无效")
-    return (
-        program_id, key, message, thread_id, bool(value.get("newConversation")), model,
-        provider, reasoning_effort_of(value, provider), fast_mode_of(value, provider),
-    )
 
 
-def planning_requirement_of(value: dict[str, Any]) -> dict[str, Any]:
-    """Normalize the requirement a planning turn belongs to.
-
-    拆解会话按需求分组：同一个项目下不同需求各自一条会话线，
-    requirementKey 为空时退回到项目级会话（需求层落地之前的老用法）。
-    """
-    requirement_key = str(value.get("requirementKey") or "").strip()
-    if len(requirement_key) > 64:
-        raise BridgeFailure("需求标识无效")
-    detail = str(value.get("requirementDetail") or "")
-    if len(detail) > 32 * 1024:
-        raise BridgeFailure("需求详情不能超过 32KB")
-    # 简易模式直接把任务放进动作执行，专业模式由用户选起始阶段，默认梳理需求。
-    start_phase = str(value.get("requirementStartPhase") or "").strip() or "requirement"
-    if start_phase not in {"requirement", "development", "testing"}:
-        raise BridgeFailure("起始阶段无效")
-    return {
-        "requirementKey": requirement_key,
-        "name": str(value.get("requirementName") or "").strip()[:255],
-        "detail": detail,
-        "owners": str(value.get("requirementOwners") or "").strip()[:512],
-        "assistants": str(value.get("requirementAssistants") or "").strip()[:512],
-        "startPhase": start_phase,
-        # 老客户端不带这个字段时按拆解处理，保持既有行为。
-        "splitTasks": bool(value.get("requirementSplitTasks", True)),
-        # 兼容已安装的旧面板字段；新面板使用 requirementPreGenerateTaskDocuments。
-        "preGenerateTaskDocuments": bool(
-            value.get("requirementPreGenerateTaskDocuments", value.get("requirementGenerateTaskOutline", False))
-        ),
-        "generatePrototype": bool(value.get("requirementGeneratePrototype")),
-        "references": planning_requirement_references_of(value.get("requirementReferences")),
-        "itemReferences": planning_requirement_item_references_of(value.get("requirementItemReferences")),
-    }
 
 
-def planning_requirement_references_of(value: Any) -> list[dict[str, str]]:
-    """Normalize the earlier requirements a new requirement @-mentions.
-
-    面板只传被 @ 的需求键和名字：正文按需从各自的大纲产物地址读取，
-    不把历史大纲整段塞进提示词。
-    """
-    if not isinstance(value, list):
-        return []
-    references: list[dict[str, str]] = []
-    seen: set[str] = set()
-    for entry in value[:20]:
-        if not isinstance(entry, dict):
-            continue
-        requirement_key = str(entry.get("requirementKey") or "").strip()
-        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", requirement_key) or requirement_key in seen:
-            continue
-        seen.add(requirement_key)
-        references.append({
-            "requirementKey": requirement_key,
-            "name": str(entry.get("name") or "").strip()[:255] or requirement_key,
-        })
-    return references
 
 
-def planning_requirement_item_references_of(value: Any) -> list[dict[str, str]]:
-    """Normalize the existing tasks a requirement detail @-mentions.
-
-    Titles are deliberately not accepted from the browser. The planning prompt resolves
-    each task key against the current project catalog before exposing its document path.
-    """
-    if not isinstance(value, list):
-        return []
-    references: list[dict[str, str]] = []
-    seen: set[str] = set()
-    for entry in value[:20]:
-        if not isinstance(entry, dict):
-            continue
-        item_key = str(entry.get("itemKey") or "").strip()
-        if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", item_key) or item_key in seen:
-            continue
-        seen.add(item_key)
-        references.append({"itemKey": item_key})
-    return references
 
 
-def conversation_references_of(value: Any) -> list[dict[str, str]]:
-    """Normalize objects selected from a task or requirement chat @ menu.
 
-    The browser can only nominate keys. The bridge later fetches every record again,
-    so labels or arbitrary text supplied by a browser never become task context.
-    """
-    if not isinstance(value, list):
-        return []
-    references: list[dict[str, str]] = []
-    seen: set[tuple[str, str]] = set()
-    for entry in value[:MAX_CONVERSATION_REFERENCES]:
-        if not isinstance(entry, dict):
-            continue
-        kind = str(entry.get("kind") or "").strip()
-        key = str(entry.get("key") or "").strip()
-        if kind == "file":
-            scope = str(entry.get("scope") or "").strip()
-            path = Path(key)
-            if (
-                scope not in {"requirement-outline", "requirement-testing", "requirement-prototype", "requirement-review"}
-                or not key
-                or len(key) > 512
-                or "\x00" in key
-                or "\\" in key
-                or path.is_absolute()
-                or ".." in path.parts
-                or (kind, key) in seen
-            ):
-                continue
-            seen.add((kind, key))
-            references.append({"kind": kind, "key": key, "scope": scope})
-            continue
-        pattern = r"[A-Za-z0-9_-]{1,64}" if kind == "requirement" else r"[A-Za-z0-9._-]{1,64}"
-        if kind not in {"requirement", "task"} or not re.fullmatch(pattern, key) or (kind, key) in seen:
-            continue
-        seen.add((kind, key))
-        references.append({"kind": kind, "key": key})
-    return references
 
 
 
@@ -2706,25 +1221,6 @@ def task_fine_tuning_executor_type(provider: str) -> str:
     return f"{ai_provider_of(provider)}-fine-tuning"
 
 
-def validate_requirement_prototype_payload(value: Any, message_required: bool = False) -> tuple[int, str, str, str, str, bool]:
-    if not isinstance(value, dict):
-        raise BridgeFailure("请求体必须是 JSON 对象")
-    program_id = program_id_of(value.get("programId"))
-    requirement_key = str(value.get("requirementKey") or "").strip()
-    requirement_prototype_directory_of(requirement_key)
-    message = str(value.get("message") or "").strip()
-    if message_required and not message:
-        raise BridgeFailure("请输入原型修改要求")
-    if len(message) > 32 * 1024:
-        raise BridgeFailure("原型修改要求不能超过 32KB")
-    thread_id = str(value.get("threadId") or "").strip()
-    if len(thread_id) > 255:
-        raise BridgeFailure("会话标识无效")
-    provider = ai_provider_of(value)
-    model = str(value.get("model") or "").strip()
-    if len(model) > 128:
-        raise BridgeFailure("模型标识不能超过 128 个字符")
-    return program_id, requirement_key, message, thread_id, provider, model
 
 
 def requirement_prototype_files(workspace: Path, requirement_key: str) -> tuple[str, list[dict[str, str]]]:
@@ -2767,62 +1263,19 @@ def requirement_prototype_files(workspace: Path, requirement_key: str) -> tuple[
     return relative_directory.as_posix(), files
 
 
-def prototype_session_detail_digest(rows: list[dict[str, Any]], thread_id: str) -> str:
-    """取出这条原型会话上次发过的需求正文指纹；取不到就当正文变过，重发一份更安全。"""
-    row = next((item for item in rows if str(item.get("threadId") or "") == thread_id), None)
-    metadata = row.get("metadata") if isinstance(row, dict) and isinstance(row.get("metadata"), dict) else {}
-    return str(metadata.get("detailDigest") or "")
 
 
-def build_requirement_prototype_prompt(
-    program_id: int,
-    requirement: dict[str, Any],
-    message: str,
-    workspace: Path,
-    editing: bool = False,
-    follow_up: bool = False,
-    include_detail: bool = False,
-) -> str:
-    requirement_key = str(requirement.get("requirementKey") or "").strip()
-    prototype_path = requirement_prototype_directory_of(requirement_key).as_posix()
-    if follow_up:
-        # 续聊只保留写入范围这条红线和会变的需求正文；页面本身就在目录里，模型自己读得到。
-        return wrap_bridge_context(
-            [
-                "这是同一条需求原型会话的追加回合：继续在当前工作区调整这套 HTML 原型，"
-                "保留未被本轮要求修改的内容，不要推倒重来。",
-                workspace_instruction(workspace),
-                f"项目 program_id: {program_id}",
-                f"需求键: {requirement_key}",
-                *(
-                    ["需求详情（用户已在面板上改过，以这一版为准）:", str(requirement.get("detail") or "（未填写）")]
-                    if include_detail
-                    else ["需求详情与本会话首轮一致，没有变化；若上下文里已经找不到，直接读原型目录下现有页面接回来。"]
-                ),
-                f"原型目录（唯一允许写入的目录）: `{prototype_path}/`。只能创建或修改该目录下的 UTF-8 `.html` / `.htm` 文件，"
-                "不得修改业务代码、配置、依赖或该目录以外的文件。",
-                "页面仍需可独立在浏览器打开，使用内联 CSS/JS 或本地无依赖资源，不引用远程资源。",
-                "完成后在最终回复列出改动过的相对路径和改动摘要。",
-            ],
-            message or "请按上述要求调整现有 HTML 原型。",
-        )
-    context_lines = [
-        "这是交付任务面板的需求 HTML 原型任务。直接在当前工作区完成，不要只给建议。",
-        workspace_instruction(workspace),
-        f"项目 program_id: {program_id}",
-        f"需求键: {requirement_key}",
-        f"需求名称: {str(requirement.get('name') or '未命名')[:255]}",
-        "需求详情:",
-        str(requirement.get("detail") or "（未填写）"),
-        "",
-        f"原型目录（唯一允许写入的目录）: `{prototype_path}/`。",
-        "只能创建或修改该目录下的 UTF-8 `.html` / `.htm` 文件，不得修改业务代码、配置、依赖或该目录以外的文件。",
-        "按功能模块拆分页面；每个文件应可独立在浏览器打开，使用内联 CSS/JS 或本地无依赖资源，不引用远程资源。",
-        "完成后核对至少一个 HTML 文件存在，并在最终回复列出相对路径和改动摘要。",
-    ]
-    if editing:
-        context_lines.insert(0, "这是已有需求原型的编辑回合，应保留未被本轮要求修改的内容。")
-    return wrap_bridge_context(context_lines, message or "请根据上述需求生成 HTML 原型。")
+from delivery_bridge.prompts.requirement import (
+    REVIEW_EXCLUDED_DIRECTORIES,
+    REVIEW_GUIDELINES,
+    build_requirement_testing_prompt,
+    review_scope_of,
+    review_scope_lines,
+    requirement_review_report_relative_path,
+    build_requirement_review_prompt,
+    prototype_session_detail_digest,
+    build_requirement_prototype_prompt,
+)
 
 
 
@@ -2841,132 +1294,14 @@ from delivery_bridge.attachments_text import (
 )
 
 
-def validate_execute_payload(value: Any) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        raise BridgeFailure("请求体必须是 JSON 对象")
-    program_id = program_id_of(value.get("programId"))
-    task = value.get("task")
-    if not isinstance(task, dict):
-        raise BridgeFailure("缺少项目或任务")
-    required = ("itemKey", "title", "version")
-    if any(not task.get(key) for key in required):
-        raise BridgeFailure("任务缺少 itemKey、title 或 version")
-    status = str(task.get("status") or "")
-    # 「再做一次」不回滚状态，只是给已完成的任务再开一轮执行实例。
-    redo = bool(value.get("redo"))
-    if status == "done" and not redo:
-        raise BridgeFailure("已完成任务不能再次执行")
-    normalized = dict(value)
-    normalized["redo"] = redo
-    normalized.pop("bizLine", None)
-    normalized["programId"] = program_id
-    normalized["task"] = dict(task)
-    model = str(value.get("model") or "").strip()
-    if len(model) > 128:
-        raise BridgeFailure("模型标识不能超过 128 个字符")
-    normalized["model"] = model
-    normalized["provider"] = ai_provider_of(value)
-    normalized["reasoningEffort"] = reasoning_effort_of(value, normalized["provider"])
-    normalized["fastMode"] = fast_mode_of(value, normalized["provider"])
-    follow_up = str(value.get("followUp") or "").strip()
-    if len(follow_up) > 32 * 1024:
-        raise BridgeFailure("追加要求不能超过 32KB")
-    normalized["followUp"] = follow_up
-    normalized["conversationReferences"] = conversation_references_of(value.get("conversationReferences"))
-    execution_constraints = str(value.get("executionConstraints") or "").strip()
-    if len(execution_constraints) > 32 * 1024:
-        raise BridgeFailure("任务约束条件说明不能超过 32KB")
-    normalized["executionConstraints"] = execution_constraints
-    attachments = value.get("followUpAttachments") or []
-    if not isinstance(attachments, list) or len(attachments) > MAX_CONVERSATION_ATTACHMENTS:
-        raise BridgeFailure("附件数量无效")
-    normalized["followUpAttachments"] = attachments
-    return normalized
 
 
-def validate_conversation_payload(value: Any) -> tuple[int, str, str, str, bool, list[str], str, str, bool, list[dict[str, str]]]:
-    if not isinstance(value, dict):
-        raise BridgeFailure("请求体必须是 JSON 对象")
-    program_id = program_id_of(value.get("programId"))
-    item_key = str(value.get("itemKey") or "").strip()
-    message = str(value.get("message") or "").strip()
-    if not item_key:
-        raise BridgeFailure("缺少项目或任务标识")
-    if len(message) > 32 * 1024:
-        raise BridgeFailure("消息不能超过 32KB")
-    thread_id = str(value.get("threadId") or "").strip()
-    if len(thread_id) > 255:
-        raise BridgeFailure("会话标识无效")
-    raw_attachment_ids = value.get("attachmentIds") or []
-    if not isinstance(raw_attachment_ids, list) or len(raw_attachment_ids) > MAX_CONVERSATION_ATTACHMENTS:
-        raise BridgeFailure("附件数量无效")
-    attachment_ids = [str(attachment_id or "").strip() for attachment_id in raw_attachment_ids]
-    if any(not re.fullmatch(r"[A-Za-z0-9_-]{16,80}", attachment_id) for attachment_id in attachment_ids):
-        raise BridgeFailure("附件标识无效")
-    if len(set(attachment_ids)) != len(attachment_ids):
-        raise BridgeFailure("附件不能重复")
-    if not message and not attachment_ids:
-        raise BridgeFailure("请输入要发送的内容或添加附件")
-    model = str(value.get("model") or "").strip()
-    if len(model) > 128:
-        raise BridgeFailure("模型标识不能超过 128 个字符")
-    provider = ai_provider_of(value)
-    reasoning_effort = reasoning_effort_of(value, provider)
-    fast_mode = fast_mode_of(value, provider)
-    references = conversation_references_of(value.get("references"))
-    return (
-        program_id,
-        item_key,
-        message,
-        thread_id,
-        bool(value.get("newConversation")),
-        attachment_ids,
-        model,
-        reasoning_effort,
-        fast_mode,
-        references,
-    )
 
 
-def business_item_key_of(value: Any) -> str:
-    item_key = str(value or "").strip()
-    if not re.fullmatch(r"business-requirement-[1-9][0-9]*", item_key):
-        raise BridgeFailure("业务诉求标识无效")
-    return item_key
 
 
-def business_intake_of(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes"}
-    return False
 
 
-def validate_business_conversation_payload(value: Any) -> tuple[int, str, str, str, str, str, list[str]]:
-    if not isinstance(value, dict) or not business_intake_of(value.get("businessIntake")):
-        raise BridgeFailure("业务访谈请求标识无效")
-    program_id = program_id_of(value.get("programId"))
-    item_key = business_item_key_of(value.get("itemKey"))
-    message = str(value.get("message") or "").strip()
-    if not message:
-        raise BridgeFailure("请输入业务诉求")
-    if len(message) > 32 * 1024:
-        raise BridgeFailure("业务诉求不能超过 32KB")
-    thread_id = str(value.get("threadId") or "").strip()
-    if len(thread_id) > 255:
-        raise BridgeFailure("会话标识无效")
-    provider = ai_provider_of(value)
-    if provider != "codex":
-        raise BridgeFailure("业务访谈仅支持 Codex")
-    model = str(value.get("model") or "").strip()
-    if len(model) > 128:
-        raise BridgeFailure("模型标识不能超过 128 个字符")
-    attachment_ids = value.get("attachmentIds") or []
-    if not isinstance(attachment_ids, list) or len(attachment_ids) > MAX_CONVERSATION_ATTACHMENTS:
-        raise BridgeFailure(f"一条消息最多携带 {MAX_CONVERSATION_ATTACHMENTS} 个附件")
-    attachment_ids = [str(item).strip() for item in attachment_ids if str(item).strip()]
-    return program_id, item_key, message, thread_id, model, reasoning_effort_of(value, provider), attachment_ids
 
 
 from delivery_bridge.timeutil import (
@@ -3133,20 +1468,8 @@ def merged_conversation_catalog(bindings: list[dict[str, Any]]) -> tuple[list[di
     return catalog, owners
 
 
-def runtime_config_from_payload(value: Any) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        raise BridgeFailure("请求参数无效")
-    runtime_config = value.get(RUNTIME_CONFIG_KEY)
-    if not isinstance(runtime_config, dict):
-        raise BridgeFailure("任务面板身份上下文缺失")
-    return runtime_config
 
 
-def assert_runtime_project(config: dict[str, Any], program_id: int) -> None:
-    runtime_value = config.get("_project_id")
-    runtime_program_id = program_id_of(runtime_value) if runtime_value not in (None, "") else 0
-    if program_id and runtime_program_id and runtime_program_id != program_id:
-        raise BridgeFailure("当前请求项目与任务面板入口项目不一致")
 
 
 def codex_environment(
@@ -3168,39 +1491,45 @@ def codex_environment(
     }
 
 
-def biz_line_of(value: Any) -> str:
-    # Accepted for backwards-compatible clients only. Project-scoped work never
-    # uses this value to resolve or authorize a project.
-    return str(value.get("bizLine") or "") if isinstance(value, dict) else ""
 
 
-def scoped_config(config: dict[str, Any], biz_line: str = "") -> dict[str, Any]:
-    return config
 
 
-def config_biz_line(config: dict[str, Any]) -> str:
-    return ""
 
 
-def request_scoped_config(config: dict[str, Any] | None, biz_line: str, program_id: int) -> dict[str, Any]:
-    if config is None:
-        raise BridgeFailure("任务面板身份上下文缺失")
-    assert_runtime_project(config, program_id)
-    return config
 
 
-def task_identity(biz_line: str, program_id: int, item_key: str) -> tuple[str, int, str]:
-    return "", program_id, item_key
 
 
-def validate_task_identity(value: Any) -> tuple[str, int, str]:
-    if not isinstance(value, dict):
-        raise BridgeFailure("请求参数无效")
-    program_id = program_id_of(value.get("programId"))
-    item_key = str(value.get("itemKey") or "").strip()
-    if not item_key:
-        raise BridgeFailure("缺少项目或任务标识")
-    return "", program_id, item_key
+from delivery_bridge.payloads import (
+    MAX_CONVERSATION_ATTACHMENTS,
+    MAX_CONVERSATION_REFERENCES,
+    RUNTIME_CONFIG_KEY,
+    validate_planning_payload,
+    session_kind_of,
+    validate_requirement_review_payload,
+    validate_requirement_testing_payload,
+    validate_task_testing_cases_payload,
+    validate_fine_tuning_payload,
+    planning_requirement_of,
+    planning_requirement_references_of,
+    planning_requirement_item_references_of,
+    conversation_references_of,
+    validate_requirement_prototype_payload,
+    validate_execute_payload,
+    validate_conversation_payload,
+    business_item_key_of,
+    business_intake_of,
+    validate_business_conversation_payload,
+    runtime_config_from_payload,
+    assert_runtime_project,
+    biz_line_of,
+    scoped_config,
+    config_biz_line,
+    request_scoped_config,
+    task_identity,
+    validate_task_identity,
+)
 
 
 
@@ -3220,6 +1549,7 @@ def validate_task_identity(value: Any) -> tuple[str, int, str]:
 
 
 from delivery_bridge.clients.journal import (
+    CODEX_THREAD_ITEMS_DIR,
     MAX_THREAD_JOURNAL_TURNS,
     MAX_THREAD_JOURNAL_ITEMS,
     REASONING_SUMMARY_METHODS,
@@ -3236,6 +1566,9 @@ from delivery_bridge.clients.journal import (
 
 
 from delivery_bridge.clients.codex import (
+    APP_SERVER_STDERR_TAIL,
+    TURN_REASONING_SUMMARY,
+    THREAD_READ_GRACE_SECONDS,
     AppServerClient,
 )
 
@@ -3251,6 +1584,8 @@ from delivery_bridge.clients.codex import (
 
 
 from delivery_bridge.clients.claude import (
+    MAX_CLAUDE_TRANSCRIPT_TURNS,
+    CLAUDE_TRANSCRIPTS_DIR,
     CLAUDE_TRANSCRIPTS,
     CLAUDE_FILE_TOOLS,
     CLAUDE_COMMAND_TOOLS,

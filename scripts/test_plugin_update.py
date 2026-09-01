@@ -21,7 +21,8 @@ def make_package(root: Path, version: str = "0.3.0") -> Path:
     (root / ".codex-plugin").mkdir(parents=True)
     (root / ".claude-plugin").mkdir(parents=True)
     (root / "skills" / "delivery-task-planner").mkdir(parents=True)
-    (root / "delivery_bridge" / "clients").mkdir(parents=True)
+    for package in ("clients", "prompts"):
+        (root / "delivery_bridge" / package).mkdir(parents=True)
     for folder in (".codex-plugin", ".claude-plugin"):
         (root / folder / "plugin.json").write_text(
             json.dumps({"name": "delivery-task-planner", "version": version}),
@@ -49,10 +50,15 @@ def make_package(root: Path, version: str = "0.3.0") -> Path:
         "attachments_text.py",
         "timeutil.py",
         "reasoning.py",
+        "payloads.py",
     ):
         (root / "delivery_bridge" / name).write_text(f"# {version}\n", encoding="utf-8")
-    for name in ("journal.py", "codex.py", "claude.py", "factory.py", "pool.py"):
-        (root / "delivery_bridge" / "clients" / name).write_text(f"# {version}\n", encoding="utf-8")
+    for package, names in {
+        "clients": ("journal.py", "codex.py", "claude.py", "factory.py", "pool.py"),
+        "prompts": ("common.py", "task.py", "planning.py", "conversation.py", "requirement.py", "environment.py"),
+    }.items():
+        for name in names:
+            (root / "delivery_bridge" / package / name).write_text(f"# {version}\n", encoding="utf-8")
     return root
 
 

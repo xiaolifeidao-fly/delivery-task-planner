@@ -141,7 +141,8 @@ def environment_command_for(entry: dict[str, Any], field: str, host: str) -> str
     return str(value.get(host) or value.get("macos") or "").strip()
 
 
-VERSION_RE = re.compile(r"(?<!\d)(\d+(?:\.\d+)+)")
+# 从探测命令的输出里捞出第一个数字版本号；不是 SemVer 校验（那是 versioning 的事）。
+PROBE_VERSION_RE = re.compile(r"(?<!\d)(\d+(?:\.\d+)+)")
 
 
 def version_at_least(version: str, minimum: str) -> bool:
@@ -178,7 +179,7 @@ def environment_probe_status(entry: dict[str, Any], host: str = "") -> dict[str,
         return result
     if completed.returncode != 0:
         return result
-    version_match = VERSION_RE.search(completed.stdout or "")
+    version_match = PROBE_VERSION_RE.search(completed.stdout or "")
     version = version_match.group(1) if version_match else ""
     minimum = str(entry.get("minimumVersion") or "")
     result["version"] = version

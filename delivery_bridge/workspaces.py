@@ -9,6 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from . import runtime
 from .errors import BridgeFailure
 
 
@@ -68,3 +69,13 @@ def business_workspace_path_of(value: Any, root: Path) -> Path:
         raise BridgeFailure("业务工作目录超出允许范围") from exc
     return workspace
 
+
+def environment_setup_workspace() -> Path:
+    """「预设环境」的专用工作目录。
+
+    装 Python / Node / Go 走的是本机全局包管理器，和项目代码没有关系，
+    所以和初始化 Git 环境一样给一个运行时目录下的空目录当 cwd，别把安装痕迹落进业务仓库。
+    """
+    root = runtime.RUNTIME_DIR / "environment-setup"
+    root.mkdir(parents=True, exist_ok=True)
+    return root.resolve()

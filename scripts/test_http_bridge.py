@@ -360,7 +360,7 @@ class HttpBridgeTest(unittest.TestCase):
             bridge.requirement_outline_path_of("../../etc")
 
     def test_planning_temp_path_is_plugin_local_and_sanitizes_names(self):
-        with tempfile.TemporaryDirectory() as temporary, patch.object(bridge, "PLUGIN_ROOT", Path(temporary)):
+        with tempfile.TemporaryDirectory() as temporary, patch.object(bridge.runtime, "PLUGIN_ROOT", Path(temporary)):
             path = bridge.planning_temp_document_path("导入/审核", "req-a", "thread/one")
 
         self.assertEqual(
@@ -381,7 +381,7 @@ class HttpBridgeTest(unittest.TestCase):
         self.assertNotIn("初稿", content)
 
     def test_planning_temp_summary_is_deleted_only_inside_the_managed_directory(self):
-        with tempfile.TemporaryDirectory() as temporary, patch.object(bridge, "PLUGIN_ROOT", Path(temporary)):
+        with tempfile.TemporaryDirectory() as temporary, patch.object(bridge.runtime, "PLUGIN_ROOT", Path(temporary)):
             path = bridge.planning_temp_document_path("审核", "req-a", "thread-1")
             bridge.write_planning_temp_summary(path, "审核", "req-a", "thread-1", "确认", "最终方案")
 
@@ -493,7 +493,7 @@ class HttpBridgeTest(unittest.TestCase):
         requirement = {"requirementKey": "req-a", "detail": "改过的正文"}
         with tempfile.TemporaryDirectory() as temporary:
             workspace = Path(temporary)
-            with patch.object(bridge, "PLUGIN_ROOT", workspace):
+            with patch.object(bridge.runtime, "PLUGIN_ROOT", workspace):
                 draft = bridge.planning_temp_document_path("", "req-a", "thread-1")
                 draft.parent.mkdir(parents=True, exist_ok=True)
                 draft.write_text("# 已沉淀的过程摘要\n", encoding="utf-8")
