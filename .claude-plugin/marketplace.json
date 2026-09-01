@@ -1,0 +1,16 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "universe-local",
+  "description": "Universe 本地插件市场",
+  "owner": {
+    "name": "Universe Team"
+  },
+  "plugins": [
+    {
+      "name": "delivery-task-planner",
+      "description": "在 Universe 交付任务面板中创建项目、里程碑、模块，并把需求拆解为带依赖关系的任务批量写入。",
+      "category": "productivity",
+      "source": "./"
+    }
+  ]
+}
