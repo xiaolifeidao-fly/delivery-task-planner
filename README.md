@@ -57,6 +57,8 @@ The bridge entry point remains `http_bridge.py`, but reusable runtime concerns l
 
 Modules are imported back into `http_bridge.py` by name so existing callers keep resolving them there. When a test needs to patch one of these functions, it must patch the module that owns it (for example `delivery_bridge.git_ops.run_git`) — patching the re-exported name on `http_bridge` has no effect on callers that already live inside the package. Names that tests need to replace are therefore reached through their module (`hostinfo.host_platform`, `runtime.RUNTIME_DIR`, `factory.create_ai_client`) rather than imported by value, so one patch covers every caller — including ones inside the package.
 
+`scripts/test_module_layout.py` enforces the one rule this split keeps breaking: a constant may be defined in exactly one module. Re-declaring it in the new module while leaving the old definition behind keeps the tests green — both copies agree — but the abandoned copy has no readers, and patching it silently does nothing.
+
 - `errors.py` owns `BridgeFailure`, the one business-failure exception every lower layer raises so no module has to import the entry point back.
 - `workspaces.py` resolves the project working directory and the server-supplied `{username}/业务空间/{projectName}` business workspace, enforcing the containment check in one place.
 - `prompt_context.py` owns the `delivery-bridge-context` wrapper that separates board-assembled prompt context from the words the user actually typed.
@@ -82,6 +84,9 @@ Modules are imported back into `http_bridge.py` by name so existing callers keep
 - `artifacts.py` stores chat attachments and workspace artifacts, including the TTL'd filename index that resolves the bare filenames executors write into replies.
 - `chat_archive.py` writes the human-readable chat copy into the project working directory and picks the files eligible for cloud sync.
 - `turn_view.py` lays an executor turn out as the JSON the board renders, always ending on a terminal result so an interrupted turn cannot leave the board spinning.
+- `sessions.py` builds the per-task conversation catalog: version numbers, titles, and the merge between the server's session bindings and what the executor holds.
+- `progress_events.py` translates an executor's live notifications into the one-line progress entries the board shows, dropping anything it does not recognize.
+- `item_keys.py` owns the fixed-prefix item keys and purpose-suffixed executor types that let prototypes, test cases, and fine-tuning share the task session table.
 - `versioning.py` owns SemVer comparison shared by update checks and installation.
 - `update_manager.py` resolves an immutable Git commit, downloads and validates the release archive, backs up the active package, refreshes Codex and Claude Code caches, and persists bounded installation logs.
 - `restart_helper.py` preserves the bridge command-line arguments and restarts the bridge after the HTTP response is delivered. On macOS it hands control back to the per-user LaunchAgent. On Windows the logon task runs `windows_supervisor.py`, which relaunches a stopped bridge worker in under a second instead of waiting for Task Scheduler's one-minute failure interval; an update also migrates an older direct-bridge task to the supervisor action and waits for `/healthz` before declaring the restart usable. Restart diagnostics are written to the platform runtime directory, and a stale `restarting` job becomes retryable after 45 seconds instead of polling forever.

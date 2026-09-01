@@ -161,11 +161,7 @@ PLUGIN_UPDATES = PluginUpdateManager(
     PLUGIN_GITHUB_RAW_BASE_URL,
     PLUGIN_VERSION_CHECK_CACHE_SECONDS,
 )
-MAX_CONVERSATIONS_PER_TASK = 12
 MAX_REQUIREMENT_DOCUMENT_BYTES = 2 * 1024 * 1024
-MAX_REQUIREMENT_PROTOTYPE_FILES = 30
-MAX_REQUIREMENT_PROTOTYPE_FILE_BYTES = 2 * 1024 * 1024
-MAX_REQUIREMENT_PROTOTYPE_TOTAL_BYTES = 8 * 1024 * 1024
 # 面板还可以直接往栏目目录里放文档（本地选文件或粘贴正文）：什么后缀都收得下，
 # 但只有文本类文档能在面板里预览编辑，其余的走附件预览与下载。
 MAX_DOCUMENT_UPLOAD_FILES = 10
@@ -423,27 +419,6 @@ def codex_local_projects() -> list[dict[str, Any]]:
 
 
 
-def generated_image_from_event(message: dict[str, Any]) -> tuple[str, str] | None:
-    """Extract a generated image from either rollout events or app-server notifications."""
-    candidates: list[dict[str, Any]] = [message]
-    while candidates:
-        value = candidates.pop()
-        event_type = str(value.get("type") or value.get("method") or "")
-        call_id = str(value.get("call_id") or value.get("callId") or "")
-        result = value.get("result")
-        image_result = result if isinstance(result, str) else value.get("image") or value.get("data")
-        normalized_type = event_type.replace("/", "_").replace("-", "_").lower()
-        if (
-            ("image_generation" in normalized_type or "imagegeneration" in normalized_type)
-            and call_id
-            and isinstance(image_result, str)
-            and image_result
-        ):
-            return call_id, image_result
-        for nested in value.values():
-            if isinstance(nested, dict):
-                candidates.append(nested)
-    return None
 
 
 
@@ -468,51 +443,10 @@ from delivery_bridge.reasoning import (
 )
 
 
-def progress_event_of(message: dict[str, Any]) -> tuple[str, str, str, str] | None:
-    method = str(message.get("method") or "")
-    params = message.get("params") or {}
-    if method == "turn/started":
-        return "status", "任务已开始", "Codex 正在分析任务与项目上下文。", "running"
-    if method == "turn/completed":
-        status = str((params.get("turn") or {}).get("status") or "completed")
-        return "status", "正在同步执行结果", f"Codex 回合状态：{status}", "running"
-    # Stream the app-server's display-safe reasoning summary. Deliberately do
-    # not handle item/reasoning/textDelta: that is not the summary API and is
-    # not eligible for task-board storage.
-    if method == "item/reasoning/summaryTextDelta":
-        delta = str(params.get("delta") or "").strip()
-        return ("reasoning", "Codex 推理摘要", delta, "running") if delta else None
-    if method == "item/reasoning/summaryPartAdded":
-        return "reasoning", "Codex 正在生成推理摘要", "", "running"
-    if method not in {"item/started", "item/completed"}:
-        return None
-    item = params.get("item") or {}
-    item_type = str(item.get("type") or "")
-    completed = method == "item/completed"
-    status = "success" if completed else "running"
-    if item_type == "agentMessage" and completed:
-        text = str(item.get("text") or item.get("content") or "").strip()
-        return ("message", "Codex 进度", text, status) if text else None
-    if item_type == "reasoning":
-        summary = reasoning_summary_text(item)
-        if summary and completed:
-            return "reasoning", "Codex 推理摘要", summary, status
-        return "reasoning", "Codex 正在生成推理摘要", "", status
-    if item_type == "commandExecution":
-        command = item.get("command") or item.get("commands") or ""
-        if isinstance(command, list):
-            command = "\n".join(str(part) for part in command)
-        if completed:
-            exit_code = item.get("exitCode")
-            detail = "命令执行完成" if exit_code in (None, 0) else f"命令执行失败，退出码 {exit_code}"
-            return "command", detail, str(command), "success" if exit_code in (None, 0) else "failed"
-        return "command", "正在执行命令", str(command), status
-    if item_type in {"fileChange", "fileEdit"}:
-        return "file", "正在更新项目文件" if not completed else "项目文件已更新", "", status
-    if item_type in {"mcpToolCall", "dynamicToolCall"}:
-        tool = str(item.get("tool") or item.get("name") or "工具")
-        return "tool", f"{'完成' if completed else '调用'} {tool}", "", status
-    return None
+from delivery_bridge.progress_events import (
+    generated_image_from_event,
+    progress_event_of,
+)
 
 
 
@@ -1018,70 +952,29 @@ from delivery_bridge.documents import (
 )
 
 
-def document_attachment_item_key(scope: str, key: str) -> str:
-    """栏目文档登记成附件时的归属标识，和会话附件、任务产物区分开。"""
-    return f"__document__:{str(scope or '').strip()}:{str(key or '').strip()}"
-
-
-def requirement_prototype_item_key(requirement_key: str) -> str:
-    return f"__requirement_prototype__:{requirement_prototype_directory_of(requirement_key).parts[-2]}"
-
-
-def requirement_prototype_executor_type(provider: str) -> str:
-    # 与需求拆解会话共用持久目录表，但用独立执行器类型隔离，避免“编辑原型”续到拆解对话里。
-    return f"{ai_provider_of(provider)}-prototype"
-
-
-def task_testing_cases_executor_type(provider: str) -> str:
-    """Keep pre-generated task test-case chats apart from task execution chats."""
-    return f"{ai_provider_of(provider)}-testing-cases"
-
-
-def task_fine_tuning_executor_type(provider: str) -> str:
-    """Keep task-level refinement chats out of both execution and test-case histories."""
-    return f"{ai_provider_of(provider)}-fine-tuning"
 
 
 
 
-def requirement_prototype_files(workspace: Path, requirement_key: str) -> tuple[str, list[dict[str, str]]]:
-    """Read a bounded set of UTF-8 HTML files without allowing workspace escapes."""
-    relative_directory = requirement_prototype_directory_of(requirement_key)
-    directory = (workspace / relative_directory).resolve()
-    try:
-        directory.relative_to(workspace.resolve())
-    except ValueError as exc:
-        raise BridgeFailure("需求原型目录超出当前项目") from exc
-    if not directory.is_dir():
-        return relative_directory.as_posix(), []
-    files: list[dict[str, str]] = []
-    total_bytes = 0
-    for path in sorted(directory.rglob("*")):
-        if not path.is_file() or path.suffix.lower() not in HTML_SUFFIXES:
-            continue
-        resolved = path.resolve()
-        try:
-            relative = resolved.relative_to(workspace.resolve())
-            display_name = resolved.relative_to(directory).as_posix()
-        except ValueError as exc:
-            raise BridgeFailure("需求原型文件超出当前项目") from exc
-        size = resolved.stat().st_size
-        if size > MAX_REQUIREMENT_PROTOTYPE_FILE_BYTES:
-            raise BridgeFailure(f"需求原型文件过大：{display_name}")
-        total_bytes += size
-        if total_bytes > MAX_REQUIREMENT_PROTOTYPE_TOTAL_BYTES:
-            raise BridgeFailure("需求原型总大小超过 8 MB，无法预览")
-        try:
-            html = resolved.read_text(encoding="utf-8")
-        except UnicodeDecodeError as exc:
-            raise BridgeFailure(f"需求原型不是 UTF-8 HTML：{display_name}") from exc
-        if "\x00" in html:
-            raise BridgeFailure(f"需求原型不是可预览的 HTML：{display_name}")
-        assets = html_asset_payloads(workspace, directory, resolved, html)
-        files.append({"path": relative.as_posix(), "name": display_name, "html": html, "assets": assets})
-        if len(files) >= MAX_REQUIREMENT_PROTOTYPE_FILES:
-            break
-    return relative_directory.as_posix(), files
+
+
+
+
+
+
+
+
+from delivery_bridge.item_keys import (
+    MAX_REQUIREMENT_PROTOTYPE_FILES,
+    MAX_REQUIREMENT_PROTOTYPE_FILE_BYTES,
+    MAX_REQUIREMENT_PROTOTYPE_TOTAL_BYTES,
+    document_attachment_item_key,
+    requirement_prototype_item_key,
+    requirement_prototype_executor_type,
+    task_testing_cases_executor_type,
+    task_fine_tuning_executor_type,
+    requirement_prototype_files,
+)
 
 
 
@@ -1130,163 +1023,25 @@ from delivery_bridge.timeutil import (
 )
 
 
-def next_conversation_version(binding: dict[str, Any] | None) -> int:
-    """Return the suffix number for the next thread, including compacted history."""
-    metadata = (binding or {}).get("metadata")
-    metadata = metadata if isinstance(metadata, dict) else {}
-    stored_version = metadata.get("nextConversationVersion")
-    try:
-        if int(stored_version) >= 0:
-            return int(stored_version)
-    except (TypeError, ValueError):
-        pass
-    # Existing bindings do not have a counter yet. Their retained thread catalog
-    # gives the correct next version until the first metadata update persists it.
-    return len(conversation_catalog(binding))
 
 
-def conversation_title(task: dict[str, Any], binding: dict[str, Any] | None = None) -> str:
-    """Name the first Codex thread after its task, then use ascending versions."""
-    base = " ".join(str(task.get("title") or "Codex 会话").split()) or "Codex 会话"
-    version = next_conversation_version(binding)
-    if version == 0:
-        return base[:80]
-    suffix = f" V0.0.{version}"
-    return f"{base[: 80 - len(suffix)].rstrip()}{suffix}"
 
 
-def conversation_catalog(binding: dict[str, Any] | None) -> list[dict[str, Any]]:
-    """Read the compact per-task Codex thread directory, including legacy bindings."""
-    if not isinstance(binding, dict):
-        return []
-    metadata = binding.get("metadata")
-    metadata = metadata if isinstance(metadata, dict) else {}
-    raw = metadata.get("conversations")
-    catalog: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    if isinstance(raw, list):
-        for entry in raw:
-            if not isinstance(entry, dict):
-                continue
-            thread_id = str(entry.get("threadId") or "").strip()
-            if not thread_id or thread_id in seen:
-                continue
-            seen.add(thread_id)
-            catalog.append(
-                {
-                    "threadId": thread_id,
-                    "title": str(entry.get("title") or "Codex 会话")[:80],
-                    "createdAt": str(entry.get("createdAt") or ""),
-                    "updatedAt": str(entry.get("updatedAt") or ""),
-                    "status": str(entry.get("status") or "completed"),
-                    "phase": str(entry.get("phase") or binding.get("phase") or "requirement"),
-                    "progress": int(entry.get("progress") or binding.get("progress") or 0),
-                }
-            )
-    legacy_thread_id = str(binding.get("externalSessionId") or "").strip()
-    if legacy_thread_id and legacy_thread_id not in seen:
-        timestamp = str(binding.get("updatedAt") or "")
-        catalog.append(
-            {
-                "threadId": legacy_thread_id,
-                "title": "Codex 会话",
-                "createdAt": timestamp,
-                "updatedAt": timestamp,
-                "status": str(binding.get("status") or "completed"),
-                "phase": str(binding.get("phase") or "requirement"),
-                "progress": int(binding.get("progress") or 0),
-            }
-        )
-    return catalog[:MAX_CONVERSATIONS_PER_TASK]
 
 
-def turn_already_finished(error: Exception) -> bool:
-    """Codex 在回合结束后会拒绝 interrupt。这不是停止失败，只是这一下点晚了。"""
-    return "no active turn" in str(error).lower()
 
 
-def conversation_metadata(
-    binding: dict[str, Any] | None,
-    thread_id: str,
-    turn_id: str = "",
-    turn_status: str = "",
-    title: str = "",
-    phase: str = "",
-) -> dict[str, Any]:
-    """Merge a thread update without losing the rest of a task's conversation history."""
-    raw_metadata = (binding or {}).get("metadata")
-    metadata = dict(raw_metadata) if isinstance(raw_metadata, dict) else {}
-    now = utc_now()
-    catalog = conversation_catalog(binding)
-    previous_version = next_conversation_version(binding)
-    entry = next((candidate for candidate in catalog if candidate["threadId"] == thread_id), None)
-    conversation_phase = phase or str((binding or {}).get("phase") or "requirement")
-    if entry is None:
-        entry = {
-            "threadId": thread_id,
-            "title": title or "Codex 会话",
-            "createdAt": now,
-            "updatedAt": now,
-            "status": turn_status or "running",
-            "phase": conversation_phase,
-            "progress": int((binding or {}).get("progress") or 0),
-        }
-        catalog.append(entry)
-        next_version = previous_version + 1
-    else:
-        entry["title"] = title or entry["title"]
-        entry["updatedAt"] = now
-        if turn_status:
-            entry["status"] = turn_status
-        next_version = previous_version
-    entry["phase"] = phase or str((binding or {}).get("phase") or entry.get("phase") or "requirement")
-    entry["progress"] = 100 if turn_status == "completed" else int((binding or {}).get("progress") or entry.get("progress") or 0)
-    if not entry.get("createdAt"):
-        entry["createdAt"] = now
-    entry["title"] = str(entry.get("title") or "Codex 会话")[:80]
-    entry["updatedAt"] = now
-    catalog.sort(key=lambda candidate: str(candidate.get("updatedAt") or ""), reverse=True)
-    metadata["conversations"] = catalog[:MAX_CONVERSATIONS_PER_TASK]
-    metadata["nextConversationVersion"] = next_version
-    metadata["threadId"] = thread_id
-    if turn_id:
-        metadata["turnId"] = turn_id
-    if turn_status:
-        metadata["turnStatus"] = turn_status
-    metadata["workspace"] = metadata.get("workspace") or ""
-    return metadata
 
 
-def merged_conversation_catalog(bindings: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
-    """Merge catalogs from all execution phases while retaining each thread's owner.
-
-    A task can move from requirement grooming to action and then testing. Its
-    execution-session rows are phase-scoped, while the task chat sidebar must
-    present every retained conversation for that task.
-    """
-    entries: dict[str, dict[str, Any]] = {}
-    owners: dict[str, dict[str, Any]] = {}
-    for binding in bindings:
-        for entry in conversation_catalog(binding):
-            thread_id = str(entry.get("threadId") or "")
-            if not thread_id:
-                continue
-            previous = entries.get(thread_id)
-            # 同一条 thread 可能出现在多行会话记录的目录里；真正持有它的是 externalSessionId
-            # 指向它的那一行，归属执行器只能按这一行判定，否则跨工具会读错缓存。
-            owns_thread = str(binding.get("externalSessionId") or "") == thread_id
-            previous_owns_thread = str((owners.get(thread_id) or {}).get("externalSessionId") or "") == thread_id
-            if previous is not None and previous_owns_thread and not owns_thread:
-                continue
-            if (
-                previous is None
-                or (owns_thread and not previous_owns_thread)
-                or str(entry.get("updatedAt") or "") >= str(previous.get("updatedAt") or "")
-            ):
-                entries[thread_id] = {**entry, "executorType": executor_provider_of(binding)}
-                owners[thread_id] = binding
-    catalog = sorted(entries.values(), key=lambda entry: str(entry.get("updatedAt") or ""), reverse=True)
-    return catalog, owners
+from delivery_bridge.sessions import (
+    MAX_CONVERSATIONS_PER_TASK,
+    next_conversation_version,
+    conversation_title,
+    conversation_catalog,
+    turn_already_finished,
+    conversation_metadata,
+    merged_conversation_catalog,
+)
 
 
 

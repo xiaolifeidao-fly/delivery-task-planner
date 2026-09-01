@@ -55,6 +55,9 @@ def make_package(root: Path, version: str = "0.3.0") -> Path:
         "stores.py",
         "chat_archive.py",
         "artifacts.py",
+        "sessions.py",
+        "progress_events.py",
+        "item_keys.py",
     ):
         (root / "delivery_bridge" / name).write_text(f"# {version}\n", encoding="utf-8")
     for package, names in {
