@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 # 真正发给执行器的提示词里裹着一大段面板上下文，聊天记录里只留用户自己写的那几句。
@@ -42,3 +43,9 @@ def workspace_instruction(workspace: Path | None) -> str:
         "开始前先加载该目录下项目自己的开发技能（如 backend-development、web-development），"
         "并读相关目录和现有实现；结论要落在真实文件路径上，不要凭业务名词推演。"
     )
+
+
+BRIDGE_CONTEXT_RE = re.compile(
+    r"\n?<delivery-(?:bridge|planning)-context>.*?</delivery-(?:bridge|planning)-context>\n?",
+    re.DOTALL,
+)

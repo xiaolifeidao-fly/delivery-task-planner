@@ -11,6 +11,10 @@ import re
 from datetime import datetime, timezone
 from typing import Any
 
+# 执行器回合状态到面板状态的映射，也界定了哪些状态算「这一轮结束了」。
+SESSION_STATUS = {"completed": "completed", "failed": "blocked", "interrupted": "blocked"}
+TERMINAL_TURN_STATUSES = set(SESSION_STATUS)
+
 
 EXECUTION_OUTPUT_LIMIT = 8 * 1024 * 1024
 

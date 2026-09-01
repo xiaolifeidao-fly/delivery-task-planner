@@ -33,6 +33,7 @@ from urllib.request import Request, urlopen
 
 import server as planner
 
+from delivery_bridge import clients
 from delivery_bridge import (
     codex_cli,
     documents,
@@ -71,8 +72,6 @@ PLUGIN_UPDATE_RESTART_POLL_SECONDS = 2
 # later release to verify that silent installation restarted the bridge and
 # loaded the new code instead of only replacing files on disk.
 PLUGIN_RUNTIME_TEST_VALUE = "delivery-task-planner-python-runtime-v6"
-SESSION_STATUS = {"completed": "completed", "failed": "blocked", "interrupted": "blocked"}
-TERMINAL_TURN_STATUSES = set(SESSION_STATUS)
 
 # 刚起的会话有一小段时间读不出来：Codex 的 rollout 文件还没落盘，thread/read 直接报
 # 「rollout ... is empty」。这类失败是瞬时的，容忍这么久之后仍然读不到才当成真的失败。
@@ -175,8 +174,6 @@ MAX_CLAUDE_TRANSCRIPT_TURNS = 60
 # 摘要都读不回来（协议里对 thread/rollback 的说明写得很明确）。桌面版能显示完整过程，
 # 靠的是自己留着实时通知流，这里做同一件事：把 item/started、item/completed 落盘。
 CODEX_THREAD_ITEMS_DIR = RUNTIME_DIR / "codex-thread-items"
-MAX_THREAD_JOURNAL_TURNS = 60
-MAX_THREAD_JOURNAL_ITEMS = 400
 # turn/start 的 summary 取值：auto / concise / detailed / none。auto 由模型自己决定详略，
 # 实测常常只给一两句。注意 app-server 会静默忽略不认识的字段，改名字前先实际验一遍。
 TURN_REASONING_SUMMARY = "detailed"
@@ -284,12 +281,6 @@ REQUIREMENT_SCOPE_RULE = (
 )
 ATTACHMENT_DIRECTORY_NAME = "delivery-task-attachments"
 ARTIFACT_DIRECTORY_NAME = "delivery-task-artifacts"
-ATTACHMENT_MARKER_RE = re.compile(r"<!-- delivery-task-attachments:([A-Za-z0-9_-]+(?:,[A-Za-z0-9_-]+)*) -->")
-ATTACHMENT_CONTEXT_RE = re.compile(r"\n?<delivery-task-attachments>.*?</delivery-task-attachments>", re.DOTALL)
-BRIDGE_CONTEXT_RE = re.compile(
-    r"\n?<delivery-(?:bridge|planning)-context>.*?</delivery-(?:bridge|planning)-context>\n?",
-    re.DOTALL,
-)
 IMAGE_SUFFIXES = {".gif", ".jpeg", ".jpg", ".png", ".webp"}
 MARKDOWN_ARTIFACT_RE = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
 EXCLUDED_ARTIFACT_PARTS = {".codex", ".git"}
@@ -727,23 +718,9 @@ class GitEnvironmentSessionStore:
 ENVIRONMENT_SETUP_SESSIONS = GitEnvironmentSessionStore(ENVIRONMENT_SETUP_SESSIONS_PATH)
 
 
-def reasoning_summary_text(item: Any) -> str:
-    """Return only the safe, user-visible summary from a Codex reasoning item.
-
-    The app-server can emit a separate ``reasoning/textDelta`` stream, but that is
-    not the display summary and must never be copied into the task board or its
-    project-local chat archive. ``summary`` is the protocol field intended for
-    explaining the model's reasoning to people.
-    """
-    if not isinstance(item, dict):
-        return ""
-    summary = item.get("summary")
-    if isinstance(summary, str):
-        return summary.strip()
-    if not isinstance(summary, list):
-        return ""
-    parts = [part.strip() for part in summary if isinstance(part, str) and part.strip()]
-    return "\n\n".join(parts)
+from delivery_bridge.reasoning import (
+    reasoning_summary_text,
+)
 
 
 def progress_event_of(message: dict[str, Any]) -> tuple[str, str, str, str] | None:
@@ -798,6 +775,7 @@ def progress_event_of(message: dict[str, Any]) -> tuple[str, str, str, str] | No
 
 
 from delivery_bridge.prompt_context import (
+    BRIDGE_CONTEXT_RE,
     BRIDGE_CONTEXT_TAG,
     wrap_bridge_context,
     with_mention_context,
@@ -2847,41 +2825,20 @@ def build_requirement_prototype_prompt(
     return wrap_bridge_context(context_lines, message or "请根据上述需求生成 HTML 原型。")
 
 
-def attachment_marker(attachments: list[dict[str, Any]]) -> str:
-    attachment_ids = [str(attachment.get("id") or "") for attachment in attachments]
-    return f"<!-- delivery-task-attachments:{','.join(attachment_ids)} -->" if attachment_ids else ""
 
 
-def message_with_attachments(message: str, attachments: list[dict[str, Any]]) -> str:
-    """Add file references for Codex without leaking bridge-only context into chat history.
-
-    幂等：各条发送链路里，有的调用方自己先拼过附件段，客户端里还会再统一兜一次。
-    已经带了附件标记的正文原样返回，避免同一批文件被描述两遍。
-    """
-    if ATTACHMENT_MARKER_RE.search(message):
-        return message
-    text = message.strip() or "请查看随附文件并继续处理。"
-    if not attachments:
-        return text
-    lines = [text, "", "<delivery-task-attachments>", "本条消息随附了以下文件，已经保存到当前工作区，上面那段文字才是用户本轮真正的要求："]
-    for attachment in attachments:
-        name = str(attachment.get("name") or "附件")
-        location = attachment.get("relativePath") or attachment.get("path")
-        # 路径对每种附件都要给全：图片虽然可能同时作为图片输入传入，但不是每个执行器都支持，
-        # 只写一句「已作为图片输入传入」而不给路径，执行器就只能自己去猜文件在哪。
-        kind = "图片" if attachment.get("isImage") else "文件"
-        lines.append(f"- {kind}：{name}，路径：{location}")
-    lines.extend(["</delivery-task-attachments>", attachment_marker(attachments)])
-    return "\n".join(lines)
 
 
-def attachment_ids_from_text(text: str) -> list[str]:
-    match = ATTACHMENT_MARKER_RE.search(text)
-    return match.group(1).split(",") if match else []
 
 
-def text_without_attachment_context(text: str) -> str:
-    return ATTACHMENT_MARKER_RE.sub("", BRIDGE_CONTEXT_RE.sub("", ATTACHMENT_CONTEXT_RE.sub("", text))).strip()
+from delivery_bridge.attachments_text import (
+    ATTACHMENT_MARKER_RE,
+    ATTACHMENT_CONTEXT_RE,
+    attachment_marker,
+    message_with_attachments,
+    attachment_ids_from_text,
+    text_without_attachment_context,
+)
 
 
 def validate_execute_payload(value: Any) -> dict[str, Any]:
@@ -3012,8 +2969,9 @@ def validate_business_conversation_payload(value: Any) -> tuple[int, str, str, s
     return program_id, item_key, message, thread_id, model, reasoning_effort_of(value, provider), attachment_ids
 
 
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+from delivery_bridge.timeutil import (
+    utc_now,
+)
 
 
 def next_conversation_version(binding: dict[str, Any] | None) -> int:
@@ -3245,1062 +3203,88 @@ def validate_task_identity(value: Any) -> tuple[str, int, str]:
     return "", program_id, item_key
 
 
-def journal_item(item: dict[str, Any]) -> dict[str, Any]:
-    """把一条实时条目收敛成可落盘、可回放的形状。
-
-    面板从来只展示推理的 `summary`，原始推理正文（`content` / `encryptedContent`）
-    既不上屏也不归档；日志是同一份数据的另一种存放方式，同样不能把它留下来。
-    命令输出体积大且面板不展示，一并丢掉。
-    """
-    kept = {key: value for key, value in item.items() if key not in {"aggregatedOutput", "output", "stdout", "stderr"}}
-    if str(item.get("type") or "") == "reasoning":
-        summary = item.get("summary")
-        kept = {
-            "id": item.get("id"),
-            "type": "reasoning",
-            "status": item.get("status"),
-            "summary": summary if isinstance(summary, (str, list)) else [],
-        }
-    return kept
-
-
-REASONING_SUMMARY_METHODS = {"item/reasoning/summaryPartAdded", "item/reasoning/summaryTextDelta"}
-JOURNAL_METHODS = {"turn/started", "turn/completed", "item/started", "item/completed"} | REASONING_SUMMARY_METHODS
-
-
-class ThreadItemJournal:
-    """记录 app-server 的实时条目流，补上 `thread/read` 读不回来的执行过程。
-
-    协议里对 `thread/rollback` 的说明写明了这点：Turn 里存的 ThreadItems 是有损的，
-    命令执行这类交互不会被持久化，`thread/resume` 同理。实测一个「先跑 echo 再回答」
-    的回合，实时流里有 reasoning 和 commandExecution，`thread/read` 只剩首尾两条消息。
-    """
-
-    def __init__(self, root: Path = CODEX_THREAD_ITEMS_DIR) -> None:
-        self.root = root
-        self.lock = threading.Lock()
-        # item 事件不一定带 turnId，按线程记住当前回合，落到正确的那一轮上。
-        self.current_turns: dict[str, str] = {}
-
-    def _path(self, thread_id: str) -> Path:
-        return self.root / f"{hashlib.sha256(thread_id.encode('utf-8')).hexdigest()[:32]}.json"
-
-    def read(self, thread_id: str) -> list[dict[str, Any]]:
-        if not thread_id:
-            return []
-        path = self._path(thread_id)
-        with self.lock:
-            if not path.is_file():
-                return []
-            try:
-                value = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                return []
-        turns = value.get("turns") if isinstance(value, dict) else None
-        return [turn for turn in turns or [] if isinstance(turn, dict)]
-
-    def _write(self, thread_id: str, turns: list[dict[str, Any]]) -> None:
-        path = self._path(thread_id)
-        payload = {"threadId": thread_id, "updatedAt": utc_now(), "turns": turns[-MAX_THREAD_JOURNAL_TURNS:]}
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            temp_path = path.with_suffix(".tmp")
-            temp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-            os.chmod(temp_path, 0o600)
-            os.replace(temp_path, path)
-        except OSError as exc:
-            print(f"保存 Codex 会话过程记录失败：{thread_id}: {exc}", file=sys.stderr, flush=True)
-
-    def record(self, message: dict[str, Any]) -> None:
-        """吃一条 app-server 通知；不认识的方法直接忽略，绝不打断读流线程。"""
-        method = str(message.get("method") or "")
-        if method not in JOURNAL_METHODS:
-            return
-        params = message.get("params") if isinstance(message.get("params"), dict) else {}
-        thread_id = str(params.get("threadId") or "")
-        if not thread_id:
-            return
-        turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
-        item = params.get("item") if isinstance(params.get("item"), dict) else {}
-        turn_id = str(params.get("turnId") or turn.get("id") or item.get("turnId") or "")
-        with self.lock:
-            if method in {"turn/started", "turn/completed"} and turn_id:
-                self.current_turns[thread_id] = turn_id
-            turn_id = turn_id or self.current_turns.get(thread_id, "")
-            if not turn_id:
-                return
-            turns = self.read_unlocked(thread_id)
-            entry = next((value for value in turns if str(value.get("id") or "") == turn_id), None)
-            if entry is None:
-                entry = {"id": turn_id, "status": "inProgress", "createdAt": utc_now(), "completedAt": "", "items": []}
-                turns.append(entry)
-            if method == "turn/started":
-                entry["status"] = str(turn.get("status") or entry.get("status") or "inProgress")
-            elif method == "turn/completed":
-                entry["status"] = str(turn.get("status") or "completed")
-                entry["completedAt"] = utc_now()
-                self.current_turns.pop(thread_id, None)
-            elif method in REASONING_SUMMARY_METHODS:
-                # 推理摘要不在 item 上，它是单独流出来的：item/completed 里的 summary 实测是空的。
-                item_id = str(params.get("itemId") or params.get("targetItemId") or item.get("id") or "")
-                if not item_id:
-                    return
-                target = self._reasoning_entry(entry, item_id)
-                index = params.get("summaryIndex")
-                if not (isinstance(index, int) and index >= 0):
-                    # 没给下标时：新分片就是往后追一段，文本增量落在当前这一段上。
-                    index = len(target["summary"]) if method == "item/reasoning/summaryPartAdded" else max(0, len(target["summary"]) - 1)
-                while len(target["summary"]) <= index:
-                    target["summary"].append("")
-                target["summary"][index] += str(params.get("delta") or params.get("text") or "")
-            else:
-                item_id = str(item.get("id") or "")
-                if not item_id:
-                    return
-                recorded = journal_item(item)
-                items = entry.setdefault("items", [])
-                existing = next((index for index, value in enumerate(items) if str(value.get("id") or "") == item_id), -1)
-                if existing >= 0:
-                    # 摘要是流式攒出来的，别被终态那条空 summary 覆盖掉。
-                    if not recorded.get("summary") and items[existing].get("summary"):
-                        recorded["summary"] = items[existing]["summary"]
-                    items[existing] = recorded
-                else:
-                    items.append(recorded)
-                del items[:-MAX_THREAD_JOURNAL_ITEMS]
-            self._write(thread_id, turns)
-
-    @staticmethod
-    def _reasoning_entry(turn: dict[str, Any], item_id: str) -> dict[str, Any]:
-        """摘要分片可能先于 item/started 到达，需要时就地建一条推理条目。"""
-        items = turn.setdefault("items", [])
-        target = next((value for value in items if str(value.get("id") or "") == item_id), None)
-        if target is None:
-            target = {"id": item_id, "type": "reasoning", "status": "inProgress", "summary": []}
-            items.append(target)
-        if not isinstance(target.get("summary"), list):
-            target["summary"] = [target["summary"]] if isinstance(target.get("summary"), str) and target["summary"] else []
-        return target
-
-    def read_unlocked(self, thread_id: str) -> list[dict[str, Any]]:
-        path = self._path(thread_id)
-        if not path.is_file():
-            return []
-        try:
-            value = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return []
-        turns = value.get("turns") if isinstance(value, dict) else None
-        return [turn for turn in turns or [] if isinstance(turn, dict)]
-
-
-THREAD_ITEMS = ThreadItemJournal()
-
-
-def journal_item_signature(item: dict[str, Any]) -> tuple[str, str]:
-    """按内容认条目，不按 id 认。
-
-    实测同一条消息在实时流和 `thread/read` 里 id 并不相同（服务端落库时会重新分配），
-    只按 id 去重会把整轮消息重复一遍。
-    """
-    item_type = str(item.get("type") or "")
-    if item_type == "userMessage":
-        text = text_from_user_item(item)
-    elif item_type == "reasoning":
-        text = reasoning_summary_text(item)
-    elif item_type == "commandExecution":
-        command = item.get("command") or item.get("commands") or ""
-        text = "\n".join(str(part) for part in command) if isinstance(command, list) else str(command)
-    elif item_type in {"fileChange", "fileEdit"}:
-        text = "\n".join(change["path"] for change in file_changes_of(item))
-    else:
-        text = str(item.get("text") or item.get("content") or item.get("tool") or item.get("name") or "")
-    return item_type, " ".join(text.split())
-
-
-def reasoning_summary_parts(item: dict[str, Any]) -> list[str]:
-    """推理条目里的一段段摘要。字符串形式的按空行拆开，和流式分片对齐。"""
-    summary = item.get("summary") if isinstance(item, dict) else None
-    parts = summary if isinstance(summary, list) else re.split(r"\n{2,}", summary) if isinstance(summary, str) else []
-    return [part.strip() for part in parts if isinstance(part, str) and part.strip()]
-
-
-def normalized_reasoning_part(part: str) -> str:
-    return " ".join(part.split())
-
-
-def deduped_reasoning_item(item: dict[str, Any], known: set[str]) -> dict[str, Any] | None:
-    """`thread/read` 事后会把整轮摘要合成一条还回来，实时流里已经有的段落要去掉。
-
-    两边 id 对不上（服务端落库时重新分配），只能按内容认；全都见过就整条丢掉，
-    否则回合末尾会把前面的「分析」原样重放一遍。
-    """
-    remaining = [part for part in reasoning_summary_parts(item) if normalized_reasoning_part(part) not in known]
-    if not remaining:
-        return None
-    known.update(normalized_reasoning_part(part) for part in remaining)
-    return {**item, "summary": remaining}
-
-
-def merge_journal_turns(thread: dict[str, Any], journal_turns: list[dict[str, Any]]) -> dict[str, Any]:
-    """用实时记录补全 `thread/read` 的回合正文。
-
-    以服务端返回的回合顺序为准（它才知道整个线程的历史），逐轮把记录里的条目铺开；
-    服务端有、记录里没有的条目（比如桥接中途才接上的那一轮）按原样补在后面。
-    """
-    if not isinstance(thread, dict) or not journal_turns:
-        return thread
-    journal = {str(turn.get("id") or ""): turn for turn in journal_turns if str(turn.get("id") or "")}
-    if not journal:
-        return thread
-    turns = thread.get("turns") if isinstance(thread.get("turns"), list) else []
-    merged: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for turn in turns:
-        if not isinstance(turn, dict):
-            continue
-        turn_id = str(turn.get("id") or "")
-        seen.add(turn_id)
-        recorded = journal.get(turn_id)
-        if recorded is None:
-            merged.append(turn)
-            continue
-        items = [item for item in recorded.get("items") or [] if isinstance(item, dict)]
-        known = {journal_item_signature(item) for item in items}
-        # 摘要按段去重，不按整条：实时流一段一条，服务端事后给的是合在一起的全文。
-        known_parts = {
-            normalized_reasoning_part(part)
-            for item in items if str(item.get("type") or "") == "reasoning"
-            for part in reasoning_summary_parts(item)
-        }
-        for item in turn.get("items") or []:
-            if not isinstance(item, dict):
-                continue
-            if str(item.get("type") or "") == "reasoning":
-                deduped = deduped_reasoning_item(item, known_parts)
-                if deduped is not None:
-                    items.append(deduped)
-                continue
-            if journal_item_signature(item) not in known:
-                items.append(item)
-        merged.append({**turn, "items": items})
-    # 线程刚跑完就读，服务端有时还没把这一轮写进历史；记录里已经有了就直接补上。
-    merged.extend(turn for turn in journal_turns if str(turn.get("id") or "") not in seen)
-    return {**thread, "turns": merged}
-
-
-class AppServerClient:
-    def __init__(self, workspace: Path, event_callback: Any = None, environment: dict[str, str] | None = None):
-        self.workspace = workspace
-        self.event_callback = event_callback
-        process_environment = os.environ.copy()
-        process_environment.update(environment or {})
-        codex_command = provision_codex_cli()
-        if not codex_command:
-            raise BridgeFailure("未找到 Codex CLI 或 Codex Desktop 资源目录中的可执行文件")
-        self.process = subprocess.Popen(
-            [codex_command, "app-server"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            bufsize=1,
-            cwd=workspace,
-            env=process_environment,
-        )
-        # Responses and lifecycle notifications are consumed by different callers.
-        # Keeping them separate prevents a progress follower from swallowing the
-        # response for a concurrent steer or interrupt request.
-        self.messages: queue.Queue[dict[str, Any]] = queue.Queue()
-        self.responses: queue.Queue[dict[str, Any]] = queue.Queue()
-        self.write_lock = threading.Lock()
-        self.response_lock = threading.Lock()
-        self.stderr_lock = threading.Lock()
-        self.stderr_lines: deque[str] = deque(maxlen=APP_SERVER_STDERR_TAIL)
-        threading.Thread(target=self._read_stdout, daemon=True).start()
-        threading.Thread(target=self._drain_stderr, daemon=True).start()
-        self.send(
-            "initialize",
-            0,
-            {"clientInfo": {"name": "delivery_task_planner", "title": "Delivery Task Planner", "version": "0.1.0"}},
-        )
-        self.wait_response(0)
-        self.notify("initialized", {})
-
-    def _read_stdout(self) -> None:
-        assert self.process.stdout is not None
-        for line in self.process.stdout:
-            try:
-                message = json.loads(line)
-                # 先留痕再分发：`thread/read` 读不回执行过程，只有这条实时流是完整的。
-                try:
-                    THREAD_ITEMS.record(message)
-                except Exception as exc:  # 记录失败不能拖垮读流线程
-                    print(f"记录 Codex 会话过程失败：{exc}", file=sys.stderr, flush=True)
-                if self.event_callback is not None:
-                    self.event_callback(message)
-                if "id" in message:
-                    self.responses.put(message)
-                else:
-                    self.messages.put(message)
-            except json.JSONDecodeError:
-                continue
-
-    def _drain_stderr(self) -> None:
-        """留痕而不是丢弃：这一路是 app-server 唯一会说出问题的地方。
-
-        以前这里直接 `pass`，MCP 启动超时、模型列表拉不回来这类告警在桥接器侧
-        完全没有痕迹，只能事后去翻 `~/.codex/sessions` 的 rollout。
-        """
-        assert self.process.stderr is not None
-        for line in self.process.stderr:
-            text = line.rstrip()
-            if not text:
-                continue
-            with self.stderr_lock:
-                self.stderr_lines.append(text)
-            print(f"[codex app-server] {text}", file=sys.stderr, flush=True)
-
-    def stderr_tail(self, limit: int = 10) -> str:
-        with self.stderr_lock:
-            return "\n".join(list(self.stderr_lines)[-limit:])
-
-    def write(self, message: dict[str, Any]) -> None:
-        with self.write_lock:
-            if self.process.poll() is not None:
-                raise BridgeFailure("Codex App Server 已退出")
-            assert self.process.stdin is not None
-            self.process.stdin.write(json.dumps(message, ensure_ascii=False) + "\n")
-            self.process.stdin.flush()
-
-    def send(self, method: str, request_id: int, params: dict[str, Any]) -> None:
-        self.write({"method": method, "id": request_id, "params": params})
-
-    def notify(self, method: str, params: dict[str, Any]) -> None:
-        self.write({"method": method, "params": params})
-
-    def wait_response(self, request_id: int, timeout: float = 20) -> dict[str, Any]:
-        # 排队时间也算进预算：以前 deadline 是拿到锁之后才起算，一个回合正在跑的
-        # client 上并发发请求，实际等待会变成「排队 + timeout」，轻松超过调用方的上限。
-        deadline = time.monotonic() + timeout
-        if not self.response_lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
-            raise BridgeFailure("等待 Codex 响应超时")
-        try:
-            deferred: list[dict[str, Any]] = []
-            while time.monotonic() < deadline:
-                try:
-                    message = self.responses.get(timeout=min(0.5, deadline - time.monotonic()))
-                except queue.Empty:
-                    continue
-                if message.get("id") == request_id:
-                    for later in deferred:
-                        self.responses.put(later)
-                    if message.get("error"):
-                        raise BridgeFailure(str(message["error"].get("message") or "Codex 请求失败"))
-                    return message.get("result") or {}
-                deferred.append(message)
-            for later in deferred:
-                self.responses.put(later)
-        finally:
-            self.response_lock.release()
-        raise BridgeFailure("等待 Codex 响应超时")
-
-    def start_task(
-        self,
-        title: str,
-        prompt: str,
-        attachments: list[dict[str, Any]] | None = None,
-        model: str = "",
-        reasoning_effort: str = "",
-        fast_mode: bool = False,
-    ) -> tuple[str, str]:
-        thread_params = {
-            "cwd": str(self.workspace),
-            "approvalPolicy": "never",
-            "sandbox": "danger-full-access",
-            "threadSource": "user",
-            "ephemeral": False,
-        }
-        if model:
-            thread_params["model"] = model
-        self.send(
-            "thread/start",
-            1,
-            thread_params,
-        )
-        thread_result = self.wait_response(1)
-        thread = thread_result.get("thread") or {}
-        thread_id = str(thread.get("id") or "")
-        if not thread_id:
-            raise BridgeFailure("Codex 没有返回 thread id")
-        self.thread_id = thread_id
-        self.send("thread/name/set", 2, {"threadId": thread_id, "name": title[:128]})
-        self.wait_response(2)
-        turn_params = {
-            "threadId": thread_id,
-            "input": self._input_parts(prompt, attachments),
-            "cwd": str(self.workspace),
-            "approvalPolicy": "never",
-            "sandboxPolicy": {"type": "dangerFullAccess"},
-        }
-        if model:
-            turn_params["model"] = model
-        if reasoning_effort:
-            turn_params["effort"] = reasoning_effort
-        # ``detailed`` asks Codex for the fullest supported *summary*, never for
-        # raw reasoning. 合法取值是 auto / concise / detailed / none；auto 由模型自己
-        # 决定详略，实测经常只给一两句，和桌面版看到的过程对不上。
-        turn_params["summary"] = TURN_REASONING_SUMMARY
-        self.send(
-            "turn/start",
-            3,
-            turn_params,
-        )
-        turn_result = self.wait_response(3)
-        turn_id = str((turn_result.get("turn") or {}).get("id") or "")
-        return thread_id, turn_id
-
-    def set_thread_name(self, thread_id: str, name: str, request_id: int = 2) -> None:
-        """Rename an existing Codex thread after its first answer is available."""
-        if not thread_id or not name.strip():
-            return
-        self.send("thread/name/set", request_id, {"threadId": thread_id, "name": name.strip()[:128]})
-        self.wait_response(request_id)
-
-    def resume_thread(self, thread_id: str, request_id: int = 10) -> dict[str, Any]:
-        self.send("thread/resume", request_id, {"threadId": thread_id, "cwd": str(self.workspace)})
-        result = self.wait_response(request_id)
-        self.thread_id = thread_id
-        return result
-
-    def start_turn(
-        self,
-        thread_id: str,
-        text: str,
-        attachments: list[dict[str, Any]] | None = None,
-        request_id: int = 11,
-        model: str = "",
-        reasoning_effort: str = "",
-        fast_mode: bool = False,
-    ) -> str:
-        params = {
-            "threadId": thread_id,
-            "input": self._input_parts(text, attachments),
-            "cwd": str(self.workspace),
-            "approvalPolicy": "never",
-            "sandboxPolicy": {"type": "dangerFullAccess"},
-        }
-        if model:
-            params["model"] = model
-        if reasoning_effort:
-            params["effort"] = reasoning_effort
-        params["summary"] = TURN_REASONING_SUMMARY
-        self.send(
-            "turn/start",
-            request_id,
-            params,
-        )
-        result = self.wait_response(request_id)
-        turn_id = str((result.get("turn") or {}).get("id") or "")
-        if not turn_id:
-            raise BridgeFailure("Codex 没有返回 turn id")
-        return turn_id
-
-    def list_models(self, request_id: int = 20) -> list[dict[str, Any]]:
-        self.send("model/list", request_id, {"limit": 100})
-        result = self.wait_response(request_id)
-        models = result.get("data") or []
-        return models if isinstance(models, list) else []
-
-    def steer_turn(
-        self,
-        thread_id: str,
-        turn_id: str,
-        text: str,
-        attachments: list[dict[str, Any]] | None = None,
-        request_id: int = 12,
-    ) -> str:
-        self.send(
-            "turn/steer",
-            request_id,
-            {
-                "threadId": thread_id,
-                "expectedTurnId": turn_id,
-                "input": self._input_parts(text, attachments),
-            },
-        )
-        result = self.wait_response(request_id)
-        return str(result.get("turnId") or turn_id)
-
-    @staticmethod
-    def _input_parts(text: str, attachments: list[dict[str, Any]] | None = None) -> list[dict[str, str]]:
-        # 正文永远是第一段，附件说明统一在这里兜底补齐：不是每条发送链路都自己拼过附件段，
-        # 少了它，非图片附件对 Codex 就等于没传（图片还有 localImage，文件什么都不剩）。
-        parts: list[dict[str, str]] = [{"type": "text", "text": message_with_attachments(text, attachments or [])}]
-        for attachment in attachments or []:
-            path = str(attachment.get("path") or "")
-            if attachment.get("isImage") and path:
-                parts.append({"type": "localImage", "path": path})
-        return parts
-
-    def interrupt_turn(self, thread_id: str, turn_id: str, request_id: int = 13) -> None:
-        self.send("turn/interrupt", request_id, {"threadId": thread_id, "turnId": turn_id})
-        self.wait_response(request_id)
-
-    def read_thread(self, thread_id: str, request_id: int = 100, timeout: float = 20) -> dict[str, Any]:
-        self.send("thread/read", request_id, {"threadId": thread_id, "includeTurns": True})
-        result = self.wait_response(request_id, timeout)
-        thread = result.get("thread") or {}
-        if not isinstance(thread, dict):
-            return {}
-        return merge_journal_turns(thread, THREAD_ITEMS.read(thread_id))
-
-    def next_request_id(self) -> int:
-        request_id = int(getattr(self, "request_sequence", 1000)) + 1
-        self.request_sequence = request_id
-        return request_id
-
-    def read_turn(self, thread_id: str, turn_id: str, request_id: int = 100) -> dict[str, Any]:
-        turns = self.read_thread(thread_id, request_id).get("turns") or []
-        turn = next((item for item in turns if str(item.get("id") or "") == turn_id), None)
-        return turn if isinstance(turn, dict) else {}
-
-    def read_turn_status(self, thread_id: str, turn_id: str, request_id: int = 100) -> str:
-        return str(self.read_turn(thread_id, turn_id, request_id).get("status") or "")
-
-    def wait_turn(self, turn_id: str, poll_interval: float = 2) -> str:
-        next_poll = 0.0
-        # 第一次读失败的时刻。读不出来不代表这一轮废了：turn/completed 通知照样会到，
-        # 会话刚建好的那几秒尤其容易读空，所以先忍一段时间，久读不到才把错抛出去。
-        first_failure = 0.0
-        while self.process.poll() is None:
-            now = time.monotonic()
-            if now >= next_poll:
-                try:
-                    status = self.read_turn_status(self.thread_id, turn_id, self.next_request_id())
-                    first_failure = 0.0
-                except BridgeFailure:
-                    if not first_failure:
-                        first_failure = now
-                    elif now - first_failure >= THREAD_READ_GRACE_SECONDS:
-                        raise
-                    status = ""
-                if status in TERMINAL_TURN_STATUSES:
-                    return status
-                next_poll = time.monotonic() + poll_interval
-            try:
-                message = self.messages.get(timeout=max(0.01, min(0.5, next_poll - time.monotonic())))
-            except queue.Empty:
-                continue
-            if message.get("method") == "turn/completed":
-                turn = (message.get("params") or {}).get("turn") or {}
-                if not turn_id or str(turn.get("id") or "") == turn_id:
-                    return str(turn.get("status") or "failed")
-        return "failed"
-
-    def close(self) -> None:
-        if self.process.poll() is None:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(timeout=3)
-
-
-class ClaudeTranscriptStore:
-    """Persist Claude print-mode conversations so the board can reread them later.
-
-    Codex 的 app-server 是常驻进程，`thread/read` 随时能读到完整历史；
-    Claude 每一轮都是新起的子进程，回合结束客户端就关掉了，
-    不落盘的话面板刷新一次聊天记录就空了。
-    """
-
-    def __init__(self, root: Path = CLAUDE_TRANSCRIPTS_DIR) -> None:
-        self.root = root
-        self.lock = threading.Lock()
-
-    def _path(self, thread_id: str) -> Path:
-        return self.root / f"{hashlib.sha256(thread_id.encode('utf-8')).hexdigest()[:32]}.json"
-
-    def read(self, thread_id: str) -> list[dict[str, Any]]:
-        if not thread_id:
-            return []
-        path = self._path(thread_id)
-        with self.lock:
-            if not path.is_file():
-                return []
-            try:
-                value = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                return []
-        turns = value.get("turns") if isinstance(value, dict) else None
-        return [turn for turn in turns or [] if isinstance(turn, dict)]
-
-    def write(self, thread_id: str, turns: list[dict[str, Any]]) -> None:
-        if not thread_id:
-            return
-        path = self._path(thread_id)
-        payload = {"threadId": thread_id, "updatedAt": utc_now(), "turns": turns[-MAX_CLAUDE_TRANSCRIPT_TURNS:]}
-        with self.lock:
-            try:
-                path.parent.mkdir(parents=True, exist_ok=True)
-                temp_path = path.with_suffix(".tmp")
-                temp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-                os.chmod(temp_path, 0o600)
-                os.replace(temp_path, path)
-            except OSError as exc:
-                print(f"保存 Claude 会话记录失败：{thread_id}: {exc}", file=sys.stderr, flush=True)
-
-
-CLAUDE_TRANSCRIPTS = ClaudeTranscriptStore()
-# Claude 的工具调用要还原成面板认识的条目类型，才能和 Codex 的会话长得一样。
-CLAUDE_FILE_TOOLS = {"Edit", "MultiEdit", "Write", "NotebookEdit"}
-CLAUDE_COMMAND_TOOLS = {"Bash", "BashOutput", "KillShell"}
-# Codex 的过程是一条条 shell 命令，面板能从命令本身看出"这一步在读文件还是在检索"。
-# Claude 用的是具名工具，命令行里没有对应的字面量，所以这里直接把语义标出来。
-CLAUDE_READ_TOOLS = {"Read", "NotebookRead"}
-CLAUDE_SEARCH_TOOLS = {"Grep", "Glob"}
-
-
-def text_line_count(value: Any) -> int:
-    text = str(value or "")
-    return len(text.splitlines()) if text else 0
-
-
-def claude_edit_line_counts(name: str, payload: dict[str, Any]) -> tuple[int, int]:
-    """Claude 不给 diff，只能按替换前后的文本数行，得出和 Codex 同量级的 `+N -M`。"""
-    if name == "Write":
-        return text_line_count(payload.get("content")), 0
-    edits = payload.get("edits") if isinstance(payload.get("edits"), list) else []
-    units = [edit for edit in edits if isinstance(edit, dict)] or [payload]
-    added = sum(text_line_count(unit.get("new_string")) for unit in units)
-    removed = sum(text_line_count(unit.get("old_string")) for unit in units)
-    return added, removed
-
-
-def claude_tool_item(block: dict[str, Any]) -> dict[str, Any]:
-    """Map one Claude tool_use block onto the conversation item shape the board renders."""
-    name = str(block.get("name") or "工具")
-    payload = block.get("input") if isinstance(block.get("input"), dict) else {}
-    item: dict[str, Any] = {"id": str(block.get("id") or secrets.token_urlsafe(8)), "status": "running"}
-    if name in CLAUDE_COMMAND_TOOLS:
-        command = str(payload.get("command") or payload.get("description") or "").strip()
-        return {**item, "type": "commandExecution", "command": command or name}
-    if name in CLAUDE_FILE_TOOLS:
-        edits = payload.get("edits") if isinstance(payload.get("edits"), list) else []
-        paths = [str(payload.get("file_path") or payload.get("notebook_path") or "").strip()]
-        paths.extend(str(edit.get("file_path") or "").strip() for edit in edits if isinstance(edit, dict))
-        kind = "add" if name == "Write" else "modify"
-        added, removed = claude_edit_line_counts(name, payload)
-        changes = [{"path": path, "kind": kind, "added": added, "removed": removed} for path in dict.fromkeys(paths) if path]
-        return {**item, "type": "fileChange", "changes": changes}
-    if name in CLAUDE_READ_TOOLS:
-        target = str(payload.get("file_path") or payload.get("notebook_path") or "").strip()
-        return {**item, "type": "dynamicToolCall", "tool": name, "action": "read", "target": target}
-    if name in CLAUDE_SEARCH_TOOLS:
-        target = str(payload.get("path") or payload.get("glob") or "").strip()
-        pattern = str(payload.get("pattern") or "").strip()
-        return {**item, "type": "dynamicToolCall", "tool": name, "action": "search", "target": target, "pattern": pattern}
-    if name.startswith("mcp__"):
-        # mcp__<服务>__<工具>：拆开才能显示成和 Codex 一样的「服务/工具」。
-        parts = name.split("__")
-        return {**item, "type": "mcpToolCall", "server": parts[1] if len(parts) > 2 else "", "tool": parts[-1]}
-    return {**item, "type": "dynamicToolCall", "tool": name}
-
-
-class ClaudeCLIClient:
-    """Claude Code print-mode adapter exposing the lifecycle used by ExecutionBridge."""
-
-    def __init__(
-        self,
-        workspace: Path,
-        event_callback: Any = None,
-        environment: dict[str, str] | None = None,
-        transcripts: ClaudeTranscriptStore | None = None,
-    ):
-        self.workspace = workspace
-        self.event_callback = event_callback
-        self.environment = os.environ.copy()
-        self.environment.update(environment or {})
-        self.process: subprocess.Popen[str] | None = None
-        self.thread_id = ""
-        self.turn_id = ""
-        self.turn_status = ""
-        self.turns: list[dict[str, Any]] = []
-        self.lock = threading.Lock()
-        self.transcripts = transcripts or CLAUDE_TRANSCRIPTS
-        # 落盘用的键固定成面板认识的那个会话号，即使 Claude 自己换了 session_id 也不换文件。
-        self.transcript_key = ""
-
-    def _start(self, prompt: str, model: str = "", resume: str = "", reasoning_effort: str = "", fast_mode: bool = False) -> tuple[str, str]:
-        if shutil.which("claude") is None:
-            raise BridgeFailure("未找到 Claude CLI")
-        command = ["claude", "-p", prompt, "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions"]
-        if model:
-            command.extend(["--model", model])
-        if reasoning_effort:
-            command.extend(["--effort", reasoning_effort])
-        if fast_mode:
-            command.append("--fast")
-        if resume:
-            command.extend(["--resume", resume])
-            self.thread_id = resume
-        else:
-            self.thread_id = str(uuid.uuid4())
-            command.extend(["--session-id", self.thread_id])
-        # 续聊时把之前几轮读回来，面板刷新后聊天记录不能只剩当前这一轮。
-        self.transcript_key = self.thread_id
-        self.turns = self.transcripts.read(self.transcript_key)
-        self.turn_id = secrets.token_urlsafe(16)
-        self.turn_status = "running"
-        turn = {"id": self.turn_id, "status": "running", "createdAt": utc_now(), "items": [{"id": secrets.token_urlsafe(8), "type": "userMessage", "content": prompt}]}
-        self.turns.append(turn)
-        self._persist()
-        self.process = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            bufsize=1,
-            cwd=self.workspace,
-            env=self.environment,
-        )
-        threading.Thread(target=self._consume, args=(turn,), daemon=True).start()
-        return self.thread_id, self.turn_id
-
-    def _persist(self) -> None:
-        self.transcripts.write(self.transcript_key or self.thread_id, self.turns)
-
-    def _publish(self, item: dict[str, Any]) -> None:
-        if self.event_callback:
-            self.event_callback({"method": "item/completed", "params": {"item": item}})
-
-    def _consume(self, turn: dict[str, Any]) -> None:
-        assert self.process is not None and self.process.stdout is not None
-        final_text = ""
-        # 鉴权过期这类失败，Claude 会照常收尾并把错误当正文吐出来，只有 result 里的
-        # is_error 说明这轮没成。不认它的话，面板会把「登录过期」显示成一条完成的回答。
-        result_failed = False
-        pending_tools: dict[str, dict[str, Any]] = {}
-        for line in self.process.stdout:
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            session_id = str(event.get("session_id") or event.get("sessionId") or "")
-            # 续聊时 Claude 可能给出新的 session_id，但面板认的是原来那个，别把键换掉。
-            if session_id and not self.transcript_key:
-                self.thread_id = session_id
-            event_type = str(event.get("type") or "")
-            if event_type == "assistant":
-                content = (event.get("message") or {}).get("content") or []
-                for block in content if isinstance(content, list) else []:
-                    if not isinstance(block, dict):
-                        continue
-                    block_type = str(block.get("type") or "")
-                    if block_type == "text" and block.get("text"):
-                        text = str(block["text"])
-                        item = {"id": secrets.token_urlsafe(8), "type": "agentMessage", "text": text, "status": "completed"}
-                        turn["items"].append(item)
-                        self._publish({"type": "agentMessage", "text": text})
-                    elif block_type == "tool_use":
-                        # 命令、文件改动、其他工具都要留痕：直接用 Claude 时看到的就是这些。
-                        item = claude_tool_item(block)
-                        turn["items"].append(item)
-                        pending_tools[str(block.get("id") or "")] = item
-                        self._publish(item)
-                    else:
-                        continue
-                self._persist()
-            if event_type == "user":
-                content = (event.get("message") or {}).get("content") or []
-                for block in content if isinstance(content, list) else []:
-                    if not isinstance(block, dict) or str(block.get("type") or "") != "tool_result":
-                        continue
-                    item = pending_tools.pop(str(block.get("tool_use_id") or ""), None)
-                    if item is None:
-                        continue
-                    failed = bool(block.get("is_error"))
-                    item["status"] = "failed" if failed else "completed"
-                    if item.get("type") == "commandExecution":
-                        item["exitCode"] = 1 if failed else 0
-                self._persist()
-            if event_type == "result":
-                final_text = str(event.get("result") or final_text)
-                result_failed = bool(event.get("is_error"))
-                if not self.transcript_key:
-                    self.thread_id = str(event.get("session_id") or self.thread_id)
-        return_code = self.process.wait()
-        failed = return_code != 0 or result_failed
-        if final_text and not any(item.get("text") == final_text for item in turn["items"]):
-            turn["items"].append({"id": secrets.token_urlsafe(8), "type": "agentMessage", "text": final_text, "status": "failed" if failed else "completed", "phase": "final_answer"})
-        elif final_text:
-            # 最终回复和最后一条 assistant 文本相同：把它标成终态，面板才认得出这是结论。
-            for item in reversed(turn["items"]):
-                if item.get("type") == "agentMessage" and item.get("text") == final_text:
-                    item["phase"] = "final_answer"
-                    if failed:
-                        item["status"] = "failed"
-                    break
-        for item in pending_tools.values():
-            item["status"] = "failed" if failed else "completed"
-        self.turn_status = "failed" if failed else "completed"
-        turn.update({"status": self.turn_status, "completedAt": utc_now()})
-        self._persist()
-
-    def start_task(
-        self,
-        title: str,
-        prompt: str,
-        attachments: list[dict[str, Any]] | None = None,
-        model: str = "",
-        reasoning_effort: str = "",
-        fast_mode: bool = False,
-    ) -> tuple[str, str]:
-        text = message_with_attachments(prompt, attachments or [])
-        thread_id, turn_id = self._start(text, model=model, reasoning_effort=reasoning_effort, fast_mode=fast_mode)
-        return self.thread_id, turn_id
-
-    def set_thread_name(self, thread_id: str, name: str, request_id: int = 2) -> None:
-        # Claude CLI has no persistent thread-name endpoint. Its panel-side session
-        # metadata is updated by the bridge, which is the title users see here.
-        return
-
-    def resume_thread(self, thread_id: str, request_id: int = 10) -> dict[str, Any]:
-        self.thread_id = thread_id
-        self.transcript_key = thread_id
-        return {"thread": {"id": thread_id}}
-
-    def start_turn(
-        self,
-        thread_id: str,
-        text: str,
-        attachments: list[dict[str, Any]] | None = None,
-        request_id: int = 11,
-        model: str = "",
-        reasoning_effort: str = "",
-        fast_mode: bool = False,
-    ) -> str:
-        self.thread_id = thread_id
-        return self._start(
-            message_with_attachments(text, attachments or []),
-            model=model,
-            resume=thread_id,
-            reasoning_effort=reasoning_effort,
-            fast_mode=fast_mode,
-        )[1]
-
-    def steer_turn(self, thread_id: str, turn_id: str, text: str, attachments: list[dict[str, Any]] | None = None, request_id: int = 12) -> str:
-        raise BridgeFailure("Claude 当前回合运行中，请等待完成后再发送追加要求")
-
-    def interrupt_turn(self, thread_id: str, turn_id: str, request_id: int = 13) -> None:
-        if self.process and self.process.poll() is None:
-            self.process.terminate()
-
-    def read_thread(self, thread_id: str, request_id: int = 100, timeout: float = 20) -> dict[str, Any]:
-        # 本进程跑过这条会话就用内存里的实时状态，否则回落到落盘的历史记录。
-        if self.turns and thread_id in {self.transcript_key, self.thread_id, ""}:
-            return {"id": thread_id or self.thread_id, "turns": list(self.turns)}
-        return {"id": thread_id, "turns": self.transcripts.read(thread_id)}
-
-    def read_turn(self, thread_id: str, turn_id: str, request_id: int = 100) -> dict[str, Any]:
-        turns = self.read_thread(thread_id).get("turns") or []
-        return next((turn for turn in turns if turn.get("id") == turn_id), {})
-
-    def wait_turn(self, turn_id: str, poll_interval: float = 0.2) -> str:
-        while self.process and self.process.poll() is None:
-            time.sleep(poll_interval)
-        return self.turn_status or "failed"
-
-    def next_request_id(self) -> int:
-        return 1
-
-    def stderr_tail(self, limit: int = 10) -> str:
-        # Claude CLI 的诊断信息走 stream-json，stderr 这一路没有可留痕的内容。
-        return ""
-
-    def list_models(self, request_id: int = 20) -> list[dict[str, Any]]:
-        return [{"model": value, "displayName": label} for value, label in [("opus", "Opus 5"), ("sonnet", "Sonnet 5")]]
-
-    def close(self) -> None:
-        if self.process and self.process.poll() is None:
-            self.process.terminate()
-
-
-def create_ai_client(provider: str, workspace: Path, event_callback: Any = None, environment: dict[str, str] | None = None) -> AppServerClient | ClaudeCLIClient:
-    if provider == "claude":
-        return ClaudeCLIClient(workspace, event_callback, environment)
-    return AppServerClient(workspace, event_callback, environment)
-
-
-# 只读快照的有效期。面板 3~5 秒轮询一次，这个值只用来合并「同一瞬间的重复读」，
-# 不会让正在跑的回合看起来卡住：回合活跃时正文走的是那一路自己的 client。
-THREAD_SNAPSHOT_TTL_SECONDS = 2.0
-# 只读执行器闲置多久就回收，别让空转的子进程一直挂着。
-THREAD_READER_IDLE_SECONDS = 300.0
-# 回合正在跑时读正文用的上限。这条路子共用执行器那一路的 JSON-RPC client，
-# app-server 忙着串流时不一定马上答 `thread/read`，必须明显低于面板 20s 的超时，
-# 否则浏览器先 abort、桥接还在空等，用户看到的就是一串 `(canceled)`。
-ACTIVE_THREAD_READ_TIMEOUT_SECONDS = 8.0
-# 兜底快照最多留几条，够覆盖同时开着的几个会话窗口就行。
-THREAD_LAST_GOOD_LIMIT = 64
-
-
-class ThreadReaderPool:
-    """只读会话正文用的执行器复用池 + 极短 TTL 快照缓存。
-
-    面板每 3~5 秒就要拉一次整段会话正文，而 Codex 的读法是「拉起一个
-    `codex app-server` 子进程 → 握手 → thread/read → 关掉」，一次几百毫秒到几秒。
-    几个弹窗一起轮询时这些子进程互相抢 CPU，单次请求被推到 20 秒开外，前端只能
-    按超时 abort（DevTools 里就是 `(canceled)`）。这里把只读执行器留着复用，
-    再给正文加一个很短的 TTL，把同一瞬间的重复轮询合并成一次真实读取。
-
-    只服务「没有活跃回合」的线程：回合在跑时调用方用的是那一路自己的 client，
-    正文直接来自内存，不经过这里，所以 TTL 带来的滞后最多一个 TTL。
-    """
-
-    def __init__(self) -> None:
-        self.lock = threading.Lock()
-        self.readers: dict[tuple[str, str, str], dict[str, Any]] = {}
-        self.snapshots: dict[tuple[str, str, str], tuple[float, dict[str, Any]]] = {}
-        # 最后一次读到正文的快照，没有 TTL：回合跑到一半读不回来时拿它兜底，
-        # 总比把空会话甩给面板强（增量内容前端还有 SSE 那一路）。
-        self.last_good_snapshots: dict[tuple[str, str, str], dict[str, Any]] = {}
-
-    @staticmethod
-    def _environment_signature(environment: dict[str, str] | None) -> str:
-        return json.dumps(sorted((environment or {}).items()), ensure_ascii=False)
-
-    @staticmethod
-    def _alive(client: Any) -> bool:
-        process = getattr(client, "process", None)
-        # Claude 适配器平时没有常驻进程，构造本身也不贵，按存活处理即可。
-        return process is None or process.poll() is None
-
-    def _take_idle(self, now: float) -> list[dict[str, Any]]:
-        """摘出闲置太久的执行器，真正关进程放到锁外做，别让读请求跟着等。"""
-        stale: list[dict[str, Any]] = []
-        for key, entry in list(self.readers.items()):
-            if now - float(entry.get("usedAt") or 0.0) <= THREAD_READER_IDLE_SECONDS:
-                continue
-            stale.append(self.readers.pop(key))
-        # 过期快照顺手清掉，别让 dict 随会话数一直涨。
-        for key, (stamp, _) in list(self.snapshots.items()):
-            if now - stamp > THREAD_SNAPSHOT_TTL_SECONDS:
-                self.snapshots.pop(key, None)
-        return stale
-
-    @staticmethod
-    def _close_all(entries: list[dict[str, Any]]) -> None:
-        for entry in entries:
-            try:
-                entry["client"].close()
-            except Exception:
-                pass
-
-    def _reader(self, provider: str, workspace: Path, environment: dict[str, str] | None) -> dict[str, Any]:
-        key = (provider, str(workspace), self._environment_signature(environment))
-        now = time.time()
-        with self.lock:
-            stale = self._take_idle(now)
-            entry = self.readers.get(key)
-            if entry is not None and not self._alive(entry["client"]):
-                self.readers.pop(key, None)
-                entry = None
-            if entry is None:
-                entry = {
-                    "client": create_ai_client(provider, workspace, environment=environment),
-                    "lock": threading.Lock(),
-                    "usedAt": now,
-                }
-                self.readers[key] = entry
-            entry["usedAt"] = now
-        self._close_all(stale)
-        return entry
-
-    def read(
-        self,
-        provider: str,
-        workspace: Path,
-        environment: dict[str, str] | None,
-        thread_id: str,
-    ) -> dict[str, Any]:
-        if not thread_id:
-            return {}
-        cache_key = (provider, str(workspace), thread_id)
-        now = time.time()
-        with self.lock:
-            cached = self.snapshots.get(cache_key)
-            if cached is not None and now - cached[0] <= THREAD_SNAPSHOT_TTL_SECONDS:
-                return cached[1]
-        entry = self._reader(provider, workspace, environment)
-        with entry["lock"]:
-            # 拿到读锁的这一刻可能别人刚读完，再看一眼缓存，省掉一次真实读取。
-            with self.lock:
-                cached = self.snapshots.get(cache_key)
-                if cached is not None and time.time() - cached[0] <= THREAD_SNAPSHOT_TTL_SECONDS:
-                    return cached[1]
-            if not self._alive(entry["client"]):
-                entry = self._reader(provider, workspace, environment)
-            thread = read_thread_or_empty(entry["client"], thread_id)
-        with self.lock:
-            self.snapshots[cache_key] = (time.time(), thread)
-        self.remember(provider, workspace, thread_id, thread)
-        return thread
-
-    def remember(self, provider: str, workspace: Path, thread_id: str, thread: dict[str, Any]) -> None:
-        """记下最后一次读到的正文，供回合忙时兜底。空会话不记，免得把兜底也污染掉。"""
-        if not thread_id or not (thread.get("turns") or []):
-            return
-        key = (provider, str(workspace), thread_id)
-        with self.lock:
-            self.last_good_snapshots.pop(key, None)
-            self.last_good_snapshots[key] = thread
-            while len(self.last_good_snapshots) > THREAD_LAST_GOOD_LIMIT:
-                self.last_good_snapshots.pop(next(iter(self.last_good_snapshots)))
-
-    def last_good(self, provider: str, workspace: Path, thread_id: str) -> dict[str, Any]:
-        with self.lock:
-            return self.last_good_snapshots.get((provider, str(workspace), thread_id)) or {}
-
-    def invalidate(self, thread_id: str = "") -> None:
-        """会话正文被改过（发消息、回合结束、停止）时丢掉快照，别让面板多等一个 TTL。"""
-        with self.lock:
-            if not thread_id:
-                self.snapshots.clear()
-                return
-            for key in [key for key in self.snapshots if key[2] == thread_id]:
-                self.snapshots.pop(key, None)
-
-    def shutdown(self) -> None:
-        with self.lock:
-            readers = list(self.readers.values())
-            self.readers.clear()
-            self.snapshots.clear()
-            self.last_good_snapshots.clear()
-        self._close_all(readers)
-
-
-THREAD_READERS = ThreadReaderPool()
-
-
-def read_thread_or_empty(client: Any, thread_id: str, timeout: float = 20) -> dict[str, Any]:
-    """读不到会话正文时按空会话返回，不把错误抛给需求编辑和任务详情。
-
-    会话正文只落在发起这条聊天的那台机器上（Codex 的 rollout、Claude 的
-    transcript）。别人在自己电脑上聊出来的会话，本机自然读不到，这属于常态而不是
-    故障，所以只保留目录里的会话条目、正文留空即可。
-    """
-    if not thread_id:
-        return {}
-    try:
-        return client.read_thread(thread_id, request_id=client.next_request_id(), timeout=timeout)
-    except (BridgeFailure, planner.ToolFailure, OSError, ValueError) as exc:
-        print(f"本机读取会话正文失败，按空会话处理：{thread_id}: {exc}", file=sys.stderr, flush=True)
-        return {}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+from delivery_bridge.clients.journal import (
+    MAX_THREAD_JOURNAL_TURNS,
+    MAX_THREAD_JOURNAL_ITEMS,
+    REASONING_SUMMARY_METHODS,
+    JOURNAL_METHODS,
+    journal_item,
+    ThreadItemJournal,
+    THREAD_ITEMS,
+    journal_item_signature,
+    reasoning_summary_parts,
+    normalized_reasoning_part,
+    deduped_reasoning_item,
+    merge_journal_turns,
+)
+
+
+from delivery_bridge.clients.codex import (
+    AppServerClient,
+)
+
+
+
+
+
+
+
+
+
+
+
+
+from delivery_bridge.clients.claude import (
+    CLAUDE_TRANSCRIPTS,
+    CLAUDE_FILE_TOOLS,
+    CLAUDE_COMMAND_TOOLS,
+    CLAUDE_READ_TOOLS,
+    CLAUDE_SEARCH_TOOLS,
+    ClaudeTranscriptStore,
+    text_line_count,
+    claude_edit_line_counts,
+    claude_tool_item,
+    ClaudeCLIClient,
+)
+
+
+# 造执行器客户端一律走 factory 模块属性：只读会话复用池那一路也走同一个名字，
+# 测试打桩改这一处就对所有调用方生效。
+from delivery_bridge.clients import factory
+from delivery_bridge.clients.factory import create_ai_client
+
+
+
+
+
+
+
+
+from delivery_bridge.clients.pool import (
+    THREAD_SNAPSHOT_TTL_SECONDS,
+    THREAD_READER_IDLE_SECONDS,
+    ACTIVE_THREAD_READ_TIMEOUT_SECONDS,
+    THREAD_LAST_GOOD_LIMIT,
+    ThreadReaderPool,
+    THREAD_READERS,
+    read_thread_or_empty,
+)
 
 
 class ConversationAttachmentStore:
@@ -5234,7 +4218,7 @@ class ExecutionBridge:
             title = f"需求拆解 · {requirement.get('name') or requirement_key or context.get('program', {}).get('name') or program_id}"
             if catalog:
                 title = f"{title} V0.0.{len(catalog)}"
-            client = create_ai_client(
+            client = factory.create_ai_client(
                 provider,
                 self.workspace,
                 lambda event: self._publish_app_server_event(identity, event),
@@ -5276,7 +4260,7 @@ class ExecutionBridge:
                 session.get("executorType") or provider,
             )
             detail_digest = planning_detail_digest(requirement)
-            client = create_ai_client(
+            client = factory.create_ai_client(
                 provider,
                 self.workspace,
                 lambda event: self._publish_app_server_event(identity, event),
@@ -5389,7 +4373,7 @@ class ExecutionBridge:
         reply: str,
     ) -> str:
         """起一轮只读短会话，为新聊天生成标题；超时则保留原始占位标题。"""
-        client = create_ai_client(
+        client = factory.create_ai_client(
             provider,
             self.workspace,
             None,
@@ -5838,7 +4822,7 @@ class ExecutionBridge:
             title = "预设环境"
             if catalog:
                 title = f"{title} V0.0.{len(catalog)}"
-            client = create_ai_client(
+            client = factory.create_ai_client(
                 provider,
                 workspace,
                 lambda event: self._publish_app_server_event(identity, event),
@@ -5863,7 +4847,7 @@ class ExecutionBridge:
             }
         else:
             thread_id = requested_thread_id or str(session.get("threadId") or "")
-            client = create_ai_client(
+            client = factory.create_ai_client(
                 provider,
                 workspace,
                 lambda event: self._publish_app_server_event(identity, event),
@@ -6186,7 +5170,7 @@ class ExecutionBridge:
             )
             if catalog:
                 title = f"{title} V{len(catalog) + 1}"
-            client = create_ai_client(
+            client = factory.create_ai_client(
                 provider, self.workspace, lambda event: self._publish_app_server_event(identity, event),
                 codex_environment(config, program_id, write_allowed=True),
             )
@@ -6214,7 +5198,7 @@ class ExecutionBridge:
                 session.get("executorType") or provider,
             )
             detail_digest = planning_detail_digest(requirement)
-            client = create_ai_client(
+            client = factory.create_ai_client(
                 provider, self.workspace, lambda event: self._publish_app_server_event(identity, event),
                 codex_environment(config, program_id, write_allowed=True),
             )
@@ -6512,7 +5496,7 @@ class ExecutionBridge:
             title = f"代码 review · {requirement.get('name') or requirement_key}"
             if catalog:
                 title = f"{title} V{len(catalog) + 1}"
-            client = create_ai_client(
+            client = factory.create_ai_client(
                 provider, self.workspace, lambda event: self._publish_app_server_event(identity, event),
                 codex_environment(config, program_id, write_allowed=True),
             )
@@ -6537,7 +5521,7 @@ class ExecutionBridge:
                 next((entry for entry in catalog if str(entry.get("threadId") or "") == thread_id), {}),
                 session.get("executorType") or provider,
             )
-            client = create_ai_client(
+            client = factory.create_ai_client(
                 provider, self.workspace, lambda event: self._publish_app_server_event(identity, event),
                 codex_environment(config, program_id, write_allowed=True),
             )
@@ -6786,7 +5770,7 @@ class ExecutionBridge:
             title = f"需求微调 · {requirement.get('name') or requirement_key}"
             if catalog:
                 title = f"{title} V{len(catalog) + 1}"
-            client = create_ai_client(
+            client = factory.create_ai_client(
                 provider, self.workspace, lambda event: self._publish_app_server_event(identity, event),
                 codex_environment(config, program_id, write_allowed=True),
             )
@@ -6808,7 +5792,7 @@ class ExecutionBridge:
                 next((entry for entry in catalog if str(entry.get("threadId") or "") == thread_id), {}),
                 session.get("executorType") or provider,
             )
-            client = create_ai_client(
+            client = factory.create_ai_client(
                 provider, self.workspace, lambda event: self._publish_app_server_event(identity, event),
                 codex_environment(config, program_id, write_allowed=True),
             )
@@ -6891,7 +5875,7 @@ class ExecutionBridge:
         assert_runtime_project(config, program_id)
         if provider == "codex":
             return {"defaultModel": "gpt-5.6-terra", "models": list(CODEX_MODEL_CATALOG)}
-        client = create_ai_client(provider, self.workspace, environment=codex_environment(config, program_id))
+        client = factory.create_ai_client(provider, self.workspace, environment=codex_environment(config, program_id))
         try:
             models = []
             for item in client.list_models():
@@ -7374,7 +6358,7 @@ class ExecutionBridge:
             if identity in self.active:
                 raise BridgeFailure("该任务测试用例会话正在恢复，请稍后重试")
             self.active.add(identity)
-        client = create_ai_client(
+        client = factory.create_ai_client(
             provider, self.workspace, lambda event: self._publish_app_server_event(identity, event),
             codex_environment(config, identity[1], write_allowed=True),
         )
@@ -7453,7 +6437,7 @@ class ExecutionBridge:
             if identity in self.active:
                 raise BridgeFailure("该任务正在生成测试用例")
             self.active.add(identity)
-        client = create_ai_client(
+        client = factory.create_ai_client(
             provider, self.workspace, lambda event: self._publish_app_server_event(identity, event),
             codex_environment(config, program_id, write_allowed=True),
         )
@@ -7746,7 +6730,7 @@ class ExecutionBridge:
             if identity in self.active:
                 raise BridgeFailure("该任务已有正在运行的微调会话")
             self.active.add(identity)
-        client = create_ai_client(
+        client = factory.create_ai_client(
             provider, self.workspace, lambda event: self._publish_app_server_event(identity, event),
             codex_environment(config, program_id_of(config.get("_project_id")), write_allowed=True),
         )
@@ -7809,7 +6793,7 @@ class ExecutionBridge:
                 )
                 self.progress.publish(identity, "message", "已追加微调要求", message, "running")
                 return {"accepted": True, "programId": program_id, "itemKey": item_key, "threadId": selected_thread_id, "turnId": running_turn_id, "active": True}
-        client = create_ai_client(
+        client = factory.create_ai_client(
             provider, self.workspace, lambda event: self._publish_app_server_event(identity, event),
             codex_environment(config, program_id, write_allowed=True),
         )
@@ -8279,7 +7263,7 @@ class ExecutionBridge:
 
         超时就掐掉进程，不让 HTTP 请求无限期挂着；调用方随后用仓库状态复核结果。
         """
-        client = create_ai_client(provider, workspace, None, codex_environment(config, program_id))
+        client = factory.create_ai_client(provider, workspace, None, codex_environment(config, program_id))
         try:
             thread_id, turn_id = client.start_task(
                 f"解决 {source} 合并到 {target} 的冲突",
@@ -8322,7 +7306,7 @@ class ExecutionBridge:
     ) -> tuple[str, str]:
         """起一轮 AI 会话专门修推送。超时就掐掉进程，不让 HTTP 请求无限期挂着。"""
         remote = git_default_remote(self.workspace)
-        client = create_ai_client(provider, self.workspace, None, codex_environment(config, program_id))
+        client = factory.create_ai_client(provider, self.workspace, None, codex_environment(config, program_id))
         try:
             thread_id, turn_id = client.start_task(
                 f"推送需求分支 {branch}",
@@ -8416,7 +7400,7 @@ class ExecutionBridge:
             self.active.add(identity)
 
         self.progress.publish(identity, "status", "正在领取任务", task["title"])
-        client = create_ai_client(
+        client = factory.create_ai_client(
             provider,
             self.workspace,
             lambda message: self._publish_app_server_event(identity, message),
@@ -9194,7 +8178,7 @@ class ExecutionBridge:
             if identity in self.active:
                 raise BridgeFailure("该业务诉求正在创建访谈会话，请稍后重试")
             self.active.add(identity)
-        client = create_ai_client("codex", self.workspace)
+        client = factory.create_ai_client("codex", self.workspace)
         try:
             if thread_id:
                 client.resume_thread(thread_id)
@@ -9662,7 +8646,7 @@ class ExecutionBridge:
         identity = self._requirement_prototype_identity(program_id, requirement_key)
         detail_digest = planning_detail_digest(requirement)
         title = f"需求原型 · {str(requirement.get('name') or requirement_key).strip()}"[:120]
-        client = create_ai_client(
+        client = factory.create_ai_client(
             provider,
             self.workspace,
             lambda event: self._publish_app_server_event(identity, event),
@@ -10350,7 +9334,7 @@ class ExecutionBridge:
                 raise BridgeFailure("该任务已经在本地执行中")
             self.active.add(identity)
         title = conversation_title(task, binding)
-        client = create_ai_client(
+        client = factory.create_ai_client(
             provider,
             self.workspace,
             lambda message: self._publish_app_server_event(identity, message),
@@ -10460,7 +9444,7 @@ class ExecutionBridge:
             if identity in self.active:
                 raise BridgeFailure("该任务已经在本地执行中")
             self.active.add(identity)
-        client = create_ai_client(
+        client = factory.create_ai_client(
             provider,
             self.workspace,
             lambda message: self._publish_app_server_event(identity, message),
@@ -10556,7 +9540,7 @@ class ExecutionBridge:
             if identity in self.active:
                 raise BridgeFailure("该任务正在恢复执行状态，请稍后重试")
             self.active.add(identity)
-        client = create_ai_client(
+        client = factory.create_ai_client(
             provider,
             self.workspace,
             lambda message: self._publish_app_server_event(identity, message),
@@ -10940,6 +9924,8 @@ class ExecutionBridge:
 
 
 from delivery_bridge.turn_output import (
+    SESSION_STATUS,
+    TERMINAL_TURN_STATUSES,
     EXECUTION_OUTPUT_LIMIT,
     TOOL_CALL_ITEM_TYPES,
     LEAKED_TOOL_CALL_MARKER,

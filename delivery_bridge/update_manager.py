@@ -506,6 +506,14 @@ class PluginUpdateManager:
             root / "delivery_bridge" / "codex_cli.py",
             root / "delivery_bridge" / "providers.py",
             root / "delivery_bridge" / "environments.py",
+            root / "delivery_bridge" / "attachments_text.py",
+            root / "delivery_bridge" / "timeutil.py",
+            root / "delivery_bridge" / "reasoning.py",
+            root / "delivery_bridge" / "clients" / "journal.py",
+            root / "delivery_bridge" / "clients" / "codex.py",
+            root / "delivery_bridge" / "clients" / "claude.py",
+            root / "delivery_bridge" / "clients" / "factory.py",
+            root / "delivery_bridge" / "clients" / "pool.py",
         ]
         if any(not path.exists() for path in required):
             raise UpdateFailure("发布包缺少插件清单、Skills 或桥接核心代码")

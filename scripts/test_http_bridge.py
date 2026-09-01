@@ -922,7 +922,7 @@ class HttpBridgeTest(unittest.TestCase):
 
             with (
                 patch.object(bridge.planner, "request_api", side_effect=request_api),
-                patch.object(bridge, "create_ai_client", return_value=client),
+                patch.object(bridge.factory, "create_ai_client", return_value=client),
                 patch.object(bridge.threading, "Thread") as thread,
             ):
                 result = executor.generate_requirement_prototype(
@@ -952,7 +952,7 @@ class HttpBridgeTest(unittest.TestCase):
         with (
             patch.object(bridge.planner, "project_context", return_value=context),
             patch.object(bridge.planner, "request_api", return_value=[]),
-            patch.object(bridge, "create_ai_client", return_value=client),
+            patch.object(bridge.factory, "create_ai_client", return_value=client),
             patch.object(bridge.threading, "Thread") as thread,
         ):
             created = executor.send_planning(payload, {"_project_id": 2})
@@ -977,7 +977,7 @@ class HttpBridgeTest(unittest.TestCase):
 
         with (
             patch.object(bridge.planner, "request_api", return_value=rows),
-            patch.object(bridge, "create_ai_client", return_value=client),
+            patch.object(bridge.factory, "create_ai_client", return_value=client),
         ):
             conversation = executor.planning(2, "thread-remote", config=self.runtime_config() | {"_project_id": 2}, requirement_key="req-a")
 
@@ -1136,7 +1136,7 @@ class HttpBridgeTest(unittest.TestCase):
         client.start_task.return_value = ("thread-env", "turn-env")
 
         with (
-            patch.object(bridge, "create_ai_client", return_value=client) as create_client,
+            patch.object(bridge.factory, "create_ai_client", return_value=client) as create_client,
             patch.object(bridge, "ensure_github_ssh_key", return_value={"githubSshConfigured": True, "githubSshPublicKey": "public", "githubSshError": ""}),
             patch.object(bridge.ENVIRONMENT_SETUP_SESSIONS, "load", return_value=None),
             patch.object(bridge.ENVIRONMENT_SETUP_SESSIONS, "save") as save,
@@ -1220,7 +1220,7 @@ class HttpBridgeTest(unittest.TestCase):
         with (
             patch.object(bridge.planner, "project_context", return_value=context),
             patch.object(bridge.planner, "request_api", side_effect=request_api),
-            patch.object(bridge, "create_ai_client", side_effect=make_client),
+            patch.object(bridge.factory, "create_ai_client", side_effect=make_client),
             patch.object(bridge.threading, "Thread"),
         ):
             executor.send_planning(payload, config)
@@ -1278,7 +1278,7 @@ class HttpBridgeTest(unittest.TestCase):
 
         with (
             patch.object(bridge.planner, "request_api", side_effect=request_api),
-            patch.object(bridge, "create_ai_client", side_effect=make_client),
+            patch.object(bridge.factory, "create_ai_client", side_effect=make_client),
         ):
             result = executor.planning(
                 2, "", config={"api_url": "http://test/api", "key": "k", "_project_id": 2},
@@ -1318,7 +1318,7 @@ class HttpBridgeTest(unittest.TestCase):
         with (
             patch.object(bridge.planner, "project_context", return_value=context),
             patch.object(bridge.planner, "request_api", side_effect=request_api),
-            patch.object(bridge, "create_ai_client", side_effect=make_client),
+            patch.object(bridge.factory, "create_ai_client", side_effect=make_client),
             patch.object(bridge.threading, "Thread"),
         ):
             executor.send_planning(
@@ -1362,7 +1362,7 @@ class HttpBridgeTest(unittest.TestCase):
 
         with (
             patch.object(bridge.planner, "request_api", side_effect=request_api),
-            patch.object(bridge, "create_ai_client", side_effect=make_client),
+            patch.object(bridge.factory, "create_ai_client", side_effect=make_client),
         ):
             result = executor.conversation(1, "api-1", config=self.runtime_config(), provider="claude")
 
@@ -2832,7 +2832,7 @@ class HttpBridgeTest(unittest.TestCase):
             patch.object(executor, "_task_detail", return_value={"itemKey": "a", "phase": "development", "status": "doing"}),
             patch.object(executor, "_session_binding", return_value=binding),
             patch.object(executor, "_task_session_bindings", return_value=[binding]),
-            patch.object(bridge, "AppServerClient", return_value=reader),
+            patch.object(bridge.clients.codex, "AppServerClient", return_value=reader),
         ):
             result = executor.conversation(1, "a", "thr_history", config=self.runtime_config())
 
@@ -3513,7 +3513,7 @@ class HttpBridgeTest(unittest.TestCase):
             with (
                 patch.object(bridge.planner, "request_api", side_effect=request_api),
                 patch.object(bridge.planner, "project_context", return_value={"items": []}),
-                patch.object(bridge, "create_ai_client", return_value=client),
+                patch.object(bridge.factory, "create_ai_client", return_value=client),
                 patch.object(bridge.threading, "Thread") as thread,
             ):
                 result = executor.send_requirement_testing(
@@ -3552,7 +3552,7 @@ class HttpBridgeTest(unittest.TestCase):
             with (
                 patch.object(bridge.planner, "request_api", side_effect=request_api),
                 patch.object(bridge.planner, "project_context", return_value={"items": []}),
-                patch.object(bridge, "create_ai_client", return_value=client),
+                patch.object(bridge.factory, "create_ai_client", return_value=client),
                 patch.object(bridge.threading, "Thread") as thread,
             ):
                 executor.send_requirement_testing(
@@ -3593,7 +3593,7 @@ class HttpBridgeTest(unittest.TestCase):
             with (
                 patch.object(bridge.planner, "project_context", return_value={"items": [task]}),
                 patch.object(bridge.planner, "request_api", side_effect=request_api),
-                patch.object(bridge, "create_ai_client", return_value=client),
+                patch.object(bridge.factory, "create_ai_client", return_value=client),
                 patch.object(bridge.threading, "Thread") as thread,
             ):
                 result = executor.generate_task_testing_cases(
@@ -3641,7 +3641,7 @@ class HttpBridgeTest(unittest.TestCase):
 
         with (
             patch.object(bridge.planner, "request_api", side_effect=request_api),
-            patch.object(bridge, "create_ai_client", return_value=client),
+            patch.object(bridge.factory, "create_ai_client", return_value=client),
         ):
             result = executor.task_testing_cases_conversation(1, "api-1", config=self.runtime_config())
 
@@ -3683,7 +3683,7 @@ class HttpBridgeTest(unittest.TestCase):
         with (
             patch.object(bridge.planner, "project_context", return_value={"items": [task]}),
             patch.object(bridge.planner, "request_api", side_effect=request_api),
-            patch.object(bridge, "create_ai_client", return_value=client),
+            patch.object(bridge.factory, "create_ai_client", return_value=client),
             patch.object(bridge.threading, "Thread") as thread,
         ):
             result = executor.generate_task_testing_cases(
@@ -3850,7 +3850,7 @@ class HttpBridgeTest(unittest.TestCase):
         with (
             patch.object(bridge.planner, "project_context", return_value=context),
             patch.object(bridge.planner, "request_api", side_effect=request_api),
-            patch.object(bridge, "AppServerClient", return_value=fake_client),
+            patch.object(bridge.clients.codex, "AppServerClient", return_value=fake_client),
             patch.object(bridge.threading, "Thread") as thread,
             patch.object(executor, "_migrate_legacy_task_outline") as migrate_legacy_outline,
         ):
@@ -4437,7 +4437,7 @@ class HttpBridgeTest(unittest.TestCase):
         client.thread_id = "thread-1"
         client.process = unittest.mock.MagicMock()
         client.process.poll.return_value = None
-        client.messages = bridge.queue.Queue()
+        client.messages = bridge.clients.codex.queue.Queue()
         client.messages.put({"method": "unrelated/notification"})
         client.read_turn_status = unittest.mock.MagicMock(side_effect=["inProgress", "interrupted"])
 
@@ -4452,7 +4452,7 @@ class HttpBridgeTest(unittest.TestCase):
         client.thread_id = "thread-1"
         client.process = unittest.mock.MagicMock()
         client.process.poll.return_value = None
-        client.messages = bridge.queue.Queue()
+        client.messages = bridge.clients.codex.queue.Queue()
         client.read_turn_status = unittest.mock.MagicMock(side_effect=[
             bridge.BridgeFailure("failed to read thread: rollout at ... is empty"),
             bridge.BridgeFailure("failed to read thread: rollout at ... is empty"),
@@ -4468,10 +4468,10 @@ class HttpBridgeTest(unittest.TestCase):
         client.thread_id = "thread-1"
         client.process = unittest.mock.MagicMock()
         client.process.poll.return_value = None
-        client.messages = bridge.queue.Queue()
+        client.messages = bridge.clients.codex.queue.Queue()
         client.read_turn_status = unittest.mock.MagicMock(side_effect=bridge.BridgeFailure("broken"))
 
-        with patch.object(bridge, "THREAD_READ_GRACE_SECONDS", 0):
+        with patch.object(bridge.clients.codex, "THREAD_READ_GRACE_SECONDS", 0):
             with self.assertRaises(bridge.BridgeFailure):
                 client.wait_turn("turn-1", poll_interval=0)
 
@@ -4641,7 +4641,7 @@ class HttpBridgeTest(unittest.TestCase):
                 "project_context",
                 return_value={"items": [{"itemKey": "a", "phase": "development", "status": "doing"}]},
             ),
-            patch.object(bridge, "AppServerClient") as app_server,
+            patch.object(bridge.clients.codex, "AppServerClient") as app_server,
         ):
             executor.reconcile()
 
