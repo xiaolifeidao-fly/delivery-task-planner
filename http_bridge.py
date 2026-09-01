@@ -401,6 +401,7 @@ from delivery_bridge.stores import (
     GIT_ENVIRONMENT_SESSIONS_PATH,
     MAX_GIT_ENVIRONMENT_CONVERSATIONS,
     ProgressStore,
+    PendingBatchFinalizeStore,
     PendingSessionSyncStore,
     GitEnvironmentSessionStore,
 )
@@ -1187,6 +1188,7 @@ from delivery_bridge.artifacts import (
 
 from delivery_bridge import execution
 from delivery_bridge.execution import ExecutionBridge
+from delivery_bridge.remote_worker import RemoteCommandWorker
 
 
 
@@ -1510,13 +1512,14 @@ class BridgeHandler(BaseHTTPRequestHandler):
         query = parse_qs(parsed.query)
         program_id = program_id_of((query.get("programId") or [""])[0])
         try:
-            self.bridge.request_config(
+            config = self.bridge.request_config(
                 {"programId": program_id},
                 self.allowed_origin() or "",
                 self.headers.get("token", "").strip(),
             )
             if parsed.path.endswith("/validate"):
                 selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
+                self.bridge.remember_remote_workspace(program_id, selected_bridge.workspace, config)
                 self.json_response(200, {
                     "valid": True,
                     "workspace": str(selected_bridge.workspace),
@@ -2187,12 +2190,14 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 return
             if path == "/v1/codex/git/submodules":
                 # 目录早就是仓库、只是子模块没拉下来：单独补这一步，不碰主仓库的分支和改动。
-                self.bridge.request_config(
+                config = self.bridge.request_config(
                     payload,
                     self.allowed_origin() or "",
                     self.headers.get("token", "").strip(),
                 )
-                submodule_workspace = self.bridge.for_workspace(payload.get("workspace")).workspace
+                selected_bridge = self.bridge.for_workspace(payload.get("workspace"))
+                self.bridge.remember_remote_workspace(program_id_of(payload.get("programId")), selected_bridge.workspace, config)
+                submodule_workspace = selected_bridge.workspace
                 require_git_workspace(submodule_workspace)
                 self.json_response(200, {
                     "workspace": str(submodule_workspace),
@@ -2201,13 +2206,15 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 return
             if path == "/v1/codex/git/init":
                 # 初始化时目录还不是仓库、甚至可能还没建出来，不能先走 for_workspace 的存在性校验。
-                self.bridge.request_config(
+                config = self.bridge.request_config(
                     payload,
                     self.allowed_origin() or "",
                     self.headers.get("token", "").strip(),
                 )
+                initialized_workspace = git_initializable_workspace_of(payload.get("workspace"))
+                self.bridge.remember_remote_workspace(program_id_of(payload.get("programId")), initialized_workspace, config)
                 self.json_response(200, git_initialize_workspace(
-                    git_initializable_workspace_of(payload.get("workspace")),
+                    initialized_workspace,
                     str(payload.get("repositoryUrl") or ""),
                     str(payload.get("remoteName") or "origin").strip() or "origin",
                     str(payload.get("baseBranch") or "").strip(),
@@ -2223,6 +2230,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     self.headers.get("token", "").strip(),
                 )
                 selected_bridge = self.bridge.for_workspace(payload.get("workspace"))
+                self.bridge.remember_remote_workspace(program_id_of(payload.get("programId")), selected_bridge.workspace, config)
             route = self.POST_ROUTES.get(path)
             if route is not None:
                 status, target, method, config_as_keyword = route
@@ -2342,6 +2350,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
             self.allowed_origin() or "",
             self.headers.get("token", "").strip(),
         )
+        self.bridge.remember_remote_workspace(program_id, selected_bridge.workspace, config)
         self.json_response(
             201,
             selected_bridge.upload_documents(
@@ -2407,6 +2416,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
             self.allowed_origin() or "",
             self.headers.get("token", "").strip(),
         )
+        self.bridge.remember_remote_workspace(program_id, selected_bridge.workspace, config)
         self.json_response(
             201,
             selected_bridge.upload_conversation_attachments(
@@ -2426,6 +2436,11 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument(
+        "--command-api-url",
+        default=os.environ.get("DELIVERY_COMMAND_API_URL", ""),
+        help="app-api base URL for the optional remote command Worker (for example https://api.example.com)",
+    )
     # 进程级工作目录是可选的：真正干活的目录由每个请求带的 workspace 决定（见 for_workspace）。
     # 不给就落到一个空的中性占位目录，绝不拿安装目录或启动目录冒充某个项目的仓库。
     parser.add_argument("--workspace", default="")
@@ -2452,9 +2467,13 @@ def main() -> None:
         business_workspace_root=business_workspace_root,
     )
     threading.Thread(target=httpd.bridge.reconcile_forever, daemon=True).start()  # type: ignore[attr-defined]
+    remote_worker = RemoteCommandWorker(httpd.bridge, api_url=args.command_api_url)  # type: ignore[attr-defined]
+    httpd.remote_worker = remote_worker  # type: ignore[attr-defined]
+    threading.Thread(target=remote_worker.run_forever, daemon=True, name="delivery-remote-worker").start()
     try:
         httpd.serve_forever()
     finally:
+        remote_worker.stop()
         # 只读执行器是常驻子进程，退出时收干净，别留孤儿。
         THREAD_READERS.shutdown()
 

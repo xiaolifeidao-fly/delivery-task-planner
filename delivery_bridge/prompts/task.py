@@ -13,11 +13,13 @@ from ..errors import BridgeFailure
 from ..prompt_context import workspace_instruction, wrap_bridge_context
 from .common import (
     PHASE_SKILLS,
+    document_exists,
     document_path_of,
     document_revision_rule,
     git_branch_lines,
     prototype_directory_of,
     requirement_document_catalog,
+    requirement_outline_path_for,
     sibling_document_lines,
 )
 
@@ -32,24 +34,68 @@ def build_task_prompt(payload: dict[str, Any], workspace: Path | None = None) ->
     design_directory = (Path(document_path).parent / "design").as_posix()
     prototype_directory = prototype_directory_of(task)
     test_artifact_directory = Path("doc") / "test" / str(task.get("itemKey") or "task")
+    # 文档在不在，一律由应用层核对后直接写死在提示词里：执行技能不再自己判断、也不再去试探性地读文件。
+    outline_path = requirement_outline_path_for(task)
+    outline_present = bool(outline_path) and document_exists(workspace, outline_path)
+    task_document_present = document_exists(workspace, document_path)
+    description = str(task.get("description") or "").strip()
+    # 需求级文档是这条任务所属需求的权威上下文，优先级高于任务级文档；任务级文档只补任务范围内的细节。
+    reading_order = (
+        [
+            f"需求级文档: `{outline_path}`（应用层已核对存在）。这是最高优先级的上下文：动手前先完整读一遍，"
+            "需求目标、范围、约束和验收口径以它为准。",
+        ]
+        if outline_present
+        else (
+            [f"需求级文档 `{outline_path}` 尚未沉淀（应用层已核对不存在）：不用去找它，也不要为此停下。"]
+            if outline_path
+            else []
+        )
+    )
+    if task_document_present:
+        reading_order.extend([
+            f"任务需求文档: `{document_path}`（应用层已核对存在）。这是本任务唯一的任务级需求文档，"
+            "读完需求级文档后接着完整读它；两者冲突时以需求级文档为准，并在最终回复里指出冲突点。",
+            document_revision_rule(document_path),
+        ])
+    else:
+        reading_order.extend([
+            f"本任务没有任务级需求文档：应用层已核对 `{document_path}` 不存在。不要去读它，不要因为缺文档就停下，"
+            "也不要在动手前先补一份需求文档；本轮的任务级需求，直接以下面的「任务说明」为准。",
+            "任务说明（本任务级需求的唯一来源，逐条落实，不要自行扩大或缩小范围）:",
+            description or "（面板未填写说明：只能依据需求级文档和真实代码执行；两者都不足以确定范围时，说明缺口并停下）",
+        ])
     # 每个阶段各有一个技能，明确点名让执行器去加载，别让它自己猜「当前项目的 skill」是哪个。
+    document_source = f"`{document_path}`" if task_document_present else "上面的任务说明"
     phase_instruction = {
         "requirement": (
             f"本次只进行梳理需求：遵循 {PHASE_SKILLS['requirement']} 技能，创建或更新工作区中的 `{document_path}`。"
             "每次后续会话都会从这个文件读取需求上下文；文档结论必须基于工作目录里的真实代码，不要凭业务名词推演。"
         ),
         "development": (
-            f"本次只进行动作执行：遵循 {PHASE_SKILLS['development']} 技能，先读取 `{document_path}`，"
-            "再按需求文档和当前项目的开发技能实现并交付产物。"
+            f"本次只进行动作执行：遵循 {PHASE_SKILLS['development']} 技能，按上面给出的阅读顺序取需求（{document_source}），"
+            "再按当前项目的开发技能实现并交付产物。"
         ),
         "testing": (
-            f"本次只进行成品测试：遵循 {PHASE_SKILLS['testing']} 技能，先读取 `{document_path}`，"
+            f"本次只进行成品测试：遵循 {PHASE_SKILLS['testing']} 技能，按上面给出的阅读顺序取需求（{document_source}），"
             f"再读取已有 `{test_artifact_directory / '测试用例.md'}`（不存在时说明缺口并补充最小用例），"
             "先准备环境、账号、鉴权和测试数据，再按代码与业务依赖编排实测；"
             f"验证命令沿用当前项目开发技能里的约定；所有测试资产必须写入 `{test_artifact_directory}/`，该目录支持多份文档；"
             "并生成带明确验收判定的测试报告。"
         ),
     }.get(phase, "按任务当前阶段执行。")
+    # 任务的文档产物要留下完整的设计与思考过程，而不是只贴一份改完之后的结论。
+    design_process_instruction = (
+        [
+            f"本轮的任务文档产物写入 `{design_directory}/`，用稳定唯一的文件名（例如 `设计过程.md`），"
+            "内容是你这一轮完整的设计与思考过程，不是只贴结论或改动清单：需求怎么理解、勘察到的现状事实（文件、接口、表、现有实现）、"
+            "考虑过哪些方案及各自取舍、为什么选中最终方案、方案怎么落到具体改动、影响面和兼容性怎么处理、"
+            "如何验证、还剩哪些风险与待确认项。过程中被否决的想法也要写清楚为什么否决。",
+            "已有同名设计文档时，先完整读一遍再把本轮的推演补进去，不要整篇覆盖掉此前的设计过程；"
+            "最终回复里列出这份文档的工作区相对路径。",
+        ]
+        if phase == "development" else []
+    )
     prototype_instruction = (
         [
             "这是需求拆解自动追加的原型图生成任务，不能只写文字说明："
@@ -66,12 +112,13 @@ def build_task_prompt(payload: dict[str, Any], workspace: Path | None = None) ->
         f"项目 program_id: {payload['programId']}",
         f"任务键: {task['itemKey']}",
         f"标题: {task['title']}",
-        f"说明: {task.get('description') or '无'}",
-        f"需求文档路径: {document_path}（本任务唯一的需求文档；默认加载：开始前先完整读一遍）",
+        # 文档缺失时说明会以「任务说明」整段单独给出，这里不再重复一遍。
+        *([f"说明: {description or '无'}"] if task_document_present else []),
+        *reading_order,
         f"任务需求文档目录: `{document_directory}/`，支持多份文档；`文档.md` 是主文档，独立任务说明使用独立文件名写在此目录。",
         f"任务设计文档目录: `{design_directory}/`，支持多份文档；需要交付独立设计说明时写入此目录，不要写入 `.codex/visualizations` 或其他工作区外路径。",
-        document_revision_rule(document_path),
         phase_instruction,
+        *design_process_instruction,
         *prototype_instruction,
         f"阶段: {task.get('stageKey') or '未指定'}",
         f"模块: {task.get('moduleKey') or '未指定'}",

@@ -48,7 +48,7 @@ CHAT_ARCHIVE_MAX_FILE_BYTES = 5 * 1024 * 1024
 
 # 云端同步与 Git 本地归档相互独立：Git 聊天同步开关决定 chat/ 是否落到工作目录，云端开关决定
 # 是否将用户明确选择的内容传给服务端。服务端也会复核这组类别，桥接不能绕过项目设置。
-CLOUD_SYNC_SCOPES = {"chat", "requirement", "design"}
+CLOUD_SYNC_SCOPES = {"chat", "requirement", "design", "test", "prototype", "execution", "attachment"}
 
 MAX_CLOUD_SYNC_FILE_BYTES = 8 * 1024 * 1024
 
@@ -347,28 +347,33 @@ def read_workspace_chat_archive(
             continue
     return {}
 
-def cloud_sync_workspace_entries(workspace: Path, scopes: set[str]) -> tuple[list[tuple[str, str, Path, str]], int]:
+def cloud_sync_workspace_entries(
+    workspace: Path,
+    scopes: set[str],
+    program_id: int | str | None = None,
+) -> tuple[list[tuple[str, str, Path, str]], int]:
     """Return only configured, workspace-contained files for a project cloud sync.
 
-    `chat/` is isolated from regular project files. Requirement documents are readable
-    document formats under `doc/` excluding prototype directories; design documents are
-    all regular files under a `prototype/` directory, including referenced images.
+    `chat/` is isolated from regular project files. Documents, design notes, test material
+    and HTML prototypes are classified from their stable workspace directories. Execution
+    artifacts and attachments are resolved through their local manifests and only included
+    when the manifest belongs to the requested program.
     """
     wanted = scopes & CLOUD_SYNC_SCOPES
     if not wanted:
         return [], 0
     root = workspace.resolve()
-    entries: dict[str, tuple[str, str, Path, str]] = {}
+    entries: dict[tuple[str, str], tuple[str, str, Path, str]] = {}
     skipped = 0
 
-    def offer(category: str, source: Path) -> None:
+    def offer(category: str, source: Path, relative_path: str | None = None) -> None:
         nonlocal skipped
         if len(entries) >= MAX_CLOUD_SYNC_FILES_PER_RUN:
             skipped += 1
             return
         try:
             resolved = source.resolve()
-            relative = resolved.relative_to(root).as_posix()
+            relative = relative_path or resolved.relative_to(root).as_posix()
             if not resolved.is_file() or resolved.stat().st_size > MAX_CLOUD_SYNC_FILE_BYTES:
                 skipped += 1
                 return
@@ -376,7 +381,7 @@ def cloud_sync_workspace_entries(workspace: Path, scopes: set[str]) -> tuple[lis
             skipped += 1
             return
         content_type = mimetypes.guess_type(relative)[0] or "application/octet-stream"
-        entries[relative] = (category, relative, resolved, content_type)
+        entries[(category, relative)] = (category, relative, resolved, content_type)
 
     if "chat" in wanted:
         chat_root = root / CHAT_ARCHIVE_DIRECTORY_NAME
@@ -388,7 +393,7 @@ def cloud_sync_workspace_entries(workspace: Path, scopes: set[str]) -> tuple[lis
                 skipped += 1
 
     document_root = root / "doc"
-    if document_root.is_dir() and ("requirement" in wanted or "design" in wanted):
+    if document_root.is_dir() and wanted & {"requirement", "design", "test", "prototype"}:
         try:
             for source in document_root.rglob("*"):
                 if not source.is_file():
@@ -398,13 +403,64 @@ def cloud_sync_workspace_entries(workspace: Path, scopes: set[str]) -> tuple[lis
                 except (OSError, ValueError):
                     skipped += 1
                     continue
-                in_prototype = "prototype" in relative_to_document.parts
-                if in_prototype:
+                directory_parts = set(relative_to_document.parts[:-1])
+                if "prototype" in directory_parts:
+                    if "prototype" in wanted:
+                        offer("prototype", source)
+                elif "test" in directory_parts:
+                    if "test" in wanted and source.suffix.lower() in DOCUMENT_SET_SUFFIXES:
+                        offer("test", source)
+                elif "design" in directory_parts:
                     if "design" in wanted:
                         offer("design", source)
                 elif "requirement" in wanted and source.suffix.lower() in DOCUMENT_SET_SUFFIXES:
                     offer("requirement", source)
         except OSError:
             skipped += 1
+
+    if program_id is not None and wanted & {"execution", "attachment"}:
+        manifest_root = root / ".codex"
+        expected_program_id = str(program_id)
+
+        def safe_display_name(value: Any, fallback: str) -> str:
+            name = re.sub(r"[\\x00-\\x1f/\\\\]+", "-", Path(str(value or "")).name).strip(" .-")
+            return name if name and name != ".." else fallback
+
+        def manifests(directory_name: str) -> list[dict[str, Any]]:
+            directory = manifest_root / directory_name
+            rows: list[dict[str, Any]] = []
+            if not directory.is_dir():
+                return rows
+            for manifest_path in sorted(directory.glob("*.json")):
+                try:
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    nonlocal_skipped[0] += 1
+                    continue
+                if isinstance(manifest, dict) and str(manifest.get("programId")) == expected_program_id:
+                    rows.append(manifest)
+            return rows
+
+        # A list wrapper lets the manifest reader count bad entries without widening
+        # the helper's return contract.
+        nonlocal_skipped = [0]
+        if "attachment" in wanted:
+            attachment_root = manifest_root / "delivery-task-attachments"
+            for manifest in manifests("delivery-task-attachments"):
+                attachment_id = str(manifest.get("id") or "attachment")
+                file_name = str(manifest.get("fileName") or "")
+                item_key = safe_display_name(manifest.get("itemKey"), "unassigned")
+                source = attachment_root / file_name
+                display_name = safe_display_name(manifest.get("name"), attachment_id)
+                offer("attachment", source, (Path("attachments") / item_key / f"{attachment_id}-{display_name}").as_posix())
+        if "execution" in wanted:
+            for manifest in manifests("delivery-task-artifacts"):
+                item_key = safe_display_name(manifest.get("itemKey"), "unassigned")
+                relative = str(manifest.get("relativePath") or "").replace("\\\\", "/").lstrip("/")
+                if not relative or ".." in Path(relative).parts:
+                    skipped += 1
+                    continue
+                offer("execution", root / relative, (Path("execution") / item_key / relative).as_posix())
+        skipped += nonlocal_skipped[0]
 
     return [entries[key] for key in sorted(entries)], skipped

@@ -19,6 +19,7 @@ def main() -> None:
     parser.add_argument("--plugin-root", required=True)
     # 工作目录是可选的：每个项目的工作目录由面板请求带过来，进程本身不需要认领某个仓库。
     parser.add_argument("--workspace", default="")
+    parser.add_argument("--command-api-url", default="")
     parser.add_argument("--allow-origin", action="append", default=[])
     args = parser.parse_args()
 
@@ -37,6 +38,8 @@ def main() -> None:
     if workspace:
         (runtime_dir / "workspace").write_text(str(workspace) + "\n", encoding="utf-8")
         arguments.extend(["--workspace", str(workspace)])
+    if args.command_api_url.strip():
+        arguments.extend(["--command-api-url", args.command_api_url.strip()])
     for origin in args.allow_origin:
         arguments.extend(["--allow-origin", origin])
 

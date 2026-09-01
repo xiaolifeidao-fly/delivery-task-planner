@@ -46,6 +46,7 @@ class QueueMixin:
         program_id = payload["programId"]
         requested_task = payload["task"]
         config = request_scoped_config(config, biz_line, program_id)
+        self._remember_config(program_id, config)
         biz_line = config_biz_line(config)
         context = planner.project_context(config, program_id)
         payload["conversationMentionContext"] = self._conversation_mention_context(
@@ -248,6 +249,7 @@ class QueueMixin:
         if not program_id:
             raise BridgeFailure("缺少项目标识")
         config = request_scoped_config(config, biz_line, program_id)
+        self._remember_config(program_id, config)
         biz_line = config_biz_line(config)
         context = planner.project_context(config, program_id)
         items = [item for item in context.get("items") or [] if isinstance(item, dict)]
@@ -470,6 +472,7 @@ class QueueMixin:
             raise BridgeFailure("批量任务不能重复选择")
 
         config = request_scoped_config(config, biz_line, program_id)
+        self._remember_config(program_id, config)
         biz_line = config_biz_line(config)
         context = planner.project_context(config, program_id)
         items = [item for item in context.get("items") or [] if isinstance(item, dict)]

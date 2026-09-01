@@ -982,7 +982,7 @@ def create_tasks(arguments: dict[str, Any]) -> dict[str, Any]:
             "kind": task["kind"],
             "prototypeTask": bool(task.get("prototype_task")),
             "title": task["title"],
-            "description": str(task.get("description") or ""),
+            "description": task_description(task),
             "benefitTags": task["benefit_tags"],
             "requirementDocument": requirement_document(
                 task,
@@ -1299,6 +1299,19 @@ def delete_task_dependencies(arguments: dict[str, Any]) -> dict[str, Any]:
     result = patch_task(config, body)
     result["removedPredecessorItemKeys"] = removed
     return result
+
+
+# zt_delivery_item.description 已放宽为 text；这里只留一个防跑飞的上限，
+# 真超了就截断入库，完整正文仍然进 requirement_document（mediumtext），不会丢。
+MAX_TASK_DESCRIPTION_CHARS = 8000
+
+
+def task_description(task: dict[str, Any]) -> str:
+    """Return the board-facing task description, clamped to what the column can hold."""
+    description = str(task.get("description") or "").strip()
+    if len(description) <= MAX_TASK_DESCRIPTION_CHARS:
+        return description
+    return description[: MAX_TASK_DESCRIPTION_CHARS - 1] + "…"
 
 
 def requirement_document(

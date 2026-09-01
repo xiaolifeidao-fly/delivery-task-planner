@@ -2305,11 +2305,46 @@ class HttpBridgeTest(unittest.TestCase):
             (workspace / "doc" / "core" / "task-a" / "文档.md").write_text("requirement", encoding="utf-8")
             (workspace / "doc" / "core" / "task-a" / "prototype").mkdir()
             (workspace / "doc" / "core" / "task-a" / "prototype" / "index.html").write_text("<main/>", encoding="utf-8")
-            entries, skipped = bridge.cloud_sync_workspace_entries(workspace, {"chat", "design"})
+            entries, skipped = bridge.cloud_sync_workspace_entries(workspace, {"chat", "prototype"})
 
         self.assertEqual(0, skipped)
         self.assertEqual(
-            [("chat", "chat/requirements/req-api/task/聊天.md"), ("design", "doc/core/task-a/prototype/index.html")],
+            [("chat", "chat/requirements/req-api/task/聊天.md"), ("prototype", "doc/core/task-a/prototype/index.html")],
+            [(category, relative) for category, relative, _source, _content_type in entries],
+        )
+
+    def test_cloud_sync_includes_test_execution_and_owning_attachments_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            (workspace / "doc" / "test" / "task-a").mkdir(parents=True)
+            (workspace / "doc" / "test" / "task-a" / "用例.md").write_text("test", encoding="utf-8")
+            (workspace / "server").mkdir()
+            (workspace / "server" / "result.txt").write_text("execution", encoding="utf-8")
+            attachment_root = workspace / ".codex" / "delivery-task-attachments"
+            artifact_root = workspace / ".codex" / "delivery-task-artifacts"
+            attachment_root.mkdir(parents=True)
+            artifact_root.mkdir(parents=True)
+            (attachment_root / "att-16.png").write_bytes(b"image")
+            (attachment_root / "att-16.json").write_text(json.dumps({
+                "id": "att-16", "programId": 16, "itemKey": "task-a", "name": "结果图.png", "fileName": "att-16.png",
+            }), encoding="utf-8")
+            (attachment_root / "att-other.txt").write_text("other", encoding="utf-8")
+            (attachment_root / "att-other.json").write_text(json.dumps({
+                "id": "att-other", "programId": 17, "itemKey": "task-b", "name": "其他.txt", "fileName": "att-other.txt",
+            }), encoding="utf-8")
+            (artifact_root / "artifact-16.json").write_text(json.dumps({
+                "id": "artifact-16", "programId": 16, "itemKey": "task-a", "relativePath": "server/result.txt",
+            }), encoding="utf-8")
+
+            entries, skipped = bridge.cloud_sync_workspace_entries(workspace, {"test", "execution", "attachment"}, 16)
+
+        self.assertEqual(0, skipped)
+        self.assertEqual(
+            [
+                ("attachment", "attachments/task-a/att-16-结果图.png"),
+                ("execution", "execution/task-a/server/result.txt"),
+                ("test", "doc/test/task-a/用例.md"),
+            ],
             [(category, relative) for category, relative, _source, _content_type in entries],
         )
 
@@ -3069,14 +3104,118 @@ class HttpBridgeTest(unittest.TestCase):
             patch.object(executor, "execute", side_effect=execute),
             patch.object(executor, "_update_execution_batch_item", return_value=None),
             patch.object(executor, "_finalize_execution_batch", side_effect=finalize),
+            patch.object(executor, "_cancel_execution_batches", return_value=["batch-stop"]) as cancel,
         ):
             executor._run_batch("batch-stop", self.runtime_config(), 1, ["a", "b"], "")
 
         self.assertEqual(["a"], started)
         self.assertEqual("blocked", finalized["status"])
         self.assertIn("停止", finalized["summary"])
+        # 停止必须同时让服务端收尾批次，否则任务会被锁在 running 批次里再也启动不了。
+        self.assertEqual(1, cancel.call_count)
         # 队列结束后取消标记要清掉，同一个批次号不会永远停在取消态。
         self.assertNotIn("batch-stop", executor.cancelled_queues)
+
+    def test_stop_all_closes_server_batches_even_without_local_queue(self):
+        """桥接重启或断网收尾失败后本地什么都不剩，全部停止仍要让服务端关掉僵尸批次。"""
+        executor = bridge.ExecutionBridge(Path.cwd())
+
+        with patch.object(executor, "_cancel_execution_batches", return_value=["batch-zombie"]) as cancel:
+            result = executor.stop_all_executions({"programId": 1}, config=self.runtime_config())
+
+        self.assertEqual([], result["queueIds"])
+        self.assertEqual([], result["itemKeys"])
+        self.assertEqual(["batch-zombie"], result["cancelledBatchIds"])
+        self.assertEqual(1, cancel.call_count)
+
+    def test_failed_batch_finalize_is_retried_until_it_lands(self):
+        """收尾请求丢了就等于任务被永久锁死，所以必须落盘、等网络恢复后补上。"""
+        with tempfile.TemporaryDirectory() as directory:
+            executor = bridge.ExecutionBridge(Path.cwd())
+            executor.pending_batch_finalizes = bridge.PendingBatchFinalizeStore(Path(directory) / "pending-finalize.json")
+            attempts: list[dict] = []
+
+            def request_with_retry(_config, path, body):
+                attempts.append({"path": path, "body": body})
+                if len(attempts) == 1:
+                    raise bridge.BridgeFailure("网络不可用")
+                return {}
+
+            # setUp 把整个类的收尾方法打了桩，这里要的是真实实现。
+            real_finalize = bridge.execution.core.CoreMixin._finalize_execution_batch
+
+            with patch.object(executor, "_request_with_retry", side_effect=request_with_retry):
+                with self.assertRaises(bridge.BridgeFailure):
+                    real_finalize(executor, self.runtime_config(), 1, "batch-lost", "blocked", "断网")
+                # 请求失败，收尾留在盘上等补偿。
+                self.assertEqual(["batch-lost"], [entry["batchId"] for entry in executor.pending_batch_finalizes.snapshot()])
+
+                with patch.object(executor, "_execution_batch_status", return_value="running"):
+                    executor.reconcile_pending(self.runtime_config(), 1)
+
+            self.assertEqual([], executor.pending_batch_finalizes.snapshot())
+            self.assertEqual(
+                ["/delivery/execution-batch/finalize", "/delivery/execution-batch/finalize"],
+                [attempt["path"] for attempt in attempts],
+            )
+            self.assertEqual("blocked", attempts[1]["body"]["status"])
+
+    def test_pending_finalize_is_dropped_once_the_batch_is_already_closed(self):
+        """批次已经被「全部停止」收尾过了，补偿就该消失，而不是每轮都去撞一次。"""
+        with tempfile.TemporaryDirectory() as directory:
+            executor = bridge.ExecutionBridge(Path.cwd())
+            executor.pending_batch_finalizes = bridge.PendingBatchFinalizeStore(Path(directory) / "pending-finalize.json")
+            executor.pending_batch_finalizes.add({"programId": 1, "batchId": "batch-closed", "status": "blocked", "summary": ""})
+
+            with (
+                patch.object(executor, "_execution_batch_status", return_value="blocked"),
+                patch.object(executor, "_request_with_retry") as request,
+            ):
+                executor.reconcile_pending(self.runtime_config(), 1)
+
+            request.assert_not_called()
+            self.assertEqual([], executor.pending_batch_finalizes.snapshot())
+
+    def test_reconcile_heartbeats_running_queues(self):
+        """心跳是服务端判断执行端还活着的唯一依据，队列在跑就必须持续续上。"""
+        executor = bridge.ExecutionBridge(Path.cwd())
+        executor._remember_config(1, self.runtime_config())
+        executor._register_queue("batch-alive", 1)
+
+        with patch.object(executor, "_heartbeat_execution_batches", return_value=["batch-alive"]) as heartbeat:
+            executor.reconcile()
+
+        heartbeat.assert_called_once_with(self.runtime_config(), 1, ["batch-alive"])
+        self.assertNotIn("batch-alive", executor.cancelled_queues)
+
+    def test_heartbeat_stops_a_queue_the_server_no_longer_runs(self):
+        """别处点了全部停止，本地队列要跟着收摊，不能继续往下拉任务。"""
+        executor = bridge.ExecutionBridge(Path.cwd())
+        executor._remember_config(1, self.runtime_config())
+        executor._register_queue("batch-dropped", 1)
+
+        with patch.object(executor, "_heartbeat_execution_batches", return_value=[]):
+            executor.reconcile()
+
+        self.assertIn("batch-dropped", executor.cancelled_queues)
+
+    def test_reconcile_without_a_known_identity_sends_nothing(self):
+        """没有浏览器给的身份就不许后台扫描，凭证从来不落盘。"""
+        executor = bridge.ExecutionBridge(Path.cwd())
+        executor._register_queue("batch-orphan", 1)
+
+        with patch.object(executor, "_heartbeat_execution_batches") as heartbeat:
+            executor.reconcile()
+
+        heartbeat.assert_not_called()
+
+    def test_stop_all_surfaces_a_failed_batch_cancel(self):
+        """服务端没收到收尾就不能报成功，否则用户以为停干净了，再做一次照样被拦。"""
+        executor = bridge.ExecutionBridge(Path.cwd())
+
+        with patch.object(executor, "_cancel_execution_batches", side_effect=bridge.BridgeFailure("接口不可用")):
+            with self.assertRaises(bridge.BridgeFailure):
+                executor.stop_all_executions({"programId": 1}, config=self.runtime_config())
 
     def test_batch_continues_after_an_unsubstantive_interruption(self):
         statuses = {"a": "blocked", "b": "todo"}
@@ -3375,6 +3514,77 @@ class HttpBridgeTest(unittest.TestCase):
         )
         self.assertIn("doc/module/a/文档.md", prompt)
         self.assertNotIn("## 验收", prompt)
+
+    def test_task_prompt_prefers_the_requirement_outline_when_the_app_layer_sees_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            outline = workspace / "doc" / "requirements" / "req-a" / "需求大纲.md"
+            outline.parent.mkdir(parents=True)
+            outline.write_text("# 需求", encoding="utf-8")
+            document = workspace / "doc" / "svc" / "a" / "文档.md"
+            document.parent.mkdir(parents=True)
+            document.write_text("# 任务", encoding="utf-8")
+
+            prompt = bridge.build_task_prompt(
+                {
+                    "programId": 1,
+                    "task": {
+                        "itemKey": "a", "title": "Build API", "moduleKey": "svc",
+                        "requirementKey": "req-a", "phase": "development",
+                        "description": "把接口补齐",
+                    },
+                },
+                workspace,
+            )
+
+        self.assertIn("需求级文档: `doc/requirements/req-a/需求大纲.md`（应用层已核对存在）", prompt)
+        self.assertIn("任务需求文档: `doc/svc/a/文档.md`（应用层已核对存在）", prompt)
+        self.assertIn("以需求级文档为准", prompt)
+
+    def test_task_prompt_falls_back_to_the_task_description_when_the_document_is_missing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            prompt = bridge.build_task_prompt(
+                {
+                    "programId": 1,
+                    "task": {
+                        "itemKey": "a", "title": "Build API", "moduleKey": "svc",
+                        "requirementKey": "req-a", "phase": "development",
+                        "description": "补齐 /delivery/item 的批量接口",
+                    },
+                },
+                Path(directory),
+            )
+
+        self.assertIn("本任务没有任务级需求文档", prompt)
+        self.assertIn("任务说明（本任务级需求的唯一来源", prompt)
+        self.assertIn("补齐 /delivery/item 的批量接口", prompt)
+        self.assertNotIn("跨回合累积的文档", prompt)
+
+    def test_development_prompt_requires_writing_the_whole_design_process(self):
+        prompt = bridge.build_task_prompt(
+            {
+                "programId": 1,
+                "task": {"itemKey": "a", "title": "Build API", "moduleKey": "svc", "phase": "development"},
+            }
+        )
+
+        self.assertIn("doc/svc/a/design/", prompt)
+        self.assertIn("完整的设计与思考过程", prompt)
+        self.assertNotIn(
+            "完整的设计与思考过程",
+            bridge.build_task_prompt(
+                {"programId": 1, "task": {"itemKey": "a", "title": "Build API", "moduleKey": "svc"}}
+            ),
+        )
+
+    def test_planning_prompt_demands_self_contained_task_descriptions(self):
+        prompt = bridge.build_planning_prompt(
+            1, {"program": {"name": "Universe"}}, "确认并写入",
+            requirement={"requirementKey": "req-a"}, write_allowed=True, thread_id="thread-1",
+        )
+
+        self.assertIn("动作执行阶段的兜底需求输入", prompt)
+        self.assertIn("300-1500 字", prompt)
 
     def test_task_prompt_forbids_writing_only_the_appended_requirement(self):
         prompt = bridge.build_task_prompt(

@@ -444,7 +444,12 @@ class ConversationMixin:
         }
 
     def stop_all_executions(self, raw: Any, config: dict[str, Any] | None = None) -> dict[str, Any]:
-        """停掉一个项目下所有任务执行：中断在跑的回合，并取消还在排队的批量/串行队列。
+        """停掉一个项目下所有任务执行：中断在跑的回合，取消还在排队的批量/串行队列，
+        并让任务面板把这个项目下还挂着的执行批次全部收尾。
+
+        批次收尾必须走服务端而不是只清内存：断网、桥接重启或跑批线程已经退出时，
+        本地根本不知道还有批次没关，而服务端那行 running 会把任务永久锁住，
+        导致「再做一次」一直报「任务正在其他执行批次中」。
 
         只针对任务执行本身，需求拆解、测试、环境预设这些会话各有各的停止入口，不在这里连坐。
         """
@@ -453,6 +458,7 @@ class ConversationMixin:
         biz_line = biz_line_of(raw)
         program_id = program_id_of(raw.get("programId"))
         config = request_scoped_config(config, biz_line, program_id)
+        self._remember_config(program_id, config)
         biz_line = config_biz_line(config)
         with self.lock:
             queue_ids = sorted(qid for qid, pid in self.queue_programs.items() if pid == program_id)
@@ -480,6 +486,12 @@ class ConversationMixin:
                 continue
             stopped.append(identity[2])
             self.progress.publish(identity, "status", "已请求停止任务", "正在等待中断当前回合。", "running")
+        # 本地有没有找到队列都要问服务端要一次收尾：僵尸批次恰恰是本地什么都不知道的那种。
+        cancelled_batches = self._cancel_execution_batches(
+            config,
+            program_id,
+            "用户在任务面板点了全部停止，批次被强制关闭。",
+        )
         return {
             "accepted": True,
             "bizLine": biz_line,
@@ -487,4 +499,5 @@ class ConversationMixin:
             "itemKeys": sorted(stopped),
             "finishedItemKeys": sorted(finished),
             "queueIds": queue_ids,
+            "cancelledBatchIds": cancelled_batches,
         }

@@ -9,11 +9,13 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from ..errors import BridgeFailure
 from ..documents import (
     DOCUMENT_SET_SUFFIXES,
     REQUIREMENT_OUTLINE_FILE_NAME,
     document_set_entries,
     requirement_document_directory_of,
+    requirement_outline_path_of,
     requirement_prototype_directory_of,
     testing_asset_directory_of,
 )
@@ -44,6 +46,28 @@ def document_path_of(task: dict[str, Any]) -> str:
     if explicit:
         return explicit
     return f"doc/{task.get('moduleKey') or 'module'}/{task.get('itemKey') or 'item'}/文档.md"
+
+
+def requirement_outline_path_for(task: dict[str, Any]) -> str:
+    """任务所属需求的需求级文档路径；任务没挂需求或需求键非法时返回空串。"""
+    requirement_key = str(task.get("requirementKey") or "").strip()
+    if not requirement_key:
+        return ""
+    try:
+        return requirement_outline_path_of(requirement_key).as_posix()
+    except BridgeFailure:
+        return ""
+
+
+def document_exists(workspace: Path | None, relative: str) -> bool:
+    """文档存在与否一律在应用层判定，执行技能不再自己去猜。
+
+    没有绑定工作目录时（单测和少数只拼提示词的调用）无从核对，按「存在」处理：
+    让提示词保持既有的“先读文档”措辞，总比凭空断言文档缺失、把执行器引偏要好。
+    """
+    if workspace is None:
+        return True
+    return readable_document(workspace, relative)
 
 
 def document_revision_rule(document_path: str) -> str:

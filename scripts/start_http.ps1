@@ -1,5 +1,6 @@
 param(
-  [string]$Workspace = ""
+  [string]$Workspace = "",
+  [string]$CommandApiUrl = $env:DELIVERY_COMMAND_API_URL
 )
 
 $ErrorActionPreference = "Stop"
@@ -31,7 +32,7 @@ if (-not $pythonCommand) {
   throw "Python 3 is required to run the delivery HTTP bridge."
 }
 
-& (Join-Path $scriptDirectory "install_http_service.ps1") -PluginRoot $pluginRoot -Workspace $Workspace -AllowOrigin "*"
+& (Join-Path $scriptDirectory "install_http_service.ps1") -PluginRoot $pluginRoot -Workspace $Workspace -CommandApiUrl $CommandApiUrl -AllowOrigin "*"
 for ($attempt = 0; $attempt -lt 30; $attempt += 1) {
   try {
     $response = Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:8765/healthz" -TimeoutSec 2

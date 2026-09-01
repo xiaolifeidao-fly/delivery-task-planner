@@ -29,13 +29,19 @@ from delivery_bridge.providers import (
     program_id_of,
     provider_label,
 )
-from delivery_bridge.stores import PendingSessionSyncStore, ProgressStore
+from delivery_bridge.remote_worker import WorkspaceMappingStore
+from delivery_bridge.stores import PendingBatchFinalizeStore, PendingSessionSyncStore, ProgressStore
 from delivery_bridge.workspaces import (
     DEFAULT_BUSINESS_WORKSPACE_ROOT,
     business_workspace_path_of,
     placeholder_workspace,
     workspace_path_of,
 )
+
+
+# 批次心跳间隔。服务端的容忍上限是 3 分钟，这里留足重试余量，
+# 一次普通的网络抖动不会把还在跑的批次误判成死的。
+HEARTBEAT_INTERVAL_SECONDS = 30
 
 
 if TYPE_CHECKING:
@@ -68,11 +74,20 @@ class CoreMixin:
         self.lock = threading.Lock()
         self.progress = progress or ProgressStore()
         self.pending_session_syncs = pending_session_syncs or PendingSessionSyncStore()
+        self.pending_batch_finalizes = PendingBatchFinalizeStore()
+        # 后台补偿只用本进程这次会话里浏览器带来的身份，绝不落盘凭证：
+        # 记住每个项目最近一次可用的 config，网络恢复后才有东西可以重放心跳和收尾。
+        self.recent_configs: dict[int, dict[str, Any]] = {}
+        self.last_heartbeat_at: dict[int, float] = {}
         self.business_workspace_root = (business_workspace_root or DEFAULT_BUSINESS_WORKSPACE_ROOT).expanduser().resolve()
         self.attachments = ConversationAttachmentStore(self.workspace)
         self.artifacts = WorkspaceArtifactStore(self.workspace)
         self.workspace_bridges: dict[str, "ExecutionBridge"] = {str(self.workspace): self}
         self.workspace_bridges_lock = threading.Lock()
+        self.program_biz_lines: dict[int, str] = {}
+        # Only local bridge requests can populate this store.  The remote Worker
+        # later registers program ids with app-api, never this absolute path.
+        self.workspace_mappings = WorkspaceMappingStore()
 
     def for_workspace(self, value: Any) -> ExecutionBridge:
         workspace = workspace_path_of(value)
@@ -95,6 +110,19 @@ class CoreMixin:
             bridge = type(self)(workspace, self.progress, self.pending_session_syncs, self.business_workspace_root)
             self.workspace_bridges[key] = bridge
             return bridge
+
+    def remember_remote_workspace(self, program_id: int, workspace: Path, config: dict[str, Any]) -> bool:
+        """Best-effort local mapping capture that never blocks the legacy bridge."""
+        try:
+            self.workspace_mappings.record(
+                program_id,
+                workspace,
+                self.program_biz_lines.get(program_id, str(config.get("_biz_line") or "")),
+            )
+        except BridgeFailure as exc:
+            print(f"未记录远程 Worker 工作目录映射：{exc}", file=sys.stderr, flush=True)
+            return False
+        return True
 
     def _release_active_run(self, identity: str) -> dict[str, Any] | None:
         """回合结束就顺手丢掉这条线程的只读快照。
@@ -186,6 +214,11 @@ class CoreMixin:
         program = context.get("program") or {}
         if program_id_of(program.get("programId")) != program_id:
             raise BridgeFailure("任务面板项目上下文校验失败")
+        # The authoritative project record, not a browser field, decides which
+        # app-api business line the local workspace can register for. Keep it
+        # out of the legacy request config so local bridge callers retain their
+        # historical config shape.
+        self.program_biz_lines[program_id] = str(program.get("bizLine") or "").strip()
         return config
 
     @staticmethod
@@ -322,8 +355,8 @@ class CoreMixin:
             },
         )
 
-    @staticmethod
     def _finalize_execution_batch(
+        self,
         config: dict[str, Any],
         program_id: int,
         batch_id: str,
@@ -331,19 +364,67 @@ class CoreMixin:
         summary: str,
         provider: str = "codex",
     ) -> None:
+        """给批次收尾。发不出去就先落盘，等 reconcile 补——丢一次收尾等于把任务永久锁死。"""
         if not batch_id:
             return
-        CoreMixin._request_with_retry(
+        entry = {
+            "programId": program_id,
+            "batchId": batch_id,
+            "status": status,
+            "summary": summary,
+            "actorName": f"{provider}-http-bridge",
+        }
+        self._remember_config(program_id, config)
+        self.pending_batch_finalizes.add(entry)
+        try:
+            self._request_with_retry(config, "/delivery/execution-batch/finalize", entry)
+        except Exception:
+            print(
+                f"批次收尾失败，已加入后台重试：{program_id}/{batch_id}",
+                file=sys.stderr,
+                flush=True,
+            )
+            raise
+        self.pending_batch_finalizes.remove(entry)
+
+    @staticmethod
+    def _heartbeat_execution_batches(config: dict[str, Any], program_id: int, batch_ids: list[str]) -> list[str]:
+        """告诉任务面板这些批次还在本机跑，返回服务端仍认可在运行的那部分。
+
+        心跳一停，服务端就会把批次判死收尾并放行里面的任务；没有这条，
+        断网或进程被杀之后任务会被一条没人收尾的批次永久锁住。
+        """
+        running = planner.request_api(
             config,
-            "/delivery/execution-batch/finalize",
-            {
-                "programId": program_id,
-                "batchId": batch_id,
-                "status": status,
-                "summary": summary,
-                "actorName": f"{provider}-http-bridge",
-            },
+            "POST",
+            "/delivery/execution-batch/heartbeat",
+            body={"programId": program_id, "batchIds": batch_ids, "actorName": "http-bridge"},
         )
+        if not isinstance(running, list):
+            return []
+        return [str(batch_id) for batch_id in running if str(batch_id or "").strip()]
+
+    @staticmethod
+    def _cancel_execution_batches(config: dict[str, Any], program_id: int, reason: str) -> list[str]:
+        """让任务面板把这个项目下所有还在运行的批次收尾，返回被关掉的批次号。
+
+        这是「全部停止」的兜底：桥接内存里可能早就没有批次了（断网时收尾请求失败、
+        进程重启、跑批线程已退出），只有服务端还留着 running 把任务锁着。
+        请求失败必须抛出去，不能像跑批线程那样吞掉——否则用户以为停干净了，
+        回头「再做一次」还是被拦。停止是幂等的，报错后重试一次即可。
+        """
+        cancelled = CoreMixin._request_with_retry(
+            config,
+            "/delivery/execution-batch/cancel",
+            {"programId": program_id, "reason": reason, "actorName": "http-bridge"},
+        )
+        if not isinstance(cancelled, list):
+            return []
+        return [
+            str(batch.get("batchId") or "")
+            for batch in cancelled
+            if isinstance(batch, dict) and str(batch.get("batchId") or "").strip()
+        ]
 
     def _release_failed_claim(self, config: dict[str, Any], program_id: int, task: dict[str, Any], provider: str = "codex") -> None:
         try:
@@ -363,14 +444,87 @@ class CoreMixin:
         except Exception as exc:
             print(f"恢复启动失败任务状态失败：{program_id}/{task.get('itemKey')}: {exc}", file=sys.stderr, flush=True)
 
-    def reconcile(self) -> None:
-        # Board operations always receive a current user token and one project ID
-        # from the browser. A process-wide recovery scan would require persisting a
-        # credential and would violate that scope, so recovery is intentionally UI-led.
-        return
+    @staticmethod
+    def _execution_batch_status(config: dict[str, Any], program_id: int, batch_id: str) -> str:
+        batch = planner.request_api(
+            config, "GET", "/delivery/execution-batch", query={"programId": program_id, "batchId": batch_id}
+        )
+        if not isinstance(batch, dict):
+            return ""
+        return str(batch.get("status") or "")
 
-    def _reconcile_pending_session_syncs(self, config: dict[str, Any]) -> None:
+    def _remember_config(self, program_id: int, config: dict[str, Any] | None) -> None:
+        """记住某个项目最近一次可用的身份，供后台补偿使用。只在内存里，不落盘。"""
+        if not isinstance(config, dict) or not program_id:
+            return
+        with self.lock:
+            self.recent_configs[int(program_id)] = config
+
+    def reconcile(self) -> None:
+        """后台补偿：给还在跑的批次续心跳，并补上之前发不出去的收尾和会话同步。
+
+        身份只来自浏览器的请求，不落盘，所以这里只能用本进程记住的 config：
+        桥接重启后要等用户下一次操作（执行、全部停止）才会重新拿到身份。
+        那种情况下服务端的心跳判死会兜底，不会把任务永久锁住。
+        """
+        with self.lock:
+            configs = dict(self.recent_configs)
+        for program_id, config in configs.items():
+            try:
+                self._heartbeat_running_queues(config, program_id)
+            except Exception as exc:
+                print(f"批次心跳失败：{program_id}: {exc}", file=sys.stderr, flush=True)
+            self.reconcile_pending(config, program_id)
+
+    def reconcile_pending(self, config: dict[str, Any], program_id: int) -> None:
+        """补发这个项目积压的收尾与会话同步；失败继续留在盘上，下一轮再试。"""
+        self._reconcile_pending_batch_finalizes(config, program_id)
+        self._reconcile_pending_session_syncs(config, program_id)
+
+    def _heartbeat_running_queues(self, config: dict[str, Any], program_id: int) -> None:
+        with self.lock:
+            batch_ids = sorted(qid for qid, pid in self.queue_programs.items() if pid == program_id)
+            last = self.last_heartbeat_at.get(program_id, 0.0)
+        if not batch_ids:
+            return
+        now = time.monotonic()
+        if now - last < HEARTBEAT_INTERVAL_SECONDS:
+            return
+        running = self._heartbeat_execution_batches(config, program_id, batch_ids)
+        with self.lock:
+            self.last_heartbeat_at[program_id] = now
+            # 服务端已经不认的批次（别处点了全部停止，或者被判死收尾了）：
+            # 本地队列跟着收摊，不要接着往下拉任务。
+            self.cancelled_queues.update(set(batch_ids) - set(running))
+
+    def _reconcile_pending_batch_finalizes(self, config: dict[str, Any], program_id: int) -> None:
+        for entry in self.pending_batch_finalizes.snapshot():
+            if int(entry.get("programId") or 0) != int(program_id):
+                continue
+            batch_id = str(entry.get("batchId") or "")
+            try:
+                # 批次可能已经被「全部停止」或服务端判死收尾了，那这条补偿就没意义了，
+                # 留着只会每轮都撞在「批次已结束」上。
+                if self._execution_batch_status(config, program_id, batch_id) != "running":
+                    self.pending_batch_finalizes.remove(entry)
+                    continue
+            except Exception as exc:
+                print(f"查询批次状态失败：{program_id}/{batch_id}: {exc}", file=sys.stderr, flush=True)
+                continue
+            try:
+                self._request_with_retry(config, "/delivery/execution-batch/finalize", entry)
+                self.pending_batch_finalizes.remove(entry)
+            except Exception as exc:
+                print(
+                    f"重试批次收尾失败：{entry.get('programId')}/{entry.get('batchId')}: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+    def _reconcile_pending_session_syncs(self, config: dict[str, Any], program_id: int | None = None) -> None:
         for entry in self.pending_session_syncs.snapshot():
+            if program_id is not None and int(entry.get("programId") or 0) != int(program_id):
+                continue
             try:
                 self._request_with_retry(
                     scoped_config(config, str(entry.get("bizLine") or DEFAULT_BIZ_LINE)),

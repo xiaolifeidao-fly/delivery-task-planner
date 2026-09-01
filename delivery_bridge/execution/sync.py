@@ -94,7 +94,7 @@ class SyncMixin:
         program_id: int,
         scopes: set[str],
     ) -> dict[str, Any]:
-        entries, skipped = cloud_sync_workspace_entries(self.workspace, scopes)
+        entries, skipped = cloud_sync_workspace_entries(self.workspace, scopes, program_id)
         uploaded: list[str] = []
         for category, relative, source, content_type in entries:
             self._upload_cloud_sync_file(

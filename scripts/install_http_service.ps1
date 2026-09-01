@@ -2,6 +2,7 @@ param(
   [Parameter(Mandatory = $true)]
   [string]$PluginRoot,
   [string]$Workspace = "",
+  [string]$CommandApiUrl = "",
   [string]$AllowOrigin = "*"
 )
 
@@ -34,6 +35,10 @@ $arguments += '"' + $PluginRoot + '"'
 if ($Workspace) {
   $arguments += "--workspace"
   $arguments += '"' + $Workspace + '"'
+}
+if ($CommandApiUrl) {
+  $arguments += "--command-api-url"
+  $arguments += '"' + $CommandApiUrl + '"'
 }
 $arguments += "--allow-origin"
 $arguments += '"' + $AllowOrigin + '"'

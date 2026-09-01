@@ -16,6 +16,7 @@ from typing import Any
 from . import runtime
 
 PENDING_SESSION_SYNCS_PATH = runtime.RUNTIME_DIR / "pending-session-syncs.json"
+PENDING_BATCH_FINALIZES_PATH = runtime.RUNTIME_DIR / "pending-batch-finalizes.json"
 GIT_ENVIRONMENT_SESSIONS_PATH = runtime.RUNTIME_DIR / "git-environment-sessions.json"
 MAX_GIT_ENVIRONMENT_CONVERSATIONS = 12
 
@@ -103,6 +104,54 @@ class PendingSessionSyncStore:
             entries = self._read()
             entries.pop(self.key_of(entry), None)
             entries.pop(self.legacy_key_of(entry), None)
+            self._write(entries)
+
+    def snapshot(self) -> list[dict[str, Any]]:
+        with self.lock:
+            return list(self._read().values())
+
+class PendingBatchFinalizeStore:
+    """批次收尾请求发不出去时先落在这里，等网络恢复再补。
+
+    收尾是唯一能把执行批次从 running 改成终态的动作，丢一次就意味着批次里的任务
+    被永久锁住（任务面板会一直报「任务正在其他执行批次中」）。落盘的只有批次号和结论，
+    身份凭证一律不进磁盘，重放时用当次请求带来的身份。
+    """
+
+    def __init__(self, path: Path = PENDING_BATCH_FINALIZES_PATH) -> None:
+        self.path = path
+        self.lock = threading.Lock()
+
+    @staticmethod
+    def key_of(entry: dict[str, Any]) -> str:
+        return f"{entry['programId']}/{entry['batchId']}"
+
+    def _read(self) -> dict[str, dict[str, Any]]:
+        if not self.path.exists():
+            return {}
+        try:
+            value = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    def _write(self, entries: dict[str, dict[str, Any]]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = self.path.with_suffix(".tmp")
+        temp_path.write_text(json.dumps(entries, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.chmod(temp_path, 0o600)
+        os.replace(temp_path, self.path)
+
+    def add(self, entry: dict[str, Any]) -> None:
+        with self.lock:
+            entries = self._read()
+            entries[self.key_of(entry)] = entry
+            self._write(entries)
+
+    def remove(self, entry: dict[str, Any]) -> None:
+        with self.lock:
+            entries = self._read()
+            entries.pop(self.key_of(entry), None)
             self._write(entries)
 
     def snapshot(self) -> list[dict[str, Any]]:

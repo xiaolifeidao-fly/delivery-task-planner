@@ -444,6 +444,27 @@ class DeliveryTaskPlannerTest(unittest.TestCase):
         self.assertIn("- Tests pass", body["requirementDocument"])
         self.assertEqual("doc/api/task-a/文档.md", result["created"][0]["requirementDocumentPath"])
 
+    def test_created_task_description_is_clamped_to_the_column_width(self):
+        context = {"program": {"programId": 1}, "stages": [], "modules": [], "items": []}
+        description = "详" * 9000
+        with (
+            patch.object(server, "load_config", return_value={"api_url": "http://example.test/api", "key": "secret"}),
+            patch.object(server, "project_context", return_value=context),
+            patch.object(server, "request_api", return_value={"itemKey": "task-a"}) as request,
+        ):
+            server.create_tasks({
+                "program_id": 1,
+                "tasks": [{
+                    "ref": "a", "title": "A", "description": description,
+                    "benefit_tags": ["自动化收益"], "depends_on": [],
+                }],
+            })
+        body = request.call_args.kwargs["body"]
+        self.assertEqual(server.MAX_TASK_DESCRIPTION_CHARS, len(body["description"]))
+        self.assertTrue(body["description"].endswith("…"))
+        # 完整正文仍然进需求文档，截断只发生在面板字段上。
+        self.assertIn(description, body["requirementDocument"])
+
     def test_created_tasks_inherit_the_requirement_primary_owner(self):
         context = {"program": {"programId": 1}, "stages": [], "modules": [], "items": []}
         created_bodies = []
