@@ -71,3 +71,13 @@ def program_id_of(value: Any, label: str = "项目标识") -> int:
     if program_id <= 0:
         raise BridgeFailure(f"{label}必须是项目表的正整数主键")
     return program_id
+
+
+CODEX_MODEL_CATALOG = [
+    {"model": "gpt-5.6-sol", "displayName": "5.6 Sol", "description": ""},
+    {"model": "gpt-5.6-terra", "displayName": "5.6 Terra", "description": ""},
+    {"model": "gpt-5.6-luna", "displayName": "5.6 Luna", "description": ""},
+]
+
+
+DEFAULT_BIZ_LINE = ""

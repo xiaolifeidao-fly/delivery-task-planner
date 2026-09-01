@@ -164,3 +164,9 @@ class GitEnvironmentSessionStore:
             value = self._read()
             value[provider] = catalog[-MAX_GIT_ENVIRONMENT_CONVERSATIONS:]
             self._write(value)
+
+
+ENVIRONMENT_SETUP_SESSIONS_PATH = runtime.RUNTIME_DIR / "environment-setup-sessions.json"
+
+
+ENVIRONMENT_SETUP_SESSIONS = GitEnvironmentSessionStore(ENVIRONMENT_SETUP_SESSIONS_PATH)

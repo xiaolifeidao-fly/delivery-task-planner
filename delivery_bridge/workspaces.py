@@ -79,3 +79,18 @@ def environment_setup_workspace() -> Path:
     root = runtime.RUNTIME_DIR / "environment-setup"
     root.mkdir(parents=True, exist_ok=True)
     return root.resolve()
+
+
+DEFAULT_BUSINESS_WORKSPACE_ROOT = Path.home() / ".local" / "share" / "delivery-task-planner" / "business-workspaces"
+
+
+def placeholder_workspace() -> Path:
+    """An empty, neutral directory to hold the process-level slot when no workspace is pinned.
+
+    进程启动时不该假定自己属于哪个项目。以前这里落的是安装目录的上级（正好是插件所在的仓库），
+    于是那个仓库会悄悄变成"看起来合法"的默认工作目录。现在换成运行时目录下的空目录：
+    请求带了 workspace 就按项目路由，没带就在 workspace_path_of 里直接报错，不会误伤到任何真实仓库。
+    """
+    root = runtime.RUNTIME_DIR / "no-workspace"
+    root.mkdir(parents=True, exist_ok=True)
+    return root.resolve()

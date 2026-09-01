@@ -166,3 +166,9 @@ def merged_conversation_catalog(bindings: list[dict[str, Any]]) -> tuple[list[di
                 owners[thread_id] = binding
     catalog = sorted(entries.values(), key=lambda entry: str(entry.get("updatedAt") or ""), reverse=True)
     return catalog, owners
+
+
+MAX_ENVIRONMENT_SETUP_CONVERSATIONS = 12
+
+
+MAX_PLANNING_CONVERSATIONS = 12

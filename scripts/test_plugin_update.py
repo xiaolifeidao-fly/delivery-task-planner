@@ -21,7 +21,7 @@ def make_package(root: Path, version: str = "0.3.0") -> Path:
     (root / ".codex-plugin").mkdir(parents=True)
     (root / ".claude-plugin").mkdir(parents=True)
     (root / "skills" / "delivery-task-planner").mkdir(parents=True)
-    for package in ("clients", "prompts"):
+    for package in ("clients", "prompts", "execution"):
         (root / "delivery_bridge" / package).mkdir(parents=True)
     for folder in (".codex-plugin", ".claude-plugin"):
         (root / folder / "plugin.json").write_text(
@@ -58,11 +58,17 @@ def make_package(root: Path, version: str = "0.3.0") -> Path:
         "sessions.py",
         "progress_events.py",
         "item_keys.py",
+        "executor_env.py",
     ):
         (root / "delivery_bridge" / name).write_text(f"# {version}\n", encoding="utf-8")
     for package, names in {
         "clients": ("journal.py", "codex.py", "claude.py", "factory.py", "pool.py"),
         "prompts": ("common.py", "task.py", "planning.py", "conversation.py", "requirement.py", "environment.py"),
+        "execution": tuple(f"{name}.py" for name in (
+            "core", "sync", "naming", "planning", "environment", "requirement_testing",
+            "requirement_review", "fine_tuning", "task_testing", "git", "queue",
+            "conversation", "documents", "prototype", "turns",
+        )),
     }.items():
         for name in names:
             (root / "delivery_bridge" / package / name).write_text(f"# {version}\n", encoding="utf-8")

@@ -2655,7 +2655,7 @@ class HttpBridgeTest(unittest.TestCase):
             "path": "doc/requirements/req-a/prototype/index.html",
             "name": "index.html",
         }]
-        with patch.object(bridge, "requirement_prototype_files", return_value=("doc/requirements/req-a/prototype", prototype)):
+        with patch.object(bridge.execution.turns, "requirement_prototype_files", return_value=("doc/requirements/req-a/prototype", prototype)):
             lines = executor._conversation_mention_context(
                 {"api_url": "http://test/api", "key": "k"},
                 1,
@@ -5445,13 +5445,13 @@ class GitBranchTest(unittest.TestCase):
         (self.workspace / "README.md").write_text("root changed", encoding="utf-8")
         execution = bridge.ExecutionBridge(self.workspace)
         calls: list[Path] = []
-        real_push = bridge.git_push_branch
+        real_push = bridge.execution.git.git_push_branch
 
         def ordered_push(workspace: Path, *args, **kwargs):
             calls.append(workspace.resolve())
             return real_push(workspace, *args, **kwargs)
 
-        with patch.object(bridge, "git_push_branch", side_effect=ordered_push):
+        with patch.object(bridge.execution.git, "git_push_branch", side_effect=ordered_push):
             result = execution.push_requirement_branch({
                 "programId": 1,
                 "branch": branch,

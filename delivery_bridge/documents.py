@@ -319,3 +319,20 @@ def document_payload(workspace: Path, path: Path, asset_boundary: Path | None = 
         "modifiedAt": datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat().replace("+00:00", "Z"),
         "assets": assets,
     }
+
+
+MAX_REQUIREMENT_DOCUMENT_BYTES = 2 * 1024 * 1024
+
+
+# 面板还可以直接往栏目目录里放文档（本地选文件或粘贴正文）：什么后缀都收得下，
+# 但只有文本类文档能在面板里预览编辑，其余的走附件预览与下载。
+MAX_DOCUMENT_UPLOAD_FILES = 10
+
+
+MAX_DOCUMENT_UPLOAD_FILE_BYTES = 20 * 1024 * 1024
+
+
+MAX_DOCUMENT_UPLOAD_BYTES = MAX_DOCUMENT_UPLOAD_FILES * MAX_DOCUMENT_UPLOAD_FILE_BYTES + 128 * 1024
+
+
+TESTING_CASES_FILE_NAME = "测试用例.md"

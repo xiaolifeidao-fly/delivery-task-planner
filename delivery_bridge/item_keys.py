@@ -78,3 +78,26 @@ def requirement_prototype_files(workspace: Path, requirement_key: str) -> tuple[
         if len(files) >= MAX_REQUIREMENT_PROTOTYPE_FILES:
             break
     return relative_directory.as_posix(), files
+
+
+PLANNING_ITEM_KEY = "__project_planning__"
+
+
+# 项目偏好设置「高级设置 → 预设环境」的聊天：装的是本机全局环境，不挂在任何业务仓库上。
+ENVIRONMENT_SETUP_ITEM_KEY = "__environment_setup__"
+
+
+REQUIREMENT_TESTING_ITEM_KEY = "__requirement_testing__"
+
+
+REQUIREMENT_REVIEW_ITEM_KEY = "__requirement_review__"
+
+
+REQUIREMENT_FINE_TUNING_ITEM_KEY = "__requirement_fine_tuning__"
+
+
+# 需求的测试会话和 review 会话共用同一张会话表，靠 metadata.kind 分流；旧数据没有这个字段，按测试算。
+REQUIREMENT_REVIEW_SESSION_KIND = "requirement-review"
+
+
+REQUIREMENT_FINE_TUNING_SESSION_KIND = "requirement-fine-tuning"
