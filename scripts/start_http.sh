@@ -41,6 +41,8 @@ else
   if [[ -n "${command_api_url}" ]]; then
     bridge_args+=(--command-api-url "${command_api_url}")
   fi
+  # 桥接进程启动后会自己把真实 pid 写进这个文件（macOS 的 LaunchAgent 路径同理），
+  # 这里再记一次只是为了「起进程」和「文件可读」之间不留空窗，两边写的是同一个值。
   nohup python3 "${plugin_root}/http_bridge.py" "${bridge_args[@]}" \
     >"${log_file}" 2>&1 &
   echo $! >"${pid_file}"

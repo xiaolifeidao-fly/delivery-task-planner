@@ -49,6 +49,7 @@ from delivery_bridge.providers import (
     reasoning_effort_of,
     same_executor_purpose,
 )
+from delivery_bridge.token_usage import with_usage
 from delivery_bridge.turn_view import serialize_turns
 
 
@@ -319,7 +320,7 @@ class PrototypeMixin:
             environment=codex_environment(config, program_id),
         )
         item_key = requirement_prototype_item_key(requirement_key)
-        return {
+        return with_usage({
             "programId": program_id,
             "requirementKey": requirement_key,
             "threadId": selected_thread_id,
@@ -330,7 +331,7 @@ class PrototypeMixin:
             ),
             "active": bool(active is not None and active.get("threadId") == selected_thread_id and active.get("prototype")),
             "activeTurnId": str((active or {}).get("turnId") or ""),
-        }
+        })
 
     def send_requirement_prototype_message(self, raw: Any, config: dict[str, Any] | None = None) -> dict[str, Any]:
         program_id, requirement_key, message, requested_thread_id, provider, model = validate_requirement_prototype_payload(raw, message_required=True)

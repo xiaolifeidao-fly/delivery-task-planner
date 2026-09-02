@@ -1,0 +1,137 @@
+"""每个回合烧掉多少 token，两家执行器收敛成同一份形状。
+
+面板要回答的是「这条任务花了多少」，所以两边都归一到同一组字段：
+
+- ``inputTokens``：本回合送进模型的全部输入，**含**命中缓存的那部分。
+- ``cachedInputTokens``：其中命中提示缓存的部分（计价通常只有一折）。
+- ``outputTokens``：模型生成的全部输出，含推理 token。
+- ``reasoningOutputTokens``：输出里属于推理的部分，问不出来时留 0。
+- ``totalTokens``：输入 + 输出。
+- ``costUsd``：执行器自己算出来的钱，只有 Claude 给，Codex 侧为 None。
+
+两家给的原始口径不一样，差异都在这一层抹平：Codex 的 ``inputTokens`` 本来就把
+缓存命中算在内，Claude 则把三段（新输入、写缓存、读缓存）分开列，得自己加起来。
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+USAGE_FIELDS = ("inputTokens", "cachedInputTokens", "outputTokens", "reasoningOutputTokens", "totalTokens")
+
+
+def empty_usage() -> dict[str, Any]:
+    return {field: 0 for field in USAGE_FIELDS} | {"costUsd": None}
+
+
+def _int(value: Any) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return number if number > 0 else 0
+
+
+def has_usage(usage: Any) -> bool:
+    """全零的用量等于没测到，不值得往面板上放一行 0。"""
+    return isinstance(usage, dict) and any(_int(usage.get(field)) for field in USAGE_FIELDS)
+
+
+def codex_usage_breakdown(breakdown: Any) -> dict[str, Any]:
+    """`thread/tokenUsage/updated` 里的一段 TokenUsageBreakdown。"""
+    if not isinstance(breakdown, dict):
+        return empty_usage()
+    usage = {field: _int(breakdown.get(field)) for field in USAGE_FIELDS}
+    usage["costUsd"] = None
+    # totalTokens 服务端给了就用它的，缺了自己补，别让面板显示成 0。
+    if not usage["totalTokens"]:
+        usage["totalTokens"] = usage["inputTokens"] + usage["outputTokens"]
+    return usage
+
+
+def codex_turn_usage(params: Any, base: Any = None) -> dict[str, Any]:
+    """把一条 Codex 用量通知折算成「本回合到目前为止」的用量。
+
+    Codex 报两个数：``last`` 是最近一次模型请求，``total`` 是整条线程累计。
+    一个回合里模型会被请求很多次（每次工具往返都是一次），所以 ``last`` 不等于
+    回合用量；回合用量只能拿 ``total`` 去减这一轮开始前的累计值。
+
+    ``base`` 是这一轮开始前的线程累计值。第一次收到通知时还没有 base，
+    用 ``total - last`` 反推：那时的 total 恰好只多了本轮第一次请求。
+    """
+    payload = params.get("tokenUsage") if isinstance(params, dict) else None
+    if not isinstance(payload, dict):
+        return empty_usage()
+    total = codex_usage_breakdown(payload.get("total"))
+    last = codex_usage_breakdown(payload.get("last"))
+    if not isinstance(base, dict) or not has_usage(base):
+        base = {field: max(0, total[field] - last[field]) for field in USAGE_FIELDS}
+    usage = {field: max(0, total[field] - _int(base.get(field))) for field in USAGE_FIELDS}
+    usage["costUsd"] = None
+    return usage
+
+
+def codex_usage_base(params: Any) -> dict[str, Any]:
+    """这一轮开始前的线程累计值，`codex_turn_usage` 的减数，记在回合上重复使用。"""
+    payload = params.get("tokenUsage") if isinstance(params, dict) else None
+    if not isinstance(payload, dict):
+        return empty_usage()
+    total = codex_usage_breakdown(payload.get("total"))
+    last = codex_usage_breakdown(payload.get("last"))
+    return {field: max(0, total[field] - last[field]) for field in USAGE_FIELDS} | {"costUsd": None}
+
+
+def claude_turn_usage(event: Any) -> dict[str, Any]:
+    """Claude 的 stream-json `result` 事件；它一条就是整轮的合计。"""
+    if not isinstance(event, dict):
+        return empty_usage()
+    raw = event.get("usage") if isinstance(event.get("usage"), dict) else {}
+    cached = _int(raw.get("cache_read_input_tokens"))
+    # Claude 把新输入、写缓存、读缓存分三个字段报；面板要的是「这轮送进去多少」，
+    # 所以三段相加才是 inputTokens，cachedInputTokens 只是其中命中缓存的那段。
+    input_tokens = _int(raw.get("input_tokens")) + _int(raw.get("cache_creation_input_tokens")) + cached
+    output_tokens = _int(raw.get("output_tokens"))
+    details = raw.get("output_tokens_details") if isinstance(raw.get("output_tokens_details"), dict) else {}
+    cost = event.get("total_cost_usd")
+    return {
+        "inputTokens": input_tokens,
+        "cachedInputTokens": cached,
+        "outputTokens": output_tokens,
+        "reasoningOutputTokens": _int(details.get("thinking_tokens")),
+        "totalTokens": input_tokens + output_tokens,
+        "costUsd": float(cost) if isinstance(cost, (int, float)) and cost > 0 else None,
+    }
+
+
+def merge_usage(usages: Any) -> dict[str, Any]:
+    """把若干回合的用量加成一条任务的合计。"""
+    total = empty_usage()
+    cost = 0.0
+    counted = False
+    for usage in usages or []:
+        if not isinstance(usage, dict):
+            continue
+        for field in USAGE_FIELDS:
+            total[field] += _int(usage.get(field))
+        value = usage.get("costUsd")
+        if isinstance(value, (int, float)) and value > 0:
+            cost += float(value)
+            counted = True
+    total["costUsd"] = round(cost, 6) if counted else None
+    return total
+
+
+def turns_usage_total(turns: Any) -> dict[str, Any]:
+    """一条会话里所有回合的合计；面板的「本任务累计消耗」就是它。"""
+    if not isinstance(turns, list):
+        return empty_usage()
+    return merge_usage(turn.get("usage") for turn in turns if isinstance(turn, dict))
+
+
+def with_usage(payload: dict[str, Any]) -> dict[str, Any]:
+    """给一份带 `turns` 的会话返回补上这条会话的用量合计。
+
+    面板每种会话（任务、需求拆解、需求原型、review、测试、微调）都有自己的返回结构，
+    但都带同一份 `turns`；合计只依赖它，所以统一在出口补，不必在每处重复写一遍。
+    """
+    return {**payload, "usage": turns_usage_total(payload.get("turns"))}

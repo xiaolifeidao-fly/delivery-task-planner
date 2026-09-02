@@ -22,6 +22,7 @@ from .conversation import ConversationMixin
 from .documents import DocumentsMixin
 from .prototype import PrototypeMixin
 from .turns import TurnsMixin
+from .usage import UsageMixin
 
 
 class ExecutionBridge(
@@ -40,6 +41,7 @@ class ExecutionBridge(
     DocumentsMixin,
     PrototypeMixin,
     TurnsMixin,
+    UsageMixin,
 ):
     pass
 

@@ -31,6 +31,7 @@ from delivery_bridge.sessions import (
     next_conversation_version,
 )
 from delivery_bridge.turn_output import SESSION_STATUS, execution_output, final_agent_text_from_output
+from delivery_bridge.token_usage import with_usage
 from delivery_bridge.turn_view import serialize_turns
 
 
@@ -212,7 +213,7 @@ class TaskTestingMixin:
             entry["active"] = bool(active_for_thread is not None and entry.get("threadId") == thread_id)
             if not entry["active"] and entry.get("status") == "running":
                 entry["status"] = "interrupted"
-        return {
+        return with_usage({
             "programId": program_id, "itemKey": item_key, "threadId": thread_id, "executorType": provider,
             "turns": serialize_turns(thread.get("turns") or []), "conversations": catalog,
             "active": active_for_thread is not None,
@@ -220,7 +221,7 @@ class TaskTestingMixin:
             "testingCasesStatus": task.get("testingCasesStatus") or "todo",
             "testingCases": task.get("testingCases") or "",
             "testingCasesPath": task.get("testingCasesPath") or "",
-        }
+        })
 
     def _resume_task_testing_cases_turn(
         self,

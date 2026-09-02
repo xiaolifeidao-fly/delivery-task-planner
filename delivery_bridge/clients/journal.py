@@ -19,6 +19,7 @@ from typing import Any
 from .. import runtime
 from ..reasoning import reasoning_summary_text
 from ..timeutil import utc_now
+from ..token_usage import codex_turn_usage, codex_usage_base
 from ..turn_output import file_changes_of, text_from_user_item
 
 # 落盘目录按模块名取，测试改写运行时目录时这里跟着变。
@@ -27,7 +28,12 @@ CODEX_THREAD_ITEMS_DIR = runtime.RUNTIME_DIR / "codex-thread-items"
 MAX_THREAD_JOURNAL_TURNS = 60
 MAX_THREAD_JOURNAL_ITEMS = 400
 REASONING_SUMMARY_METHODS = {"item/reasoning/summaryPartAdded", "item/reasoning/summaryTextDelta"}
-JOURNAL_METHODS = {"turn/started", "turn/completed", "item/started", "item/completed"} | REASONING_SUMMARY_METHODS
+# 用量通知和条目一样只在实时流里出现，`thread/read` 读不回来，所以也得自己记。
+TOKEN_USAGE_METHOD = "thread/tokenUsage/updated"
+JOURNAL_METHODS = (
+    {"turn/started", "turn/completed", "item/started", "item/completed", TOKEN_USAGE_METHOD}
+    | REASONING_SUMMARY_METHODS
+)
 
 def journal_item(item: dict[str, Any]) -> dict[str, Any]:
     """把一条实时条目收敛成可落盘、可回放的形状。
@@ -120,6 +126,13 @@ class ThreadItemJournal:
                 entry["status"] = str(turn.get("status") or "completed")
                 entry["completedAt"] = utc_now()
                 self.current_turns.pop(thread_id, None)
+            elif method == TOKEN_USAGE_METHOD:
+                # 减数只在本轮第一条通知时定下来，后面每条都拿它去减，回合用量才不会串轮。
+                base = entry.get("usageBase")
+                if not isinstance(base, dict):
+                    base = codex_usage_base(params)
+                    entry["usageBase"] = base
+                entry["usage"] = codex_turn_usage(params, base)
             elif method in REASONING_SUMMARY_METHODS:
                 # 推理摘要不在 item 上，它是单独流出来的：item/completed 里的 summary 实测是空的。
                 item_id = str(params.get("itemId") or params.get("targetItemId") or item.get("id") or "")
@@ -263,7 +276,8 @@ def merge_journal_turns(thread: dict[str, Any], journal_turns: list[dict[str, An
                 continue
             if journal_item_signature(item) not in known:
                 items.append(item)
-        merged.append({**turn, "items": items})
+        usage = recorded.get("usage") if isinstance(recorded.get("usage"), dict) else None
+        merged.append({**turn, "items": items, **({"usage": usage} if usage else {})})
     # 线程刚跑完就读，服务端有时还没把这一轮写进历史；记录里已经有了就直接补上。
     merged.extend(turn for turn in journal_turns if str(turn.get("id") or "") not in seen)
     return {**thread, "turns": merged}

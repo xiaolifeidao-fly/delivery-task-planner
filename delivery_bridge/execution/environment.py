@@ -29,6 +29,7 @@ from delivery_bridge.providers import ai_provider_of, provider_label
 from delivery_bridge.sessions import MAX_ENVIRONMENT_SETUP_CONVERSATIONS
 from delivery_bridge.stores import ENVIRONMENT_SETUP_SESSIONS
 from delivery_bridge.timeutil import utc_now
+from delivery_bridge.token_usage import with_usage
 from delivery_bridge.turn_view import serialize_turns
 from delivery_bridge.workspaces import environment_setup_workspace
 
@@ -95,7 +96,7 @@ class EnvironmentMixin:
             # 目录里留着 running 但本进程没有对应回合：多半是上一次桥接跑一半被重启了。
             if not entry["active"] and entry.get("status") == "running":
                 entry["status"] = "interrupted"
-        return {
+        return with_usage({
             "programId": program_id,
             "threadId": thread_id,
             "turns": serialize_turns(thread.get("turns") or []),
@@ -103,7 +104,7 @@ class EnvironmentMixin:
             "active": bool(active is not None and active.get("threadId") == thread_id),
             "activeTurnId": str((active or {}).get("turnId") or ""),
             "environmentStatuses": environment_statuses,
-        }
+        })
 
     def send_environment_setup(self, raw: Any, config: dict[str, Any]) -> dict[str, Any]:
         provider = ai_provider_of(raw)

@@ -36,6 +36,7 @@ from delivery_bridge.prompts.planning import (
     delete_planning_temp_summary,
     planning_detail_digest,
     planning_temp_document_path,
+    requirement_item_keys,
     requirement_outline_rule_lines,
     write_planning_temp_summary,
 )
@@ -50,6 +51,7 @@ from delivery_bridge.providers import (
 from delivery_bridge.sessions import MAX_PLANNING_CONVERSATIONS
 from delivery_bridge.timeutil import utc_now
 from delivery_bridge.turn_output import execution_output, final_agent_text_from_output
+from delivery_bridge.token_usage import with_usage
 from delivery_bridge.turn_view import serialize_turns
 
 
@@ -140,6 +142,8 @@ class PlanningMixin:
             "moduleKey": str(metadata.get("moduleKey") or ""),
             "kind": str(metadata.get("kind") or ""),
             "detailDigest": str(metadata.get("detailDigest") or ""),
+            # 这条线程此前轮次已经列进提示词的任务键：续聊只补增量，整份清单留在会话历史里。
+            "sentItemKeys": [str(key) for key in metadata.get("sentItemKeys") or [] if str(key)],
             "requirementKey": requirement_key,
             "baseline": {name: set(baseline.get(name) or []) for name in ("items", "stages", "modules")},
             "result": metadata.get("result") if isinstance(metadata.get("result"), dict) else {},
@@ -171,6 +175,7 @@ class PlanningMixin:
             "moduleKey": str(session.get("moduleKey") or ""),
             "kind": str(session.get("kind") or ""),
             "detailDigest": str(session.get("detailDigest") or ""),
+            "sentItemKeys": [str(key) for key in session.get("sentItemKeys") or [] if str(key)],
             "baseline": {name: sorted(values) for name, values in (session.get("baseline") or {}).items()},
             "result": result,
         }
@@ -262,7 +267,7 @@ class PlanningMixin:
             # 目录里留着 running，但本进程没有对应的回合：多半是上一次桥接跑一半被重启了。
             if not entry["active"] and entry.get("status") == "running":
                 entry["status"] = "interrupted"
-        return {
+        return with_usage({
             "bizLine": biz_line,
             "programId": program_id,
             "requirementKey": requirement_key,
@@ -285,7 +290,7 @@ class PlanningMixin:
             "selectedModuleKey": str((session or {}).get("moduleKey") or ""),
             "selectedKind": str((session or {}).get("kind") or ""),
             "result": dict((session or {}).get("result") or {}),
-        }
+        })
 
     def send_planning(self, raw: Any, config: dict[str, Any]) -> dict[str, Any]:
         provider = ai_provider_of(raw)
@@ -373,6 +378,8 @@ class PlanningMixin:
                 self.workspace,
                 lambda event: self._publish_app_server_event(identity, event),
                 codex_environment(config, program_id, write_allowed=False, provider=provider),
+                # 需求对话读的就是模型怎么理解需求、为什么这么拆，推理摘要要上屏。
+                show_reasoning=True,
             )
             try:
                 thread_id, turn_id = client.start_task(
@@ -398,6 +405,8 @@ class PlanningMixin:
                 "kind": selected_kind,
                 "requirementKey": requirement_key,
                 "detailDigest": planning_detail_digest(requirement),
+                # 首轮提示词里列了整份任务清单，后面几轮据此只补增量。
+                "sentItemKeys": requirement_item_keys(context, requirement_key),
                 "baseline": baseline,
                 "result": {"items": [], "stages": [], "modules": [], "itemKeys": [], "stageKeys": [], "moduleKeys": [], "updatedAt": ""},
                 "catalog": [*catalog, {"threadId": thread_id, "title": title, "createdAt": utc_now(), "updatedAt": utc_now(), "status": "running", "active": True}],
@@ -415,6 +424,7 @@ class PlanningMixin:
                 self.workspace,
                 lambda event: self._publish_app_server_event(identity, event),
                 codex_environment(config, program_id, write_allowed=confirm_write, provider=provider),
+                show_reasoning=True,
             )
             try:
                 client.resume_thread(thread_id)
@@ -432,6 +442,7 @@ class PlanningMixin:
                         self.workspace, mention_context,
                         include_detail=detail_digest != str(session.get("detailDigest") or ""),
                         thread_id=thread_id,
+                        known_item_keys=list(session.get("sentItemKeys") or []),
                     )
                 )
                 turn_id = client.start_turn(
@@ -446,6 +457,9 @@ class PlanningMixin:
             except Exception:
                 client.close()
                 raise
+            # 本轮列进提示词的任务键并进来：下一轮从这里算增量。确认写入轮走的是全量提示词，
+            # 同样以本轮的清单为准。
+            session["sentItemKeys"] = requirement_item_keys(context, requirement_key)
             session.update({"threadId": thread_id, "turnId": turn_id, "detailDigest": detail_digest, "stageKey": selected_stage or session.get("stageKey") or "", "moduleKey": selected_module or session.get("moduleKey") or "", "kind": selected_kind or session.get("kind") or ""})
             for entry in session.get("catalog") or []:
                 if entry.get("threadId") == thread_id:
@@ -588,6 +602,8 @@ class PlanningMixin:
                         thread_id,
                         "\n\n".join(round_messages) or user_message,
                         reply,
+                        # 首轮的回复是完整预览，之后每轮只给增量：整篇覆盖会把那份基线冲掉。
+                        incremental=not started_new_conversation,
                     )
                     session["tempPath"] = temp_path.as_posix()
             self._archive_terminal_chat(

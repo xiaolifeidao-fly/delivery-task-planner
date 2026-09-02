@@ -39,6 +39,7 @@ from delivery_bridge.providers import (
 from delivery_bridge.sessions import MAX_PLANNING_CONVERSATIONS
 from delivery_bridge.timeutil import utc_now
 from delivery_bridge.turn_output import execution_output, final_agent_text_from_output
+from delivery_bridge.token_usage import with_usage
 from delivery_bridge.turn_view import serialize_turns
 
 
@@ -166,7 +167,7 @@ class RequirementReviewMixin:
             entry["active"] = bool(active is not None and entry.get("threadId") == active.get("threadId"))
             if not entry["active"] and entry.get("status") == "running":
                 entry["status"] = "interrupted"
-        return {
+        return with_usage({
             "programId": program_id, "requirementKey": requirement_key, "threadId": selected_thread_id,
             "executorType": provider,
             "turns": serialize_turns(
@@ -178,7 +179,7 @@ class RequirementReviewMixin:
             "active": bool(active is not None and active.get("threadId") == selected_thread_id),
             "activeTurnId": str((active or {}).get("turnId") or ""),
             "reviewReport": report, "reviewReportPath": report_path,
-        }
+        })
 
     def send_requirement_review(self, raw: Any, config: dict[str, Any]) -> dict[str, Any]:
         provider = ai_provider_of(raw)

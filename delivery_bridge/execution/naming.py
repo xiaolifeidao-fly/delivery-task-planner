@@ -12,6 +12,7 @@ from typing import Any
 import server as planner
 
 from delivery_bridge.clients import factory
+from delivery_bridge.providers import lightweight_model, lightweight_reasoning_effort
 from delivery_bridge.clients.claude import ClaudeCLIClient
 from delivery_bridge.clients.codex import AppServerClient
 from delivery_bridge.executor_env import codex_environment
@@ -37,20 +38,31 @@ class NamingMixin:
         user_message: str,
         reply: str,
     ) -> str:
-        """起一轮只读短会话，为新聊天生成标题；超时则保留原始占位标题。"""
+        """起一轮只读短会话，为新聊天生成标题；超时则保留原始占位标题。
+
+        这一轮是面板内务，不读代码也不调工具，所以按轻量会话跑：cwd 换成运行时目录下的
+        空目录（两个执行器都不会再去装项目的 AGENTS.md / CLAUDE.md 和技能清单），
+        模型降到该执行器最小的那档，推理档位压到最低。以前它和拆解回合是同一套配置，
+        为一行 30 字的标题付的是一整份项目上下文。
+
+        `reasoning_effort` 保留在签名里只为兼容既有调用方，实际不再采用：内务回合的档位
+        由 lightweight_reasoning_effort 按执行器决定。
+        """
         client = factory.create_ai_client(
             provider,
-            self.workspace,
+            factory.lightweight_workspace(),
             None,
             codex_environment(config, program_id, write_allowed=False, provider=provider),
+            lightweight=True,
         )
         try:
             thread_id, turn_id = client.start_task(
                 "聊天自动命名",
                 build_conversation_title_prompt(user_message, reply),
                 None,
-                model,
-                reasoning_effort=reasoning_effort,
+                lightweight_model(provider, model),
+                # 主会话选了多高的推理档位都不跟：这一轮只是把一句话缩成一个标题。
+                reasoning_effort=lightweight_reasoning_effort(provider),
                 fast_mode=fast_mode,
             )
             outcome: dict[str, str] = {}

@@ -39,7 +39,8 @@ from delivery_bridge.git_ops import (
     git_workspace_projects,
     git_workspace_status,
 )
-from delivery_bridge.payloads import program_id_of
+from delivery_bridge.payloads import business_item_key_of, program_id_of
+from delivery_bridge.providers import ai_provider_of
 
 
 WORKSPACE_MAPPINGS_PATH = runtime.RUNTIME_DIR / "remote-worker-workspaces.json"
@@ -50,18 +51,27 @@ WORKER_BACKOFF_SECONDS = 15
 MAX_RESULT_BYTES = 480 * 1024
 MAX_COMMAND_ATTACHMENT_COUNT = 5
 MAX_COMMAND_ATTACHMENT_BYTES = 20 * 1024 * 1024
+BUSINESS_POLL_SECONDS = 2
+# 业务访谈回传的是给业务方看的整段回复，确认文档那一轮就是一篇完整业务文档。
+# 任务类命令的 4096 字截断会把它切掉，所以按命令类型放宽单条文本上限。
+COMMAND_TEXT_LIMITS = {"business.conversation": 60000}
+DEFAULT_COMMAND_TEXT_LIMIT = 4096
 
 
 # These are the only command names a remote client can cause the worker to
 # execute.  In particular, no command maps to an arbitrary local HTTP route,
 # Python attribute, or shell process.
 COMMAND_CAPABILITIES = frozenset({
+    "business.conversation",
     "task.execute",
     "task.execute-batch",
     "task.execute-sequence",
     "task.session",
     "task.conversation",
     "task.planning",
+    "task.planning-session",
+    "task.planning-stop",
+    "requirement.usage",
     "task.stop",
     "task.stop-all",
     "git.status",
@@ -78,6 +88,23 @@ COMMAND_CAPABILITIES = frozenset({
     "git.push",
     "git.merge",
     "documents.cloud-sync",
+})
+
+
+# 只读快照类命令走独立的领取通道：一条长任务占着执行通道时，工作台仍然能刷新
+# 会话、Git 状态和改动列表。这些命令都不写工作目录，也不启动新的执行回合。
+READ_ONLY_COMMAND_CAPABILITIES = frozenset({
+    "task.session",
+    "task.planning-session",
+    # 只查用量：读会话表和本机的会话缓存，不动工作目录，也不起回合。
+    "requirement.usage",
+    "git.status",
+    "git.branches",
+    "git.changes",
+    "git.change",
+    "git.projects",
+    "git.merge-preview",
+    "git.workspace-check",
 })
 
 
@@ -273,6 +300,9 @@ class CommandReporter:
         self.worker_id = worker_id
         self.lease_token = lease_token
         self.cancelled = threading.Event()
+        self.text_limit = COMMAND_TEXT_LIMITS.get(
+            str(command.get("commandType") or "").strip().lower(), DEFAULT_COMMAND_TEXT_LIMIT,
+        )
         self._last_report_at = 0.0
 
     @property
@@ -291,7 +321,7 @@ class CommandReporter:
             "workerId": self.worker_id,
             "leaseToken": self.lease_token,
             "message": _safe_text(message, None, 1024),
-            "data": _safe_value(data or {}, None),
+            "data": _safe_value(data or {}, None, self.text_limit),
         }
         if progress is not None:
             body["progress"] = max(0, min(100, int(progress)))
@@ -322,6 +352,8 @@ class RemoteCommandWorker:
         self.stop_event = threading.Event()
         self._running_lock = threading.Lock()
         self._running_command = ""
+        self._reading_lock = threading.Lock()
+        self._reading_command = ""
         self._registered_identity: tuple[str, tuple[tuple[str, tuple[int, ...]], ...]] | None = None
         self.last_error = ""
         self.last_registered_at = 0
@@ -353,6 +385,7 @@ class RemoteCommandWorker:
                 for item in self.mappings.snapshot()
             ],
             "runningCommand": self._running_command,
+            "readingCommand": self._reading_command,
             "lastError": self.last_error,
             "lastRegisteredAt": self.last_registered_at,
         }
@@ -361,6 +394,7 @@ class RemoteCommandWorker:
         self.stop_event.set()
 
     def run_forever(self) -> None:
+        threading.Thread(target=self._read_forever, daemon=True, name="delivery-remote-worker-read").start()
         while not self.stop_event.is_set():
             try:
                 self.run_once(wait_seconds=20)
@@ -370,7 +404,16 @@ class RemoteCommandWorker:
                 print(f"远程命令 Worker 暂时不可用：{self.last_error}", flush=True)
                 self.stop_event.wait(WORKER_BACKOFF_SECONDS)
 
-    def run_once(self, wait_seconds: int = 20) -> bool:
+    def _read_forever(self) -> None:
+        """只读通道：与执行通道并行领取快照命令，不参与本机写操作。"""
+        while not self.stop_event.is_set():
+            try:
+                self.run_once(wait_seconds=20, command_types=sorted(READ_ONLY_COMMAND_CAPABILITIES))
+            except Exception as exc:
+                print(f"远程命令只读通道暂时不可用：{_safe_text(str(exc), None, 1024)}", flush=True)
+                self.stop_event.wait(WORKER_BACKOFF_SECONDS)
+
+    def run_once(self, wait_seconds: int = 20, command_types: list[str] | None = None) -> bool:
         if not self.api_url:
             self.stop_event.wait(WORKER_BACKOFF_SECONDS)
             return False
@@ -381,9 +424,12 @@ class RemoteCommandWorker:
             return False
         api = CommandAPI(self.api_url)
         self._register(api, config, mappings)
+        claim_body: dict[str, Any] = {"workerId": self.worker_id}
+        if command_types:
+            claim_body["commandTypes"] = list(command_types)
         claimed = api.request(
             config, "POST", "/workers/commands/claim",
-            body={"workerId": self.worker_id}, query={"waitSeconds": max(1, min(25, int(wait_seconds)))}, timeout=max(30, wait_seconds + 10),
+            body=claim_body, query={"waitSeconds": max(1, min(25, int(wait_seconds)))}, timeout=max(30, wait_seconds + 10),
         )
         if not isinstance(claimed, dict) or not isinstance(claimed.get("command"), dict):
             return False
@@ -398,7 +444,7 @@ class RemoteCommandWorker:
             reporter = CommandReporter(api, config, command, self.worker_id, lease_token)
             self._complete(reporter, "failed", {}, "本机项目工作目录映射已失效，未执行命令")
             return True
-        self._run_claimed(api, config, command, lease_token, mapping)
+        self._run_claimed(api, config, command, lease_token, mapping, read_only=bool(command_types))
         return True
 
     def _register(self, api: CommandAPI, config: dict[str, Any], mappings: list[dict[str, Any]]) -> None:
@@ -432,13 +478,21 @@ class RemoteCommandWorker:
         command: dict[str, Any],
         lease_token: str,
         mapping: dict[str, Any],
+        *,
+        read_only: bool = False,
     ) -> None:
         reporter = CommandReporter(api, config, command, self.worker_id, lease_token)
         command_id = reporter.command_id
-        with self._running_lock:
-            if self._running_command:
-                raise BridgeFailure("Worker 已有正在运行的远程命令")
-            self._running_command = command_id
+        lock = self._reading_lock if read_only else self._running_lock
+        with lock:
+            if read_only:
+                if self._reading_command:
+                    raise BridgeFailure("Worker 只读通道已有正在执行的命令")
+                self._reading_command = command_id
+            else:
+                if self._running_command:
+                    raise BridgeFailure("Worker 已有正在运行的远程命令")
+                self._running_command = command_id
         try:
             reporter.report("Worker 已在本机工作目录开始执行命令", 1, {"commandType": command.get("commandType")}, force=True)
             workspace_bridge = self.bridge.for_workspace(mapping["workspace"])
@@ -459,11 +513,18 @@ class RemoteCommandWorker:
         except Exception as exc:
             self._complete(reporter, "cancelled" if reporter.cancelled.is_set() else "failed", {}, str(exc))
         finally:
-            with self._running_lock:
-                self._running_command = ""
+            with lock:
+                if read_only:
+                    self._reading_command = ""
+                else:
+                    self._running_command = ""
 
     def _relay_progress(self, reporter: CommandReporter, mapping: dict[str, Any]) -> None:
         command_type = str(reporter.command.get("commandType") or "")
+        if command_type.startswith("business."):
+            # 业务访谈自己按轮次回传会话快照，服务端读的是最近一条活动。
+            # 这里再插一条通用进度会把那份快照顶掉，让访谈界面回退成空白。
+            return
         input_value = reporter.command.get("input") if isinstance(reporter.command.get("input"), dict) else {}
         item_key = str(input_value.get("itemKey") or "").strip()
         if command_type.startswith("task.") and item_key:
@@ -499,11 +560,98 @@ class RemoteCommandWorker:
             "_project_id": program_id,
             "_biz_line": str(mapping["bizLine"]),
         }
+        if command_type == "business.conversation":
+            return self._dispatch_business(input_value, program_id, reporter)
         if command_type.startswith("task."):
             return self._dispatch_task(command_type, input_value, workspace_bridge, task_config, program_id, reporter)
         if command_type == "documents.cloud-sync":
             return workspace_bridge.sync_cloud_workspace(program_id, task_config)
         return self._dispatch_git(command_type, input_value, workspace_bridge, task_config, program_id)
+
+    def _dispatch_business(
+        self,
+        value: dict[str, Any],
+        program_id: int,
+        reporter: CommandReporter,
+    ) -> dict[str, Any]:
+        """Run one server-raised business interview turn.
+
+        An interview has no delivery task and no project checkout: its workspace
+        is the logical business path the Go service chose, which
+        for_business_workspace resolves under this machine's controlled business
+        root. The mapped project directory is deliberately not used here, and the
+        command still carries no absolute path of its own.
+        """
+        workspace = str(value.get("workspace") or "").strip()
+        if not workspace:
+            raise BridgeFailure("业务访谈命令缺少工作目录")
+        bridge = self.bridge.for_business_workspace(workspace)
+        item_key = business_item_key_of(value.get("itemKey"))
+        provider = ai_provider_of(value.get("provider") or "codex")
+        payload = {key: item for key, item in value.items() if key != "workspace"}
+        payload["programId"] = program_id
+        payload["itemKey"] = item_key
+        payload["attachmentIds"] = self._business_attachments(bridge, value, program_id, item_key, reporter)
+        action = bridge.send_business_conversation(payload)
+        if not action.get("accepted"):
+            raise BridgeFailure("本机插件未接受业务访谈请求")
+        thread_id = str(action.get("threadId") or "").strip()
+        turn_id = str(action.get("turnId") or "").strip()
+        # 先把线程标识回传：服务端的 Start 正阻塞等它，而且业务方的下一轮
+        # 还要靠这个标识续上同一个 Codex 会话，晚回传就会分叉成新会话。
+        reporter.report("业务访谈已在本机开始", 5, {"threadId": thread_id, "turnId": turn_id}, force=True)
+        published = ""
+        while True:
+            conversation = bridge.business_conversation(program_id, item_key, thread_id, provider)
+            thread_id = str(conversation.get("threadId") or thread_id).strip()
+            snapshot = {
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "conversation": _business_turn_only(conversation, turn_id),
+            }
+            active = bool(conversation.get("active"))
+            if not active or reporter.cancelled.is_set():
+                return snapshot
+            # 每条活动都会在服务端留一行事件，而模型思考期间快照可以连着几十秒
+            # 不变。只在真正有新内容时回传，长访谈才不会堆出成百条一样的快照。
+            current = json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
+            if current != published:
+                reporter.report("业务访谈正在进行", 50, snapshot, force=True)
+                published = current
+            self.stop_event.wait(BUSINESS_POLL_SECONDS)
+            if self.stop_event.is_set():
+                raise BridgeFailure("Worker 正在退出，业务访谈未能完成")
+
+    def _business_attachments(
+        self,
+        bridge: Any,
+        value: dict[str, Any],
+        program_id: int,
+        item_key: str,
+        reporter: CommandReporter,
+    ) -> list[str]:
+        """Materialise app-api-held uploads into the business workspace.
+
+        The console uploads to the server, not to this machine, so the ids in the
+        command are app-api ids. They only become usable once the bytes are in the
+        business workspace under the bridge's own attachment ids.
+        """
+        attachment_ids = value.get("attachmentIds") or []
+        if not isinstance(attachment_ids, list):
+            raise BridgeFailure("业务访谈附件标识必须是数组")
+        if not attachment_ids:
+            return []
+        if len(attachment_ids) > MAX_COMMAND_ATTACHMENT_COUNT:
+            raise BridgeFailure(f"一条消息最多携带 {MAX_COMMAND_ATTACHMENT_COUNT} 个附件")
+        uploads = [
+            reporter.api.download_attachment(reporter.config, reporter.biz_line, program_id, str(attachment_id))
+            for attachment_id in attachment_ids
+        ]
+        stored = bridge.save_business_attachments(program_id, item_key, uploads)
+        attachments = stored.get("attachments") if isinstance(stored, dict) else None
+        if not isinstance(attachments, list) or len(attachments) != len(uploads):
+            raise BridgeFailure("业务访谈附件写入本机工作目录失败")
+        return [str(item.get("id") or "") for item in attachments]
 
     def _dispatch_task(
         self,
@@ -525,6 +673,10 @@ class RemoteCommandWorker:
             result["task"] = bridge._task_detail(config, program_id, item_key)
             result["cloudSync"] = _best_effort_sync(bridge, program_id, config)
             return result
+        if command_type == "requirement.usage":
+            return bridge.requirement_usage(
+                program_id, str(payload.get("requirementKey") or ""), config=config,
+            )
         if command_type == "task.session":
             item_key = _item_key(payload)
             return bridge.conversation(
@@ -556,8 +708,21 @@ class RemoteCommandWorker:
             result["task"] = bridge._task_detail(config, program_id, item_key)
             result["cloudSync"] = _best_effort_sync(bridge, program_id, config)
             return result
+        if command_type == "task.planning-session":
+            requirement_key = _requirement_key(payload)
+            return bridge.planning(
+                program_id,
+                selected_thread_id=str(payload.get("threadId") or ""),
+                config=config,
+                requirement_key=requirement_key,
+                provider=str(payload.get("provider") or "codex"),
+            )
+        if command_type == "task.planning-stop":
+            return bridge.stop_planning(payload, config=config)
         if command_type == "task.planning":
             requirement_key = _requirement_key(payload)
+            # 移动端只知道需求键：拆解会话要的需求正文和阶段开关由 Worker 从任务面板补齐。
+            payload = self._planning_payload(bridge, config, program_id, requirement_key, payload, reporter)
             result = bridge.send_planning(payload, config=config)
             self._wait_for_planning(bridge, program_id, requirement_key, reporter)
             thread_id = str(result.get("threadId") or "")
@@ -628,6 +793,46 @@ class RemoteCommandWorker:
             self._relay_progress(reporter, {"workspace": str(bridge.workspace)})
             self.stop_event.wait(1)
 
+    def _planning_payload(
+        self,
+        bridge: Any,
+        config: dict[str, Any],
+        program_id: int,
+        requirement_key: str,
+        payload: dict[str, Any],
+        reporter: CommandReporter,
+    ) -> dict[str, Any]:
+        """Fill a planning turn's requirement context and land its attachments locally."""
+        requirement = planner.request_api(
+            config, "GET", "/delivery/requirement",
+            query={"programId": program_id, "requirementKey": requirement_key},
+        )
+        if not isinstance(requirement, dict) or str(requirement.get("requirementKey") or "") != requirement_key:
+            raise BridgeFailure("需求不存在或无法读取")
+        enriched = dict(payload)
+        enriched.setdefault("requirementName", str(requirement.get("name") or ""))
+        enriched.setdefault("requirementDetail", str(requirement.get("detail") or ""))
+        enriched.setdefault("requirementStartPhase", str(requirement.get("startPhase") or "requirement"))
+        enriched.setdefault("requirementSplitTasks", bool(requirement.get("splitTasks", True)))
+        enriched.setdefault("requirementPreGenerateTaskDocuments", bool(requirement.get("preGenerateTaskDocuments")))
+        enriched.setdefault("requirementGeneratePrototype", bool(requirement.get("generatePrototype")))
+        attachment_ids = enriched.get("attachmentIds") or []
+        if not isinstance(attachment_ids, list) or len(attachment_ids) > MAX_COMMAND_ATTACHMENT_COUNT:
+            raise BridgeFailure(f"一条消息最多携带 {MAX_COMMAND_ATTACHMENT_COUNT} 个附件")
+        if attachment_ids:
+            uploads = [
+                reporter.api.download_attachment(reporter.config, reporter.biz_line, program_id, str(attachment_id))
+                for attachment_id in attachment_ids
+            ]
+            stored = bridge.upload_conversation_attachments(
+                str(config["_biz_line"]), program_id, bridge._planning_item_key(requirement_key), uploads, config,
+            )
+            attachments = stored.get("attachments") if isinstance(stored, dict) else None
+            if not isinstance(attachments, list) or len(attachments) != len(uploads):
+                raise BridgeFailure("远程命令附件写入本机工作目录失败")
+            enriched["attachmentIds"] = [str(item.get("id") or "") for item in attachments]
+        return enriched
+
     def _wait_for_planning(self, bridge: Any, program_id: int, requirement_key: str, reporter: CommandReporter) -> None:
         identity = bridge._planning_identity(program_id, requirement_key)
         while True:
@@ -658,7 +863,7 @@ class RemoteCommandWorker:
                 item_key = str(value.get("itemKey") or "").strip()
                 if item_key:
                     bridge.stop_conversation({"programId": command.get("programId"), "itemKey": item_key}, config=config)
-            elif command_type == "task.planning":
+            elif command_type in {"task.planning", "task.planning-stop"}:
                 requirement_key = str(value.get("requirementKey") or "").strip()
                 if requirement_key:
                     bridge.stop_planning({"programId": command.get("programId"), "requirementKey": requirement_key}, config=config)
@@ -671,7 +876,7 @@ class RemoteCommandWorker:
             return
 
     def _complete(self, reporter: CommandReporter, state: str, result: dict[str, Any], error: str) -> None:
-        safe_result = _bounded_result(_safe_value(result, None))
+        safe_result = _bounded_result(_safe_value(result, None, reporter.text_limit))
         try:
             reporter.api.request(
                 reporter.config, "POST", f"/workers/commands/{reporter.command_id}/complete",
@@ -687,6 +892,26 @@ class RemoteCommandWorker:
         except Exception as exc:
             self.last_error = _safe_text(f"回传命令结果失败：{exc}", None, 1024)
             print(self.last_error, flush=True)
+
+
+def _business_turn_only(conversation: dict[str, Any], turn_id: str) -> dict[str, Any]:
+    """Keep the running turn and drop the thread's history.
+
+    A command activity is capped at 64 KB server-side, and a business thread
+    accumulates every earlier turn. The server only projects the turn it asked
+    about, so sending the rest would buy nothing and eventually overflow.
+    """
+    turns = conversation.get("turns")
+    if not isinstance(turns, list):
+        turns = []
+    selected = [turn for turn in turns if isinstance(turn, dict) and str(turn.get("id") or "") == turn_id]
+    if not selected and turns:
+        selected = [turns[-1]]
+    return {
+        "threadId": str(conversation.get("threadId") or ""),
+        "active": bool(conversation.get("active")),
+        "turns": selected,
+    }
 
 
 def _item_key(value: dict[str, Any]) -> str:
@@ -720,7 +945,7 @@ def _safe_text(value: Any, workspace: Path | None, limit: int = 4096) -> str:
     return text.strip()[:limit]
 
 
-def _safe_value(value: Any, workspace: Path | None) -> Any:
+def _safe_value(value: Any, workspace: Path | None, limit: int = DEFAULT_COMMAND_TEXT_LIMIT) -> Any:
     if isinstance(value, dict):
         safe: dict[str, Any] = {}
         for key, item in value.items():
@@ -729,15 +954,15 @@ def _safe_value(value: Any, workspace: Path | None) -> Any:
             if str(key).lower() in {"workspace", "repositoryroot"}:
                 safe[f"{key}Name"] = workspace.name if workspace is not None else "local-workspace"
             else:
-                safe[str(key)] = _safe_value(item, workspace)
+                safe[str(key)] = _safe_value(item, workspace, limit)
         return safe
     if isinstance(value, list):
-        return [_safe_value(item, workspace) for item in value]
+        return [_safe_value(item, workspace, limit) for item in value]
     if isinstance(value, str):
-        return _safe_text(value, workspace)
+        return _safe_text(value, workspace, limit)
     if value is None or isinstance(value, (bool, int, float)):
         return value
-    return _safe_text(value, workspace)
+    return _safe_text(value, workspace, limit)
 
 
 def _bounded_result(value: Any) -> dict[str, Any]:

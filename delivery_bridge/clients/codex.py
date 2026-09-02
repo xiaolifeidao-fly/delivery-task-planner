@@ -25,22 +25,48 @@ from typing import Any
 import server as planner
 
 from ..attachments_text import message_with_attachments
-from ..codex_cli import provision_codex_cli
+from ..codex_cli import codex_mcp_disable_overrides, provision_codex_cli
 from ..errors import BridgeFailure
 from ..turn_output import TERMINAL_TURN_STATUSES
 from .journal import THREAD_ITEMS, merge_journal_turns
 
 # 刚起的会话读不出来是瞬时的，忍这么久之后仍然读不到才算失败。
 THREAD_READ_GRACE_SECONDS = 30.0
-# turn/start 的 summary 取值：auto / concise / detailed / none。auto 由模型自己决定详略，
-# 实测常常只给一两句。注意 app-server 会静默忽略不认识的字段，改名字前先实际验一遍。
-TURN_REASONING_SUMMARY = "detailed"
+# turn/start 的 summary 取值：auto / concise / detailed / none。摘要本身是模型生成的
+# 输出 token，按输出计价，所以按会话类型分开定：
+#
+# - 任务执行会话（HIDDEN）：面板要看的是跑了哪些命令、改了哪些文件、最后结论是什么，
+#   推理摘要不在其中，不生成。
+# - 需求侧会话（SHOWN）：用户读的就是模型怎么想的——需求怎么理解、为什么这么拆，
+#   摘要本身就是产物的一部分，这份钱该花。
+#
+# auto 由模型自己决定详略，实测经常只给一两句，两边都不用。
+# 注意 app-server 会静默忽略不认识的字段，改名字前先实际验一遍。
+TURN_REASONING_SUMMARY_HIDDEN = "none"
+TURN_REASONING_SUMMARY_SHOWN = "detailed"
+TURN_REASONING_SUMMARY = TURN_REASONING_SUMMARY_HIDDEN
 # stderr 只在出问题时才有内容，留最后这几行就够定位。
 APP_SERVER_STDERR_TAIL = 40
 
 class AppServerClient:
-    def __init__(self, workspace: Path, event_callback: Any = None, environment: dict[str, str] | None = None):
+    # 类属性兜底：测试会绕过 __init__ 直接造实例，起名之外的所有会话都是非轻量的。
+    lightweight = False
+    # 同理：没走 __init__ 的实例按「不展示推理」处理，任务执行是绝大多数会话。
+    reasoning_summary = TURN_REASONING_SUMMARY_HIDDEN
+
+    def __init__(
+        self,
+        workspace: Path,
+        event_callback: Any = None,
+        environment: dict[str, str] | None = None,
+        lightweight: bool = False,
+        show_reasoning: bool = False,
+    ):
         self.workspace = workspace
+        # 需求侧会话要把推理摘要展示出来，任务执行会话不要；决定权在建客户端的那一路。
+        self.reasoning_summary = TURN_REASONING_SUMMARY_SHOWN if show_reasoning else TURN_REASONING_SUMMARY_HIDDEN
+        # 轻量会话用于起标题这类内务回合：线程一次性、沙箱只读，也不需要项目上下文。
+        self.lightweight = lightweight
         self.event_callback = event_callback
         process_environment = os.environ.copy()
         process_environment.update(environment or {})
@@ -48,7 +74,7 @@ class AppServerClient:
         if not codex_command:
             raise BridgeFailure("未找到 Codex CLI 或 Codex Desktop 资源目录中的可执行文件")
         self.process = subprocess.Popen(
-            [codex_command, "app-server"],
+            [codex_command, "app-server", *codex_mcp_disable_overrides()],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -167,9 +193,10 @@ class AppServerClient:
         thread_params = {
             "cwd": str(self.workspace),
             "approvalPolicy": "never",
-            "sandbox": "danger-full-access",
+            # 内务回合不写任何文件，也不该留下一条能被续聊的线程。
+            "sandbox": "read-only" if self.lightweight else "danger-full-access",
             "threadSource": "user",
-            "ephemeral": False,
+            "ephemeral": bool(self.lightweight),
         }
         if model:
             thread_params["model"] = model
@@ -191,16 +218,13 @@ class AppServerClient:
             "input": self._input_parts(prompt, attachments),
             "cwd": str(self.workspace),
             "approvalPolicy": "never",
-            "sandboxPolicy": {"type": "dangerFullAccess"},
+            "sandboxPolicy": {"type": "readOnly"} if self.lightweight else {"type": "dangerFullAccess"},
         }
         if model:
             turn_params["model"] = model
         if reasoning_effort:
             turn_params["effort"] = reasoning_effort
-        # ``detailed`` asks Codex for the fullest supported *summary*, never for
-        # raw reasoning. 合法取值是 auto / concise / detailed / none；auto 由模型自己
-        # 决定详略，实测经常只给一两句，和桌面版看到的过程对不上。
-        turn_params["summary"] = TURN_REASONING_SUMMARY
+        turn_params["summary"] = self.reasoning_summary
         self.send(
             "turn/start",
             3,
@@ -244,7 +268,7 @@ class AppServerClient:
             params["model"] = model
         if reasoning_effort:
             params["effort"] = reasoning_effort
-        params["summary"] = TURN_REASONING_SUMMARY
+        params["summary"] = self.reasoning_summary
         self.send(
             "turn/start",
             request_id,

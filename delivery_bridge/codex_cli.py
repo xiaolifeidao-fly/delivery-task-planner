@@ -11,6 +11,7 @@ RUNTIME_DIR 按模块名访问（``runtime.RUNTIME_DIR``），这样测试改写
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -178,3 +179,43 @@ def provision_codex_cli(host: str = "", runtime_dir: Path | None = None) -> str:
         # Desktop resources are directly executable too. Keep the board usable
         # when a restrictive filesystem prevents creating the local copy.
         return str(source)
+
+
+# `[mcp_servers.名字]` 和 `[mcp_servers.名字.env]` 都要认，名字可能被引号裹着。
+CODEX_MCP_SECTION_RE = re.compile(r'^\s*\[mcp_servers\.(?:"([^"]+)"|([^.\]\s]+))', re.MULTILINE)
+
+
+def codex_home() -> Path:
+    return Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
+
+
+def codex_mcp_server_names(home: Path | None = None) -> list[str]:
+    """`~/.codex/config.toml` 里配置过的 MCP 服务名，按出现顺序去重。"""
+    config_path = (home or codex_home()) / "config.toml"
+    try:
+        text = config_path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    names: list[str] = []
+    for quoted, bare in CODEX_MCP_SECTION_RE.findall(text):
+        name = quoted or bare
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def codex_mcp_disable_overrides(home: Path | None = None) -> list[str]:
+    """把每个 MCP 服务在本次 app-server 里关掉的 `-c` 覆盖参数。
+
+    交付任务的执行会话只用 Codex 自带的文件、命令和搜索工具，用户机器上全局配置的
+    MCP 与交付任务无关：工具清单会进系统提示、会话里每轮都要重发，起不来的服务还要
+    白等一次启动超时。这里只覆盖本次进程，不动用户的 config.toml。
+
+    注意 `-c mcp_servers={}` 是不管用的：表覆盖走的是合并，实测服务照样在，
+    只有逐个 `mcp_servers.<名字>.enabled=false` 才真的关掉。
+    """
+    return [
+        argument
+        for name in codex_mcp_server_names(home)
+        for argument in ("-c", f"mcp_servers.{name}.enabled=false")
+    ]

@@ -34,7 +34,27 @@ from delivery_bridge.providers import (
     reasoning_effort_of,
 )
 from delivery_bridge.sessions import conversation_metadata, conversation_title
-from delivery_bridge.turn_output import batch_task_outcome
+from delivery_bridge.turn_output import batch_task_outcome, code_facts_from_output
+
+
+# 队列里已完成任务交接下来的代码事实，总量封顶。这段会跟着后面每一条任务的
+# 每一次请求重发，涨起来比它替下游省掉的那点勘察还贵，所以超限时丢最旧的。
+QUEUE_CODE_FACTS_LIMIT = 8 * 1024
+
+
+def queue_code_facts(collected: list[tuple[str, str]], limit: int = QUEUE_CODE_FACTS_LIMIT) -> str:
+    """Join the handoff notes of finished queue items, newest first, under a cap."""
+    blocks: list[str] = []
+    used = 0
+    for item_key, facts in reversed(collected):
+        if not str(facts or "").strip():
+            continue
+        block = f"【{item_key}】\n{facts.strip()}"
+        if used + len(block) + 2 > limit:
+            break
+        blocks.append(block)
+        used += len(block) + 2
+    return "\n\n".join(reversed(blocks))
 
 
 class QueueMixin:
@@ -362,6 +382,8 @@ class QueueMixin:
         with self.lock:
             self.sequence_satisfied.setdefault(sequence_id, set())
         self._register_queue(sequence_id, program_id)
+        # 上游任务在最终回复里交接下来的代码事实，按顺序攒着传给后面的任务。
+        collected_facts: list[tuple[str, str]] = []
         try:
             for item_key in item_keys:
                 self._abort_if_cancelled(sequence_id)
@@ -385,6 +407,7 @@ class QueueMixin:
                         "executionBatchId": sequence_id,
                         "batchMode": True,
                         **({"executionConstraints": execution_constraints} if execution_constraints else {}),
+                        **({"upstreamCodeFacts": queue_code_facts(collected_facts)} if collected_facts else {}),
                         **({"reasoningEffort": reasoning_effort} if reasoning_effort else {}),
                         **({"fastMode": True} if fast_mode else {}),
                     },
@@ -424,6 +447,9 @@ class QueueMixin:
                 with self.lock:
                     self.sequence_satisfied.setdefault(sequence_id, set()).add(item_key)
                 self._update_execution_batch_item(config, program_id, sequence_id, item_key, "completed", reason, provider)
+                facts = code_facts_from_output(str(completed_task.get("actionOutput") or ""))
+                if facts:
+                    collected_facts.append((item_key, facts))
                 attempted_item = ""
         except Exception as exc:
             terminal_status = "blocked"
@@ -560,6 +586,8 @@ class QueueMixin:
         with self.lock:
             self.batch_satisfied.setdefault(batch_id, set())
         self._register_queue(batch_id, program_id)
+        # 上一波任务交接下来的代码事实，下一波开始前拼进提示词。
+        collected_facts: list[tuple[str, str]] = []
         try:
             remaining = set(item_keys)
             while remaining:
@@ -621,6 +649,7 @@ class QueueMixin:
                             "batchMode": True,
                             **({"redo": True} if redo else {}),
                             **({"executionConstraints": execution_constraints} if execution_constraints else {}),
+                            **({"upstreamCodeFacts": queue_code_facts(collected_facts)} if collected_facts else {}),
                             **({"reasoningEffort": reasoning_effort} if reasoning_effort else {}),
                             **({"fastMode": True} if fast_mode else {}),
                         },
@@ -646,6 +675,9 @@ class QueueMixin:
                         self._update_execution_batch_item(config, program_id, batch_id, item_key, "completed", reason, provider)
                         with self.lock:
                             self.batch_satisfied.setdefault(batch_id, set()).add(item_key)
+                        facts = code_facts_from_output(str(reviewed_task.get("actionOutput") or ""))
+                        if facts:
+                            collected_facts.append((item_key, facts))
                         continue
                     if outcome == "ignorable":
                         self._update_execution_batch_item(config, program_id, batch_id, item_key, "blocked", reason, provider)

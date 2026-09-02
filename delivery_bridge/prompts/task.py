@@ -42,8 +42,9 @@ def build_task_prompt(payload: dict[str, Any], workspace: Path | None = None) ->
     # 需求级文档是这条任务所属需求的权威上下文，优先级高于任务级文档；任务级文档只补任务范围内的细节。
     reading_order = (
         [
-            f"需求级文档: `{outline_path}`（应用层已核对存在）。这是最高优先级的上下文：动手前先完整读一遍，"
-            "需求目标、范围、约束和验收口径以它为准。",
+            f"需求级文档: `{outline_path}`（应用层已核对存在）。这是最高优先级的上下文：动手前先读它开头的"
+            "「摘要」和「范围与不做的事」，再按本任务实际涉及的部分下钻到相关章节；"
+            "需求目标、范围、约束和验收口径以它为准。文件很长时按标题定位，不必为了通读整篇载入。",
         ]
         if outline_present
         else (
@@ -55,7 +56,8 @@ def build_task_prompt(payload: dict[str, Any], workspace: Path | None = None) ->
     if task_document_present:
         reading_order.extend([
             f"任务需求文档: `{document_path}`（应用层已核对存在）。这是本任务唯一的任务级需求文档，"
-            "读完需求级文档后接着完整读它；两者冲突时以需求级文档为准，并在最终回复里指出冲突点。",
+            "读完需求级文档后接着读它——同样按标题定位到本任务涉及的章节，不要为了通读整篇载入；"
+            "两者冲突时以需求级文档为准，并在最终回复里指出冲突点。",
             document_revision_rule(document_path),
         ])
     else:
@@ -84,15 +86,16 @@ def build_task_prompt(payload: dict[str, Any], workspace: Path | None = None) ->
             "并生成带明确验收判定的测试报告。"
         ),
     }.get(phase, "按任务当前阶段执行。")
-    # 任务的文档产物要留下完整的设计与思考过程，而不是只贴一份改完之后的结论。
+    # 设计过程是按回合追加的记录，不是需要维护成一份的活文档：一轮一份文件，
+    # 就不用为了「合并」而每轮把之前几轮的推演读一遍再重写一遍。
+    # 写什么、写多长按技能里的分档规则来，这里只交代路径和「一轮一份」这条操作约定，
+    # 避免和技能正文重复——两份都会在本轮的每一次请求里被重发。
     design_process_instruction = (
         [
-            f"本轮的任务文档产物写入 `{design_directory}/`，用稳定唯一的文件名（例如 `设计过程.md`），"
-            "内容是你这一轮完整的设计与思考过程，不是只贴结论或改动清单：需求怎么理解、勘察到的现状事实（文件、接口、表、现有实现）、"
-            "考虑过哪些方案及各自取舍、为什么选中最终方案、方案怎么落到具体改动、影响面和兼容性怎么处理、"
-            "如何验证、还剩哪些风险与待确认项。过程中被否决的想法也要写清楚为什么否决。",
-            "已有同名设计文档时，先完整读一遍再把本轮的推演补进去，不要整篇覆盖掉此前的设计过程；"
-            "最终回复里列出这份文档的工作区相对路径。",
+            f"本轮的任务文档产物写入 `{design_directory}/`，新建一份文件名带可排序后缀的文档"
+            "（例如 `设计过程-02.md`，序号接着目录里已有的最大序号往下排）；此前几轮的设计文档不要读、更不要改写。"
+            "内容是你这一轮完整的设计与思考过程，篇幅按改动体量分档，详见技能。"
+            "最终回复里列出本轮这份文档的工作区相对路径。",
         ]
         if phase == "development" else []
     )
@@ -134,12 +137,25 @@ def build_task_prompt(payload: dict[str, Any], workspace: Path | None = None) ->
                 "`批量判定：完成`、`批量判定：可忽略` 或 `批量判定：需人工处理`。",
                 "只有短暂的连接/会话中断，或不影响交付物的命令、验收提示噪声，才能判定为可忽略；"
                 "代码、编译、测试、权限、依赖、数据或实际实现问题必须判定为需人工处理，并说明原因。",
+                "最终回复里再加一节 `## 代码事实交接`：把下游任务不必重新勘察一遍的硬事实列成不超过 15 条要点"
+                "（文件路径与行号、接口/函数签名、字段名与类型、表名与关键列、已定下的命名或分层约定）。"
+                "只写事实，不贴代码正文，不复述设计过程；桥接器会把这一节原样传给同队列的后续任务。",
             ]
         )
     lines.extend(sibling_document_lines(payload.get("requirementDocuments")))
     execution_constraints = str(payload.get("executionConstraints") or "").strip()
     if execution_constraints:
         lines.extend(["", "本次队列的前置任务约束条件说明:", execution_constraints])
+    # 同队列已完成任务交接下来的代码事实。它们是上游刚刚在这份代码上确认过的，
+    # 直接采信就不必让每条任务在同一片代码上重新勘察一遍——勘察读进来的正文
+    # 会在本轮之后的每一次请求里被重发，是动作执行阶段最贵的一块。
+    upstream_code_facts = str(payload.get("upstreamCodeFacts") or "").strip()
+    if upstream_code_facts:
+        lines.extend([
+            "",
+            "同队列上游任务已确认的代码事实（可直接采信，不要为了核对它们重新通读这些文件）:",
+            upstream_code_facts,
+        ])
     mention_context = payload.get("conversationMentionContext") or []
     if isinstance(mention_context, list):
         lines.extend(str(line) for line in mention_context if isinstance(line, str) and line.strip())

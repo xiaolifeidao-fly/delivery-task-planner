@@ -41,6 +41,7 @@ from delivery_bridge import (
     git_ops,
     github_ssh,
     hostinfo,
+    pidfile,
     prompt_context,
     runtime,
     turn_output,
@@ -293,6 +294,8 @@ from delivery_bridge.providers import (
     reasoning_effort_of,
     fast_mode_of,
     program_id_of,
+    lightweight_model,
+    lightweight_reasoning_effort,
 )
 
 
@@ -414,6 +417,23 @@ from delivery_bridge.reasoning import (
 )
 
 
+from delivery_bridge import usage_index
+from delivery_bridge.usage_index import (
+    thread_usage,
+    usage_by_provider,
+)
+
+
+from delivery_bridge.token_usage import (
+    claude_turn_usage,
+    codex_turn_usage,
+    empty_usage,
+    merge_usage,
+    turns_usage_total,
+    with_usage,
+)
+
+
 from delivery_bridge.progress_events import (
     generated_image_from_event,
     progress_event_of,
@@ -530,8 +550,11 @@ from delivery_bridge.prompts.conversation import (
 
 
 from delivery_bridge.prompts.planning import (
+    MAX_PLANNING_TEMP_ROUNDS,
     planning_temp_segment,
     planning_temp_document_path,
+    planning_temp_sections,
+    requirement_item_keys,
     write_planning_temp_summary,
     delete_planning_temp_summary,
     planning_temp_rule_lines,
@@ -1112,6 +1135,8 @@ from delivery_bridge.clients.journal import (
 from delivery_bridge.clients.codex import (
     APP_SERVER_STDERR_TAIL,
     TURN_REASONING_SUMMARY,
+    TURN_REASONING_SUMMARY_HIDDEN,
+    TURN_REASONING_SUMMARY_SHOWN,
     THREAD_READ_GRACE_SECONDS,
     AppServerClient,
 )
@@ -1232,6 +1257,7 @@ from delivery_bridge.turn_output import (
     merged_execution_output,
     final_agent_text_from_output,
     testing_verdict_from_output,
+    code_facts_from_output,
     BATCH_OUTCOME_RE,
     BATCH_TURN_STATUS_RE,
     BATCH_HARD_PROBLEM_RE,
@@ -1382,6 +1408,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
         "/v1/codex/requirement-prototype/conversation": "_get_requirement_prototype_conversation",
         "/v1/codex/requirement-review": "_get_requirement_review",
         "/v1/codex/requirement-testing": "_get_requirement_testing",
+        "/v1/codex/requirement-usage": "_get_requirement_usage",
         "/v1/codex/task-fine-tuning": "_get_task_fine_tuning",
         "/v1/codex/task-testing-cases": "_get_task_testing_cases",
         "/v1/codex/workspace/validate": "_get_workspaces",
@@ -2069,6 +2096,31 @@ class BridgeHandler(BaseHTTPRequestHandler):
             self.json_response(500, {"error": f"读取拆解会话失败：{exc}"})
         return
 
+    def _get_requirement_usage(self, parsed: ParseResult) -> None:
+        """这条需求到目前为止烧了多少 token，按执行器分开，并附每条任务的分账。"""
+        if not self.allowed_origin():
+            self.json_response(403, {"error": "origin not allowed"})
+            return
+        query = parse_qs(parsed.query)
+        program_id = program_id_of((query.get("programId") or [""])[0])
+        requirement_key = str((query.get("requirementKey") or [""])[0]).strip()
+        if not program_id:
+            self.json_response(400, {"error": "programId is required"})
+            return
+        try:
+            selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
+            config = self.bridge.request_config(
+                {"programId": program_id},
+                self.allowed_origin() or "",
+                self.headers.get("token", "").strip(),
+            )
+            self.json_response(200, selected_bridge.requirement_usage(program_id, requirement_key, config=config))
+        except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
+            self.json_response(400, {"error": str(exc)})
+        except Exception as exc:
+            self.json_response(500, {"error": f"读取需求消耗失败：{exc}"})
+        return
+
     def do_POST(self) -> None:
         path = urlparse(self.path).path
         if path == "/v1/session/heartbeat":
@@ -2451,6 +2503,8 @@ def main() -> None:
         help="远端业务访谈的受控工作目录根路径；默认 ~/.local/share/delivery-task-planner/business-workspaces",
     )
     args = parser.parse_args()
+    # 先登记 pid：面板和脚本靠这个文件认「桥接在不在跑」，不能等服务起完才写。
+    pidfile.track_current_process()
     if args.workspace:
         workspace = Path(args.workspace).resolve()
         if not workspace.is_dir():

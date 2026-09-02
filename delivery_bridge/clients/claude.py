@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import secrets
 import shutil
 import time
@@ -24,6 +25,7 @@ from .. import runtime
 from ..attachments_text import message_with_attachments
 from ..errors import BridgeFailure
 from ..timeutil import utc_now
+from ..token_usage import claude_turn_usage, has_usage
 
 # 会话正文的落盘位置按模块名取，测试改写运行时目录时这里跟着变。
 CLAUDE_TRANSCRIPTS_DIR = runtime.RUNTIME_DIR / "claude-transcripts"
@@ -36,6 +38,52 @@ CLAUDE_COMMAND_TOOLS = {"Bash", "BashOutput", "KillShell"}
 # Claude 用的是具名工具，命令行里没有对应的字面量，所以这里直接把语义标出来。
 CLAUDE_READ_TOOLS = {"Read", "NotebookRead"}
 CLAUDE_SEARCH_TOOLS = {"Grep", "Glob"}
+
+# `claude --help` 里出现过的长选项，问一次记住。省 token 的那几个开关都是较新版本才有的，
+# 而插件会装到各种机器上：直接传一个老 CLI 不认识的参数，它会当场退出，整条会话就废了。
+# 探测失败（问不到 help）时按「认得」处理，保持既有行为，不为一次探测失败退回高开销模式。
+CLAUDE_HELP_FLAGS: set[str] | None = None
+
+
+def supported_claude_flags(flags: list[str], command: str = "claude") -> list[str]:
+    """从想加的开关里挑出本机 CLI 认得的那些。"""
+    global CLAUDE_HELP_FLAGS
+    if CLAUDE_HELP_FLAGS is None:
+        try:
+            result = subprocess.run([command, "--help"], capture_output=True, text=True, timeout=30)
+            text = result.stdout or result.stderr or ""
+            CLAUDE_HELP_FLAGS = set(re.findall(r"--[A-Za-z0-9][A-Za-z0-9-]*", text)) if text.strip() else set()
+        except (OSError, subprocess.SubprocessError):
+            CLAUDE_HELP_FLAGS = set()
+    if not CLAUDE_HELP_FLAGS:
+        return list(flags)
+    return [flag for flag in flags if flag in CLAUDE_HELP_FLAGS]
+
+
+# 交付回合真正用得到的内置工具。CLI 默认会把 31 个工具的定义全塞进系统提示，
+# 而这份系统提示在一轮里的每一次模型请求上都要重发一遍——实测一轮 66 次请求，
+# 这一块就是 3.15 万 token × 66。
+#
+# 用 haiku 空跑「ok」实测的前置开销（同样带 --strict-mcp-config 和
+# --exclude-dynamic-system-prompt-sections）：
+#   全量 31 个                     31,526 token
+#   Bash Read Edit Write Skill     14,258 token   ← 现在用这套，省 55%
+#   上面 + Task（子代理）           17,281 token
+#   上面 + WebFetch/WebSearch       15,259 token
+#   完全无工具（轻量回合）            6,589 token
+#
+# 这五个是交付回合的下限：命令、读文件、改文件、建文件，外加 Skill——阶段技能和项目
+# 开发技能都靠它加载，去掉整条流程就散了。Task 和 Web* 按上表按需加回，代价写在那儿。
+# 注意 CLI 对不认识的工具名是静默忽略，不报错：改这份清单后要用
+# `--output-format stream-json` 的首条 system 事件核对实际生效的工具集。
+EXECUTION_TOOLS = ("Bash", "Read", "Edit", "Write", "Skill")
+
+
+# 内务回合（起标题）的系统提示词：这类回合不读代码、不调工具，也就不需要默认那一整套。
+LIGHTWEIGHT_SYSTEM_PROMPT = (
+    "你是一个只负责按要求输出一小段文本的助手。不要读取文件、不要执行命令、不要调用任何工具，"
+    "直接按用户给出的格式要求作答。"
+)
 
 class ClaudeTranscriptStore:
     """Persist Claude print-mode conversations so the board can reread them later.
@@ -131,14 +179,20 @@ def claude_tool_item(block: dict[str, Any]) -> dict[str, Any]:
 class ClaudeCLIClient:
     """Claude Code print-mode adapter exposing the lifecycle used by ExecutionBridge."""
 
+    # 类属性兜底：测试会绕过 __init__ 直接造实例，起名之外的所有会话都是非轻量的。
+    lightweight = False
+
     def __init__(
         self,
         workspace: Path,
         event_callback: Any = None,
         environment: dict[str, str] | None = None,
         transcripts: ClaudeTranscriptStore | None = None,
+        lightweight: bool = False,
     ):
         self.workspace = workspace
+        # 轻量会话用于起标题这类内务回合：不需要项目上下文，也不该为它付一份系统提示词。
+        self.lightweight = lightweight
         self.event_callback = event_callback
         self.environment = os.environ.copy()
         self.environment.update(environment or {})
@@ -155,7 +209,30 @@ class ClaudeCLIClient:
     def _start(self, prompt: str, model: str = "", resume: str = "", reasoning_effort: str = "", fast_mode: bool = False) -> tuple[str, str]:
         if shutil.which("claude") is None:
             raise BridgeFailure("未找到 Claude CLI")
-        command = ["claude", "-p", prompt, "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions"]
+        # --strict-mcp-config 且不给 --mcp-config，等于这条会话一个 MCP 都不加载。
+        # 任务执行只需要 CLI 自带的文件、命令和搜索工具；用户机器上全局配置的 MCP
+        # （playwright、pencil 之类）跟交付任务无关，但它们的工具清单会进系统提示，
+        # 会话里每一轮都要重发，还要为起不来的服务白等一次启动超时。
+        # --exclude-dynamic-system-prompt-sections 把 cwd、环境信息、记忆路径、git 状态
+        # 这些每次都不一样的段落从系统提示词挪到第一条用户消息里。系统提示词因此在多次
+        # 会话之间保持逐字一致，续聊时那段前缀能命中提示缓存，而不是每轮按新 token 重算。
+        savings = ["--strict-mcp-config", "--exclude-dynamic-system-prompt-sections"]
+        if self.lightweight:
+            # 起个标题而已，却要按完整会话付账：默认系统提示词、项目 CLAUDE.md、
+            # 全部技能与插件的清单都会进第一条请求。--safe-mode 把这些自定义一次性关掉
+            # （鉴权、模型选择和内置工具照常），--system-prompt 换成一句话的角色说明，
+            # --disable-slash-commands 连技能索引也不加载，会话本身也不必落盘。
+            savings.extend(["--safe-mode", "--disable-slash-commands", "--no-session-persistence"])
+        command = [
+            "claude", "-p", prompt, "--output-format", "stream-json", "--verbose",
+            "--dangerously-skip-permissions",
+            *supported_claude_flags(savings),
+        ]
+        if self.lightweight and supported_claude_flags(["--system-prompt"]):
+            command.extend(["--system-prompt", LIGHTWEIGHT_SYSTEM_PROMPT])
+        if supported_claude_flags(["--tools"]):
+            # 起标题的回合一个工具都不需要（空串就是「全部关掉」）；交付回合只留那五个。
+            command.extend(["--tools", *(("",) if self.lightweight else EXECUTION_TOOLS)])
         if model:
             command.extend(["--model", model])
         if reasoning_effort:
@@ -249,6 +326,10 @@ class ClaudeCLIClient:
             if event_type == "result":
                 final_text = str(event.get("result") or final_text)
                 result_failed = bool(event.get("is_error"))
+                # result 是这一轮唯一带合计用量的事件；面板的每轮消耗就从这里来。
+                usage = claude_turn_usage(event)
+                if has_usage(usage):
+                    turn["usage"] = usage
                 if not self.transcript_key:
                     self.thread_id = str(event.get("session_id") or self.thread_id)
         return_code = self.process.wait()

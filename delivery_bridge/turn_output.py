@@ -126,6 +126,41 @@ def testing_verdict_from_output(output: str) -> str:
     return match.group(1) if match else ""
 
 
+# 动作执行技能要求批量回合在最终回复里留一节「代码事实交接」。它是给同队列下游
+# 任务用的：上游刚刚在这份代码上确认过的路径、签名、字段口径，下游直接采信就不必
+# 在同一片代码上重新勘察一遍——勘察读进来的正文会在那一轮之后的每一次请求里重发，
+# 是动作执行阶段最贵的一块。
+CODE_FACTS_HEADING_RE = re.compile(r"(?m)^\s{0,3}#{1,6}\s*代码事实交接\s*$")
+NEXT_HEADING_RE = re.compile(r"(?m)^\s{0,3}#{1,6}\s+\S")
+# 一条任务交接下来的事实最多这么长；再多就不是「事实清单」而是把正文抄了一遍，
+# 那份内容会跟着后面每一条任务的每一次请求走，比它省下的勘察还贵。
+CODE_FACTS_LIMIT = 2 * 1024
+
+
+def code_facts_from_output(output: str, limit: int = CODE_FACTS_LIMIT) -> str:
+    """Pull the handoff section out of one finished queue task's final reply."""
+    final_text = final_agent_text_from_output(str(output or ""))
+    heading = CODE_FACTS_HEADING_RE.search(final_text)
+    if not heading:
+        return ""
+    body = final_text[heading.end():].lstrip("\n")
+    following = NEXT_HEADING_RE.search(body)
+    if following:
+        body = body[:following.start()]
+    body = body.strip()
+    if len(body) <= limit:
+        return body
+    # 超长时按行截断，不要从半句话里切开。
+    kept: list[str] = []
+    used = 0
+    for line in body.splitlines():
+        if used + len(line) + 1 > limit:
+            break
+        kept.append(line)
+        used += len(line) + 1
+    return "\n".join(kept).strip()
+
+
 BATCH_OUTCOME_RE = re.compile(r"(?m)^\s*批量判定\s*[:：]\s*(完成|可忽略|需人工处理)\s*$")
 BATCH_TURN_STATUS_RE = re.compile(r"(?m)^\s*-?\s*状态\s*[:：]\s*([A-Za-z]+)\s*$")
 # These markers are intentionally limited to evidence of a deliverable-level

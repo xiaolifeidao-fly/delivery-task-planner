@@ -16,7 +16,7 @@ from delivery_bridge.attachments_text import text_without_attachment_context
 from delivery_bridge.clients import factory
 from delivery_bridge.clients.claude import ClaudeCLIClient
 from delivery_bridge.clients.codex import AppServerClient
-from delivery_bridge.documents import document_set_entries
+from delivery_bridge.documents import document_set_entries, requirement_outline_path_of
 from delivery_bridge.errors import BridgeFailure
 from delivery_bridge.executor_env import codex_environment
 from delivery_bridge.item_keys import requirement_prototype_files
@@ -34,6 +34,12 @@ from delivery_bridge.turn_output import (
     merged_execution_output,
     testing_verdict_from_output,
 )
+
+
+# @ 引用只是本轮的补充上下文，不是需求正文：给开头这么多字够判断相关性了，
+# 真要全文就按同时给出的文档路径自己读。
+MENTION_DETAIL_LIMIT = 1500
+MENTION_TASK_DETAIL_LIMIT = 1200
 
 
 class TurnsMixin:
@@ -64,9 +70,17 @@ class TurnsMixin:
                 task_cache[key] = self._task_detail(config, program_id, key)
             return task_cache[key]
 
-        def readable_detail(value: Any, limit: int = 6000) -> str:
+        def readable_detail(value: Any, limit: int = MENTION_DETAIL_LIMIT, source: str = "") -> str:
+            """@ 引用的正文只给开头一段：足够判断相关性，需要全文就按给出的路径自己读。
+
+            @ 三四个需求，按原来 6000 字一份的口径就是两万多字的上下文，
+            而其中真正被用到的往往只有一两段——和历史需求引用「只给大纲路径」的做法对齐。
+            """
             text = str(value or "").strip()
-            return text if len(text) <= limit else f"{text[:limit]}…（已截断）"
+            if len(text) <= limit:
+                return text
+            pointer = f"，全文见 `{source}`" if source else "，需要完整正文时向用户索取或读对应文档"
+            return f"{text[:limit]}…（已截断{pointer}）"
 
         lines = ["用户在本轮消息中 @ 了以下关联对象。它们是本轮的补充上下文，按需参考，不能改写当前任务或需求的边界："]
         for reference in references:
@@ -103,28 +117,36 @@ class TurnsMixin:
                     f"（{item.get('phase') or '-'}/{item.get('status') or '-'}；需求文档：{document_path_of(item)}）"
                     for item in related_items[:30]
                 ]
+                outline_path = requirement_outline_path_of(key).as_posix()
                 lines.extend([
                     f"@需求 {key}: {requirement.get('name') or key}",
+                    f"需求大纲: {outline_path}（需要完整背景时读它，不存在说明这条需求还没沉淀大纲）",
                     "需求详情:",
-                    readable_detail(requirement.get("detail")) or "（未填写）",
+                    readable_detail(requirement.get("detail"), source=outline_path) or "（未填写）",
                     "该需求关联的任务:",
                     *(related_lines or ["- 暂无任务"]),
                 ])
                 continue
             task = task_of(key)
             requirement_key = str(task.get("requirementKey") or "").strip()
+            task_document = document_path_of(task)
             lines.extend([
                 f"@任务 {key}: {task.get('title') or key}",
-                f"任务说明: {readable_detail(task.get('description'), 4000) or '（未填写）'}",
+                f"任务说明: {readable_detail(task.get('description'), MENTION_TASK_DETAIL_LIMIT, task_document) or '（未填写）'}",
                 f"当前阶段: {task.get('phase') or 'requirement'}/{task.get('status') or 'todo'}",
-                f"需求文档: {document_path_of(task)}",
+                f"需求文档: {task_document}",
             ])
             if requirement_key:
                 requirement = requirement_of(requirement_key)
+                # 任务上的需求键来自看板数据，不像 @ 引用那样过过白名单；拼不出路径就不给路径。
+                try:
+                    outline_path = requirement_outline_path_of(requirement_key).as_posix()
+                except BridgeFailure:
+                    outline_path = ""
                 lines.extend([
                     f"所属需求 {requirement_key}: {requirement.get('name') or requirement_key}",
                     "所属需求详情:",
-                    readable_detail(requirement.get("detail")) or "（未填写）",
+                    readable_detail(requirement.get("detail"), source=outline_path) or "（未填写）",
                 ])
             elif key in items_by_key:
                 lines.append("所属需求: 未关联")

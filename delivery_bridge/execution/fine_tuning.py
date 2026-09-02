@@ -46,6 +46,7 @@ from delivery_bridge.sessions import (
 )
 from delivery_bridge.timeutil import utc_now
 from delivery_bridge.turn_output import SESSION_STATUS
+from delivery_bridge.token_usage import with_usage
 from delivery_bridge.turn_view import serialize_turns
 
 
@@ -144,7 +145,7 @@ class FineTuningMixin:
             entry["active"] = bool(active is not None and entry.get("threadId") == active.get("threadId"))
             if not entry["active"] and entry.get("status") == "running":
                 entry["status"] = "interrupted"
-        return {
+        return with_usage({
             "programId": program_id, "requirementKey": requirement_key, "threadId": selected_thread_id,
             "executorType": provider,
             "turns": serialize_turns(
@@ -155,7 +156,7 @@ class FineTuningMixin:
             "conversations": catalog,
             "active": bool(active is not None and active.get("threadId") == selected_thread_id),
             "activeTurnId": str((active or {}).get("turnId") or ""),
-        }
+        })
 
     def send_requirement_fine_tuning(self, raw: Any, config: dict[str, Any]) -> dict[str, Any]:
         (
@@ -190,6 +191,8 @@ class FineTuningMixin:
             client = factory.create_ai_client(
                 provider, self.workspace, lambda event: self._publish_app_server_event(identity, event),
                 codex_environment(config, program_id, write_allowed=True),
+                # 需求微调也是需求侧对话：推理摘要是用户要读的内容。
+                show_reasoning=True,
             )
             try:
                 thread_id, turn_id = client.start_task(
@@ -212,6 +215,7 @@ class FineTuningMixin:
             client = factory.create_ai_client(
                 provider, self.workspace, lambda event: self._publish_app_server_event(identity, event),
                 codex_environment(config, program_id, write_allowed=True),
+                show_reasoning=True,
             )
             try:
                 client.resume_thread(thread_id)
@@ -399,7 +403,7 @@ class FineTuningMixin:
             entry["active"] = bool(active_for_thread is not None and entry.get("threadId") == thread_id)
             if not entry["active"] and entry.get("status") == "running":
                 entry["status"] = "interrupted"
-        return {
+        return with_usage({
             "programId": program_id, "itemKey": item_key, "threadId": thread_id, "executorType": provider,
             "turns": serialize_turns(
                 thread.get("turns") or [],
@@ -408,7 +412,7 @@ class FineTuningMixin:
             ),
             "conversations": catalog, "active": active_for_thread is not None,
             "activeTurnId": str((active_for_thread or {}).get("turnId") or ""),
-        }
+        })
 
     def _resume_task_fine_tuning_turn(
         self,

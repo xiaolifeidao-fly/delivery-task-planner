@@ -80,4 +80,25 @@ CODEX_MODEL_CATALOG = [
 ]
 
 
+# 内务回合（起标题）用得起的最小模型：一行标题不值得用主会话那档模型跑。
+# Codex 侧留空表示沿用调用方选的模型——三个 5.6 档位之间没有公开的价格梯度，
+# 与其猜一个可能更贵或者不可用的标识，不如靠只读空目录 + 一次性线程 + 最低推理档位省。
+LIGHTWEIGHT_MODELS = {"claude": "haiku"}
+
+
+# 内务回合的推理档位。Codex 认 minimal；Claude CLI 的 --effort 只收 low 以上，
+# 传 minimal 会被命令行直接拒掉，所以两家分开给。
+LIGHTWEIGHT_REASONING_EFFORTS = {"codex": "minimal", "claude": "low"}
+
+
+def lightweight_model(provider: str, fallback: str = "") -> str:
+    """内务回合该用哪个模型；没有为这个执行器指定就沿用调用方传进来的那个。"""
+    return LIGHTWEIGHT_MODELS.get(ai_provider_of(provider), "") or fallback
+
+
+def lightweight_reasoning_effort(provider: str) -> str:
+    """内务回合的推理档位：起个标题不需要想，主会话选了多高都不跟。"""
+    return LIGHTWEIGHT_REASONING_EFFORTS.get(ai_provider_of(provider), "low")
+
+
 DEFAULT_BIZ_LINE = ""

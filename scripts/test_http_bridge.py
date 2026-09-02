@@ -30,6 +30,14 @@ SPEC.loader.exec_module(bridge)
 
 
 class HttpBridgeTest(unittest.TestCase):
+    def stub_claude_help(self, flags: set[str] | None = None) -> None:
+        """固定住 CLI 能力探测：用例不该去问本机真装了哪个版本的 claude。"""
+        from delivery_bridge.clients import claude as claude_client
+
+        patcher = patch.object(claude_client, "CLAUDE_HELP_FLAGS", flags if flags is not None else set())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def setUp(self) -> None:
         # THREAD_READERS 是模块级全局池，会把上一条用例建的只读执行器留给下一条。
         bridge.THREAD_READERS.shutdown()
@@ -380,6 +388,53 @@ class HttpBridgeTest(unittest.TestCase):
         self.assertNotIn("第一次", content)
         self.assertNotIn("初稿", content)
 
+    def test_planning_temp_summary_appends_rounds_without_losing_the_baseline(self):
+        """续聊的回复只是增量：整篇覆盖会把首轮那份完整预览冲掉。"""
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "temp.md"
+            bridge.write_planning_temp_summary(path, "审核", "req-a", "thread-1", "首轮", "完整预览")
+            bridge.write_planning_temp_summary(
+                path, "审核", "req-a", "thread-1", "再改一条", "只改第 3 条", incremental=True,
+            )
+            content = path.read_text(encoding="utf-8")
+            baseline, rounds = bridge.planning_temp_sections(path)
+
+        self.assertEqual("完整预览", baseline)
+        self.assertEqual(1, len(rounds))
+        self.assertIn("只改第 3 条", rounds[0])
+        self.assertIn("完整预览", content)
+        self.assertIn("再改一条", content)
+
+    def test_planning_temp_summary_keeps_only_the_latest_rounds(self):
+        """更早的增量早被后面的轮次覆盖了，留着只会把恢复上下文撑大。"""
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "temp.md"
+            bridge.write_planning_temp_summary(path, "审核", "req-a", "thread-1", "首轮", "完整预览")
+            for index in range(bridge.MAX_PLANNING_TEMP_ROUNDS + 3):
+                bridge.write_planning_temp_summary(
+                    path, "审核", "req-a", "thread-1", f"第 {index} 次", f"增量 {index}", incremental=True,
+                )
+            baseline, rounds = bridge.planning_temp_sections(path)
+            content = path.read_text(encoding="utf-8")
+
+        self.assertEqual("完整预览", baseline)
+        self.assertEqual(bridge.MAX_PLANNING_TEMP_ROUNDS, len(rounds))
+        self.assertNotIn("增量 0", content)
+        self.assertIn(f"增量 {bridge.MAX_PLANNING_TEMP_ROUNDS + 2}", content)
+
+    def test_planning_temp_summary_restarts_the_baseline_for_an_unreadable_draft(self):
+        """旧格式或被删过的摘要认不出基线：这一轮只能自己当基线，不能接着往后追加。"""
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "temp.md"
+            path.write_text("# 老格式的摘要\n", encoding="utf-8")
+            bridge.write_planning_temp_summary(
+                path, "审核", "req-a", "thread-1", "续聊", "本轮增量", incremental=True,
+            )
+            baseline, rounds = bridge.planning_temp_sections(path)
+
+        self.assertEqual("本轮增量", baseline)
+        self.assertEqual([], rounds)
+
     def test_planning_temp_summary_is_deleted_only_inside_the_managed_directory(self):
         with tempfile.TemporaryDirectory() as temporary, patch.object(bridge.runtime, "PLUGIN_ROOT", Path(temporary)):
             path = bridge.planning_temp_document_path("审核", "req-a", "thread-1")
@@ -488,6 +543,71 @@ class HttpBridgeTest(unittest.TestCase):
             len(follow_up),
             len(bridge.build_planning_prompt(1, context, "再加一条", "m1", "web", "", requirement)),
         )
+
+    def test_planning_follow_up_prompt_asks_for_an_increment_instead_of_a_reprint(self):
+        """整份预览重印一次，就是本轮的输出加上后面每一轮的重读，成本按轮次翻倍。"""
+        follow_up = bridge.build_planning_follow_up_prompt(
+            1, {"program": {}}, "第 3 条改一下", requirement={"requirementKey": "req-a"}, thread_id="thread-1",
+        )
+
+        self.assertIn("输出增量，不要重印整份预览", follow_up)
+        self.assertIn("其余 N 条不变", follow_up)
+        self.assertIn("首轮全量预览 + 后续各轮增量", follow_up)
+        self.assertIn("确认无误后点「确认并写入」", follow_up)
+        self.assertNotIn("输出格式沿用首轮", follow_up)
+
+    def test_planning_follow_up_prompt_only_lists_the_tasks_it_has_not_sent_yet(self):
+        context = {
+            "items": [
+                {"itemKey": "task-a", "title": "首轮就有的任务", "requirementKey": "req-a"},
+                {"itemKey": "task-b", "title": "这一轮才建的任务", "requirementKey": "req-a"},
+            ],
+        }
+        requirement = {"requirementKey": "req-a"}
+
+        first = bridge.build_planning_follow_up_prompt(1, context, "继续", requirement=requirement)
+        incremental = bridge.build_planning_follow_up_prompt(
+            1, context, "继续", requirement=requirement, known_item_keys=["task-a"],
+        )
+        nothing_new = bridge.build_planning_follow_up_prompt(
+            1, context, "继续", requirement=requirement, known_item_keys=["task-a", "task-b"],
+        )
+
+        self.assertIn("首轮就有的任务", first)
+        self.assertNotIn("首轮就有的任务", incremental)
+        self.assertIn("这一轮才建的任务", incremental)
+        self.assertIn("这里只补新增的部分", incremental)
+        self.assertIn("与此前轮次给出的那 2 条相同", nothing_new)
+        self.assertNotIn("这一轮才建的任务", nothing_new)
+
+    def test_requirement_item_keys_follow_the_prompt_order(self):
+        context = {
+            "items": [
+                {"itemKey": "task-a", "requirementKey": "req-a"},
+                {"itemKey": "task-z", "requirementKey": "req-z"},
+                {"itemKey": "task-b", "requirementKey": "req-a"},
+            ],
+        }
+
+        self.assertEqual(["task-a", "task-b"], bridge.requirement_item_keys(context, "req-a"))
+        self.assertEqual([], bridge.requirement_item_keys(context, ""))
+
+    def test_planning_prompt_bounds_the_workspace_survey(self):
+        """勘察是首轮最容易失控的一段：不封边界就会把整个模块通读一遍。"""
+        preview = bridge.build_planning_prompt(1, {"program": {}}, "拆一下", requirement={"requirementKey": "req-a"})
+
+        self.assertIn("勘察点到为止", preview)
+        self.assertIn("不要通读整个模块", preview)
+        self.assertIn("只贴关键几行并给出路径和行号", preview)
+
+    def test_planning_confirm_prompt_merges_the_incremental_preview(self):
+        confirmed = bridge.build_planning_prompt(
+            1, {"program": {}}, "确认并写入", requirement={"requirementKey": "req-a"},
+            write_allowed=True, thread_id="thread-1",
+        )
+
+        self.assertIn("首轮给完整方案，之后每轮只给增量", confirmed)
+        self.assertIn("不要凭最后一轮的增量反推整份方案", confirmed)
 
     def test_planning_follow_up_prompt_resends_the_detail_only_after_it_changes(self):
         requirement = {"requirementKey": "req-a", "detail": "改过的正文"}
@@ -649,7 +769,7 @@ class HttpBridgeTest(unittest.TestCase):
         self.assertIn("doc/test/task-a/", follow_up)
         self.assertIn("绝不调用接口、UI、脚本或构建命令执行真实测试", follow_up)
         self.assertIn("测试用例已生成", follow_up)
-        self.assertNotIn("本需求下其他任务已写好的需求文档", follow_up)
+        self.assertNotIn("前置任务的文档目录", follow_up)
 
     def test_requirement_fine_tuning_prompt_loads_workspace_skills_without_reopening_delivery_flow(self):
         requirement = {"requirementKey": "req-a", "name": "需求一", "detail": "已完成能力"}
@@ -1198,7 +1318,7 @@ class HttpBridgeTest(unittest.TestCase):
         environments = []
         planning_sessions = []
 
-        def make_client(provider, workspace, listener=None, environment=None):
+        def make_client(provider, workspace, listener=None, environment=None, **options):
             environments.append(environment or {})
             return client
 
@@ -1272,7 +1392,7 @@ class HttpBridgeTest(unittest.TestCase):
                 return {"gitEnabled": False}
             self.fail(f"unexpected request: {method} {path}")
 
-        def make_client(provider, workspace, listener=None, environment=None):
+        def make_client(provider, workspace, listener=None, environment=None, **options):
             providers.append(provider)
             return client
 
@@ -1311,7 +1431,7 @@ class HttpBridgeTest(unittest.TestCase):
                 return None
             self.fail(f"unexpected request: {method} {path}")
 
-        def make_client(provider, workspace, listener=None, environment=None):
+        def make_client(provider, workspace, listener=None, environment=None, **options):
             providers.append(provider)
             return client
 
@@ -1332,6 +1452,55 @@ class HttpBridgeTest(unittest.TestCase):
         client.resume_thread.assert_called_once_with("codex-thread")
         self.assertEqual({"codex"}, set(providers))
         self.assertEqual("codex", binds[-1]["executorType"])
+
+    def test_planning_follow_up_sends_only_the_tasks_the_thread_has_not_seen(self):
+        """已建任务清单是「不要重复建任务」的依据，但它逐轮重发就是每轮几十行的固定开销。"""
+        executor = bridge.ExecutionBridge(Path.cwd())
+        client = unittest.mock.MagicMock()
+        client.start_turn.return_value = "turn-2"
+        context = {
+            "program": {"programId": 2, "name": "项目 2"},
+            "items": [
+                {"itemKey": "task-a", "title": "首轮就有的任务", "requirementKey": "req-a"},
+                {"itemKey": "task-b", "title": "这一轮才建的任务", "requirementKey": "req-a"},
+            ],
+            "stages": [],
+            "modules": [],
+        }
+        binds = []
+        rows = [{
+            "threadId": "codex-thread", "title": "需求拆解 · A", "status": "completed",
+            "executorType": "codex", "updatedAt": "2026-08-01T00:00:00Z",
+            "metadata": {"sentItemKeys": ["task-a"]},
+        }]
+
+        def request_api(_config, method, path, query=None, body=None):
+            if method == "GET" and path == "/delivery/requirement/planning-sessions":
+                return list(rows)
+            if method == "POST" and path == "/delivery/requirement/planning-session/bind":
+                binds.append(body)
+                return None
+            self.fail(f"unexpected request: {method} {path}")
+
+        with (
+            patch.object(bridge.planner, "project_context", return_value=context),
+            patch.object(bridge.planner, "request_api", side_effect=request_api),
+            patch.object(bridge.factory, "create_ai_client", return_value=client),
+            patch.object(bridge.threading, "Thread"),
+        ):
+            executor.send_planning(
+                {
+                    "programId": 2, "message": "继续", "requirementKey": "req-a",
+                    "threadId": "codex-thread", "provider": "codex",
+                },
+                {"api_url": "http://test/api", "key": "k", "_project_id": 2},
+            )
+
+        prompt = client.start_turn.call_args.args[1]
+        self.assertNotIn("首轮就有的任务", prompt)
+        self.assertIn("这一轮才建的任务", prompt)
+        # 本轮列过的键并进会话记录，下一轮从这里继续算增量。
+        self.assertEqual(["task-a", "task-b"], binds[-1]["metadata"]["sentItemKeys"])
 
     def test_task_conversation_reads_a_chat_left_by_the_other_tool(self):
         executor = bridge.ExecutionBridge(Path.cwd())
@@ -1356,7 +1525,7 @@ class HttpBridgeTest(unittest.TestCase):
                 return {"gitEnabled": False}
             self.fail(f"unexpected request: {method} {path}")
 
-        def make_client(provider, workspace, listener=None, environment=None):
+        def make_client(provider, workspace, listener=None, environment=None, **options):
             providers.append(provider)
             return client
 
@@ -1593,6 +1762,7 @@ class HttpBridgeTest(unittest.TestCase):
         self.assertEqual(["opus", "sonnet"], [item["model"] for item in client.list_models()])
 
     def test_claude_cli_receives_model_effort_and_fast_mode(self):
+        self.stub_claude_help()
         client = bridge.ClaudeCLIClient(Path.cwd())
         process = unittest.mock.MagicMock()
         with patch.object(bridge.shutil, "which", return_value="/bin/claude"), patch.object(
@@ -1605,6 +1775,82 @@ class HttpBridgeTest(unittest.TestCase):
         self.assertEqual("high", command[command.index("--effort") + 1])
         self.assertIn("--fast", command)
         self.assertEqual("utf-8", popen.call_args.kwargs["encoding"])
+
+    def _claude_command(self, lightweight: bool = False, flags: set[str] | None = None) -> list[str]:
+        self.stub_claude_help(flags)
+        client = bridge.ClaudeCLIClient(Path.cwd(), lightweight=lightweight)
+        with patch.object(bridge.shutil, "which", return_value="/bin/claude"), patch.object(
+            bridge.subprocess, "Popen", return_value=unittest.mock.MagicMock(),
+        ) as popen, patch.object(bridge.threading, "Thread"):
+            client.start_task("Task", "Prompt")
+        return popen.call_args.args[0]
+
+    def test_delivery_sessions_only_load_the_tools_a_delivery_round_uses(self):
+        command = self._claude_command()
+
+        index = command.index("--tools")
+        self.assertEqual(
+            ["Bash", "Read", "Edit", "Write", "Skill"],
+            command[index + 1:index + 6],
+        )
+        # 变长参数后面必须还跟着别的开关，不然模型或会话号会被它吞掉。
+        self.assertTrue(command[index + 6].startswith("--"))
+
+    def test_naming_rounds_load_no_tools_at_all(self):
+        command = self._claude_command(lightweight=True)
+
+        self.assertEqual("", command[command.index("--tools") + 1])
+
+    def test_an_older_cli_without_the_tools_flag_keeps_the_full_tool_set(self):
+        command = self._claude_command(flags={"--strict-mcp-config"})
+
+        self.assertNotIn("--tools", command)
+
+    def test_the_bridge_process_owns_its_pid_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(bridge.runtime, "RUNTIME_DIR", Path(directory)):
+                bridge.pidfile.write_pid(4321)
+                self.assertEqual(4321, bridge.pidfile.read_pid())
+                self.assertEqual(
+                    "4321", (Path(directory) / "http-bridge.pid").read_text(encoding="utf-8").strip(),
+                )
+
+                bridge.pidfile.clear_pid(4321)
+                self.assertEqual(0, bridge.pidfile.read_pid())
+                self.assertFalse((Path(directory) / "http-bridge.pid").exists())
+
+    def test_clearing_never_removes_another_process_record(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(bridge.runtime, "RUNTIME_DIR", Path(directory)):
+                # 重启时新旧进程会短暂并存：退出的那个不能把接班进程的记录抹掉。
+                bridge.pidfile.write_pid(777)
+
+                bridge.pidfile.clear_pid(4321)
+
+                self.assertEqual(777, bridge.pidfile.read_pid())
+
+    def test_an_unreadable_pid_file_reads_as_no_bridge(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(bridge.runtime, "RUNTIME_DIR", Path(directory)):
+                (Path(directory) / "http-bridge.pid").write_text("不是数字", encoding="utf-8")
+
+                self.assertEqual(0, bridge.pidfile.read_pid())
+
+    def test_tracking_registers_the_real_pid_and_a_signal_cleanup(self):
+        signals: list[int] = []
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch.object(bridge.runtime, "RUNTIME_DIR", Path(directory)),
+                patch.object(bridge.pidfile.atexit, "register") as register,
+                patch.object(
+                    bridge.pidfile.signal, "signal", side_effect=lambda number, _handler: signals.append(number),
+                ),
+            ):
+                bridge.pidfile.track_current_process()
+
+            self.assertEqual(os.getpid(), bridge.pidfile.read_pid())
+        register.assert_called_once_with(bridge.pidfile.clear_pid)
+        self.assertIn(bridge.pidfile.signal.SIGTERM, signals)
 
     def test_codex_models_are_limited_to_the_product_catalog(self):
         executor = bridge.ExecutionBridge(Path.cwd())
@@ -1650,6 +1896,154 @@ class HttpBridgeTest(unittest.TestCase):
 
             self.assertEqual(runtime / "bin" / "codex.exe", Path(copied))
             self.assertEqual(b"desktop-codex", Path(copied).read_bytes())
+
+    def test_claude_sessions_load_no_mcp_server_at_all(self):
+        """执行会话只用 CLI 自带的工具：本机全局配置的 MCP 与交付任务无关，白占系统提示。"""
+        from delivery_bridge.clients import claude as claude_client
+        self.stub_claude_help()
+
+        with tempfile.TemporaryDirectory() as workspace:
+            store = bridge.ClaudeTranscriptStore(Path(workspace) / "transcripts")
+            client = bridge.ClaudeCLIClient(Path(workspace), transcripts=store)
+            with patch.object(claude_client.shutil, "which", return_value="/usr/local/bin/claude"):
+                with patch.object(claude_client.subprocess, "Popen") as popen:
+                    with patch.object(claude_client.threading, "Thread"):
+                        client._start("执行任务")
+
+        command = popen.call_args.args[0]
+        self.assertIn("--strict-mcp-config", command)
+        self.assertNotIn("--mcp-config", command)
+
+    def test_claude_sessions_keep_the_system_prompt_stable_for_the_prompt_cache(self):
+        """cwd、git 状态这些每轮都在变的段落留在系统提示里，等于每轮都要按新 token 重算。"""
+        from delivery_bridge.clients import claude as claude_client
+        self.stub_claude_help()
+
+        with tempfile.TemporaryDirectory() as workspace:
+            store = bridge.ClaudeTranscriptStore(Path(workspace) / "transcripts")
+            client = bridge.ClaudeCLIClient(Path(workspace), transcripts=store)
+            with patch.object(claude_client.shutil, "which", return_value="/usr/local/bin/claude"):
+                with patch.object(claude_client.subprocess, "Popen") as popen:
+                    with patch.object(claude_client.threading, "Thread"):
+                        client._start("执行任务")
+
+        self.assertIn("--exclude-dynamic-system-prompt-sections", popen.call_args.args[0])
+
+    def test_claude_saving_flags_are_filtered_by_the_local_cli(self):
+        """老版本 CLI 不认识这些新开关，直接传过去它会当场退出，整条会话就废了。"""
+        from delivery_bridge.clients import claude as claude_client
+
+        self.stub_claude_help({"--strict-mcp-config", "--model"})
+        self.assertEqual(
+            ["--strict-mcp-config"],
+            claude_client.supported_claude_flags(["--strict-mcp-config", "--safe-mode"]),
+        )
+
+    def test_claude_flags_survive_a_failed_capability_probe(self):
+        """问不到 help 时保持既有行为，不为一次探测失败退回高开销模式。"""
+        from delivery_bridge.clients import claude as claude_client
+
+        self.stub_claude_help(set())
+        self.assertEqual(
+            ["--strict-mcp-config", "--safe-mode"],
+            claude_client.supported_claude_flags(["--strict-mcp-config", "--safe-mode"]),
+        )
+
+    def test_claude_lightweight_sessions_drop_the_project_context(self):
+        """起标题这类内务回合不读项目：默认系统提示、CLAUDE.md 和技能清单都不该为它加载。"""
+        from delivery_bridge.clients import claude as claude_client
+        self.stub_claude_help()
+
+        with tempfile.TemporaryDirectory() as workspace:
+            store = bridge.ClaudeTranscriptStore(Path(workspace) / "transcripts")
+            client = bridge.ClaudeCLIClient(Path(workspace), transcripts=store, lightweight=True)
+            with patch.object(claude_client.shutil, "which", return_value="/usr/local/bin/claude"):
+                with patch.object(claude_client.subprocess, "Popen") as popen:
+                    with patch.object(claude_client.threading, "Thread"):
+                        client._start("起个标题")
+
+        command = popen.call_args.args[0]
+        self.assertIn("--safe-mode", command)
+        self.assertIn("--disable-slash-commands", command)
+        self.assertIn("--no-session-persistence", command)
+        self.assertEqual(
+            claude_client.LIGHTWEIGHT_SYSTEM_PROMPT,
+            command[command.index("--system-prompt") + 1],
+        )
+
+    def test_codex_lightweight_threads_are_ephemeral_and_read_only(self):
+        client = bridge.AppServerClient.__new__(bridge.AppServerClient)
+        client.workspace = Path("/tmp/delivery-lightweight")
+        client.lightweight = True
+        requests = []
+        client.send = lambda method, request_id, params: requests.append((method, request_id, params))
+        client.wait_response = unittest.mock.MagicMock(
+            side_effect=[{"thread": {"id": "thread-1"}}, {}, {"turn": {"id": "turn-1"}}]
+        )
+
+        client.start_task("聊天自动命名", "起个标题")
+
+        self.assertTrue(requests[0][2]["ephemeral"])
+        self.assertEqual("read-only", requests[0][2]["sandbox"])
+        self.assertEqual({"type": "readOnly"}, requests[2][2]["sandboxPolicy"])
+
+    def test_lightweight_naming_picks_the_cheapest_tier_per_executor(self):
+        """起一行标题不跟主会话的模型和推理档位；Codex 没有更便宜的档位就沿用原模型。"""
+        self.assertEqual("haiku", bridge.lightweight_model("claude", "opus"))
+        self.assertEqual("gpt-5.6-terra", bridge.lightweight_model("codex", "gpt-5.6-terra"))
+        self.assertEqual("low", bridge.lightweight_reasoning_effort("claude"))
+        self.assertEqual("minimal", bridge.lightweight_reasoning_effort("codex"))
+
+    def test_lightweight_workspace_is_an_empty_directory_outside_the_project(self):
+        workspace = bridge.factory.lightweight_workspace()
+
+        self.assertTrue(workspace.is_dir())
+        self.assertEqual([], list(workspace.iterdir()))
+
+    def test_codex_app_server_turns_off_every_configured_mcp_server(self):
+        with tempfile.TemporaryDirectory() as home:
+            (Path(home) / "config.toml").write_text(
+                '[mcp_servers.pencil]\ncommand = "pencil"\n\n'
+                '[mcp_servers.pencil.env]\nA = "1"\n\n'
+                '[mcp_servers."node-repl"]\ncommand = "node_repl"\n\n'
+                '[projects."/tmp/x"]\ntrust_level = "trusted"\n',
+                encoding="utf-8",
+            )
+
+            names = bridge.codex_cli.codex_mcp_server_names(Path(home))
+            overrides = bridge.codex_cli.codex_mcp_disable_overrides(Path(home))
+
+        # 同一个服务的 [x] 和 [x.env] 两节只算一次，projects 之类的其他表不能混进来。
+        self.assertEqual(["pencil", "node-repl"], names)
+        self.assertEqual(
+            ["-c", "mcp_servers.pencil.enabled=false", "-c", "mcp_servers.node-repl.enabled=false"],
+            overrides,
+        )
+
+    def test_codex_mcp_overrides_are_empty_without_a_config_file(self):
+        with tempfile.TemporaryDirectory() as home:
+            self.assertEqual([], bridge.codex_cli.codex_mcp_disable_overrides(Path(home)))
+
+    def test_requirement_document_catalog_lists_only_dependency_directories(self):
+        """前置任务给目录，非前置任务一条都不给：列出来模型就会挨个打开。"""
+        task = {"itemKey": "task-c", "requirementKey": "req-a", "moduleKey": "svc", "dependsOnItemKeys": ["task-a"]}
+        items = [
+            {"itemKey": "task-a", "title": "上游接口", "requirementKey": "req-a", "moduleKey": "svc", "status": "done"},
+            {"itemKey": "task-b", "title": "同需求但不是前置", "requirementKey": "req-a", "moduleKey": "svc"},
+            {"itemKey": "task-d", "title": "别的需求", "requirementKey": "req-b", "moduleKey": "svc"},
+        ]
+        with tempfile.TemporaryDirectory() as workspace:
+            for item_key in ("task-a", "task-b", "task-d"):
+                document = Path(workspace) / "doc" / "svc" / item_key / "文档.md"
+                document.parent.mkdir(parents=True, exist_ok=True)
+                document.write_text("需求", encoding="utf-8")
+
+            catalog = bridge.requirement_document_catalog(items, task, Path(workspace))
+
+        self.assertEqual(["- task-a: 上游接口（已完成） → `doc/svc/task-a/`"], catalog)
+        rendered = "\n".join(bridge.sibling_document_lines(catalog))
+        self.assertIn("前置任务的文档目录（只给目录，默认不要打开）", rendered)
+        self.assertNotIn("文档.md", rendered)
 
     def test_codex_cli_prefers_the_newest_build_on_this_machine(self):
         """PATH 上的旧 CLI 和桌面端捆绑的 MCP 服务对不上：实测 0.134.0 调 node_repl 会被
@@ -1895,7 +2289,8 @@ class HttpBridgeTest(unittest.TestCase):
         self.assertEqual("gpt-5.6-sol", requests[2][2]["model"])
         self.assertNotIn("effort", requests[0][2])
         self.assertEqual("high", requests[2][2]["effort"])
-        self.assertEqual("detailed", requests[2][2]["summary"])
+        # 不要推理摘要：面板不展示推理，摘要本身也是要付钱的输出 token。
+        self.assertEqual("none", requests[2][2]["summary"])
 
     def test_app_server_can_resume_start_steer_and_interrupt_a_thread(self):
         client = bridge.AppServerClient.__new__(bridge.AppServerClient)
@@ -1919,7 +2314,7 @@ class HttpBridgeTest(unittest.TestCase):
         self.assertEqual("turn-2", requests[3][2]["turnId"])
         self.assertEqual("dangerFullAccess", requests[1][2]["sandboxPolicy"]["type"])
         self.assertEqual("xhigh", requests[1][2]["effort"])
-        self.assertEqual("detailed", requests[1][2]["summary"])
+        self.assertEqual("none", requests[1][2]["summary"])
 
     def test_app_server_sends_images_as_local_image_inputs(self):
         client = bridge.AppServerClient.__new__(bridge.AppServerClient)
@@ -1994,6 +2389,300 @@ class HttpBridgeTest(unittest.TestCase):
         self.assertEqual(0, recorded[0]["items"][1]["exitCode"])
         # 命令输出面板不展示，不留在本地记录里。
         self.assertNotIn("aggregatedOutput", recorded[0]["items"][1])
+
+    def test_claude_consume_stores_the_turn_usage_on_the_turn(self):
+        events = [
+            {"type": "system", "subtype": "init", "session_id": "s-1"},
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "做完了"}]}},
+            {
+                "type": "result", "subtype": "success", "is_error": False, "result": "做完了",
+                "total_cost_usd": 0.21,
+                "usage": {"input_tokens": 100, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 900, "output_tokens": 50},
+            },
+        ]
+        with tempfile.TemporaryDirectory() as workspace:
+            store = bridge.ClaudeTranscriptStore(Path(workspace) / "transcripts")
+            client = bridge.ClaudeCLIClient(Path(workspace), transcripts=store)
+            client.transcript_key = "thread-1"
+            client.thread_id = "thread-1"
+            turn = {"id": "turn-1", "status": "running", "items": []}
+            client.turns = [turn]
+            client.process = unittest.mock.MagicMock()
+            client.process.stdout = [json.dumps(event) + "\n" for event in events]
+            client.process.wait.return_value = 0
+
+            client._consume(turn)
+
+        self.assertEqual(1000, turn["usage"]["inputTokens"])
+        self.assertEqual(900, turn["usage"]["cachedInputTokens"])
+        self.assertEqual(50, turn["usage"]["outputTokens"])
+        self.assertEqual(0.21, turn["usage"]["costUsd"])
+
+    def test_merged_journal_turns_keep_the_recorded_usage(self):
+        """`thread/read` 的回合里没有用量字段，合并时不能把记录里的那份丢掉。"""
+        usage = {"inputTokens": 10, "cachedInputTokens": 0, "outputTokens": 5, "reasoningOutputTokens": 0, "totalTokens": 15, "costUsd": None}
+        thread = {"turns": [{"id": "turn-1", "status": "completed", "items": [{"id": "a1", "type": "agentMessage", "text": "做完了"}]}]}
+
+        merged = bridge.merge_journal_turns(thread, [{"id": "turn-1", "status": "completed", "items": [], "usage": usage}])
+
+        self.assertEqual(usage, merged["turns"][0]["usage"])
+
+    def test_requirement_sessions_ask_for_reasoning_summaries_and_task_runs_do_not(self):
+        """需求对话读的是模型怎么想的，任务执行读的是命令和结论——摘要按会话类型开关。"""
+        created = []
+
+        class RecordingClient:
+            def __init__(self, workspace, event_callback=None, environment=None, lightweight=False, show_reasoning=False):
+                created.append(show_reasoning)
+
+        with patch.object(bridge.factory.codex, "AppServerClient", RecordingClient):
+            bridge.factory.create_ai_client("codex", Path("/tmp/x"), show_reasoning=True)
+            bridge.factory.create_ai_client("codex", Path("/tmp/x"))
+
+        self.assertEqual([True, False], created)
+
+        client = bridge.AppServerClient.__new__(bridge.AppServerClient)
+        client.workspace = Path("/tmp/delivery-workspace")
+        client.reasoning_summary = bridge.TURN_REASONING_SUMMARY_SHOWN
+        requests = []
+        client.send = lambda method, request_id, params: requests.append((method, request_id, params))
+        client.wait_response = unittest.mock.MagicMock(side_effect=[{"thread": {"id": "t-1"}}, {}, {"turn": {"id": "turn-1"}}])
+
+        client.start_task("需求拆解", "把这条需求拆成任务")
+
+        self.assertEqual("detailed", requests[2][2]["summary"])
+        # 没走 __init__ 的实例按类属性兜底，也就是任务执行那一档：不展示推理。
+        self.assertEqual("none", bridge.AppServerClient.__new__(bridge.AppServerClient).reasoning_summary)
+
+    def test_every_conversation_payload_carries_a_usage_total(self):
+        """需求侧和任务侧的会话返回结构各不相同，但都得带上这条会话的合计。"""
+        payload = bridge.with_usage({
+            "programId": 1,
+            "turns": [
+                {"id": "t1", "usage": {"inputTokens": 100, "cachedInputTokens": 0, "outputTokens": 20, "reasoningOutputTokens": 0, "totalTokens": 120, "costUsd": None}},
+                {"id": "t2", "usage": {"inputTokens": 300, "cachedInputTokens": 200, "outputTokens": 30, "reasoningOutputTokens": 0, "totalTokens": 330, "costUsd": None}},
+            ],
+        })
+
+        self.assertEqual(450, payload["usage"]["totalTokens"])
+        self.assertEqual(200, payload["usage"]["cachedInputTokens"])
+        # 没有回合的会话给一份零值，面板不必判断字段在不在。
+        self.assertEqual(0, bridge.with_usage({"turns": []})["usage"]["totalTokens"])
+
+    def test_requirement_usage_splits_conversations_and_tasks_by_executor(self):
+        """需求总账 = 需求侧会话 + 每条任务；线程归哪个执行器，按正文落在哪个缓存里认。"""
+        def usage(total):
+            return {"inputTokens": total, "cachedInputTokens": 0, "outputTokens": 0, "reasoningOutputTokens": 0, "totalTokens": total, "costUsd": None}
+
+        stored = {
+            # 需求拆解走 Codex，任务 a 的执行会话走 Claude，任务 a 还有一条早期的 Codex 会话。
+            "codex": {"thread-planning": usage(1000), "thread-a-old": usage(300), "thread-review": usage(70)},
+            "claude": {"thread-a": usage(500), "thread-testing": usage(90)},
+        }
+
+        def request_api(_config, method, path, query=None, body=None):
+            if path == "/delivery/requirement/planning-sessions":
+                return [{"threadId": "thread-planning"}]
+            if path == "/delivery/requirement/testing-sessions":
+                return [
+                    {"threadId": "thread-review", "metadata": {"kind": "requirement-review"}},
+                    {"threadId": "thread-testing"},
+                ]
+            if path == "/delivery/item/execution-session":
+                if query["itemKey"] == "task-a":
+                    return [{"externalSessionId": "thread-a", "metadata": {"conversations": [{"threadId": "thread-a-old"}]}}]
+                return []
+            self.fail(f"unexpected request: {method} {path}")
+
+        context = {
+            "program": {"programId": 1},
+            "items": [
+                {"itemKey": "task-a", "title": "接口", "requirementKey": "req-a", "phase": "development", "status": "done"},
+                {"itemKey": "task-b", "title": "还没跑过", "requirementKey": "req-a", "phase": "requirement", "status": "todo"},
+                {"itemKey": "task-x", "title": "别的需求", "requirementKey": "req-b"},
+            ],
+        }
+
+        def thread_usage(thread_id):
+            for provider, threads in stored.items():
+                if thread_id in threads:
+                    return provider, threads[thread_id]
+            return "", bridge.empty_usage()
+
+        with (
+            patch.object(bridge.planner, "request_api", side_effect=request_api),
+            patch.object(bridge.planner, "project_context", return_value=context),
+            patch.object(bridge.usage_index, "thread_usage", side_effect=thread_usage),
+        ):
+            executor = bridge.ExecutionBridge(Path.cwd())
+            result = executor.requirement_usage(1, "req-a", config={"_project_id": 1})
+
+        # 需求会话现在含两张表：拆解在拆解会话表，review 和需求测试在测试会话表。
+        self.assertEqual(1070, result["conversations"]["codex"]["totalTokens"])
+        self.assertEqual(90, result["conversations"]["claude"]["totalTokens"])
+        tasks = {task["itemKey"]: task for task in result["tasks"]}
+        # 别的需求的任务不算进来。
+        self.assertEqual(["task-a", "task-b"], sorted(tasks))
+        self.assertEqual(300, tasks["task-a"]["usage"]["codex"]["totalTokens"])
+        self.assertEqual(500, tasks["task-a"]["usage"]["claude"]["totalTokens"])
+        self.assertEqual(800, tasks["task-a"]["usage"]["total"]["totalTokens"])
+        # 没跑过的任务给零值，面板照样能画两行。
+        self.assertEqual(0, tasks["task-b"]["usage"]["total"]["totalTokens"])
+        self.assertEqual(1370, result["usage"]["codex"]["totalTokens"])
+        self.assertEqual(590, result["usage"]["claude"]["totalTokens"])
+        self.assertEqual(1960, result["usage"]["total"]["totalTokens"])
+
+    def test_requirement_usage_splits_requirement_sessions_by_block(self):
+        """拆解、原型、review、需求测试、微调各算各的；没跑过的块也留一行零值。"""
+        def usage(total):
+            return {"inputTokens": total, "cachedInputTokens": 0, "outputTokens": 0, "reasoningOutputTokens": 0, "totalTokens": total, "costUsd": None}
+
+        stored = {
+            "thread-planning": usage(1000),
+            "thread-prototype": usage(200),
+            "thread-review": usage(70),
+            "thread-testing": usage(90),
+            "thread-fine-tuning": usage(40),
+            "thread-legacy-testing": usage(5),
+        }
+
+        def request_api(_config, method, path, query=None, body=None):
+            if path == "/delivery/requirement/planning-sessions":
+                return [
+                    {"threadId": "thread-planning", "executorType": "codex"},
+                    # 原型会话跟拆解共用一张表，只有执行器类型的用途后缀能认出来。
+                    {"threadId": "thread-prototype", "executorType": "claude-prototype"},
+                ]
+            if path == "/delivery/requirement/testing-sessions":
+                return [
+                    {"threadId": "thread-review", "metadata": {"kind": "requirement-review"}},
+                    {"threadId": "thread-testing", "metadata": {"kind": "requirement-testing"}},
+                    {"threadId": "thread-fine-tuning", "metadata": {"kind": "requirement-fine-tuning"}},
+                    # 老数据没写 kind，按需求测试算。
+                    {"threadId": "thread-legacy-testing"},
+                ]
+            if path == "/delivery/item/execution-session":
+                return []
+            self.fail(f"unexpected request: {method} {path}")
+
+        context = {"program": {"programId": 1}, "items": []}
+
+        with (
+            patch.object(bridge.planner, "request_api", side_effect=request_api),
+            patch.object(bridge.planner, "project_context", return_value=context),
+            patch.object(bridge.usage_index, "thread_usage", side_effect=lambda thread_id: ("codex", stored[thread_id]) if thread_id in stored else ("", bridge.empty_usage())),
+        ):
+            executor = bridge.ExecutionBridge(Path.cwd())
+            result = executor.requirement_usage(1, "req-a", config={"_project_id": 1})
+
+        groups = {group["key"]: group for group in result["conversationGroups"]}
+        self.assertEqual(
+            ["planning", "prototype", "review", "testing", "fineTuning"],
+            [group["key"] for group in result["conversationGroups"]],
+        )
+        self.assertEqual(1000, groups["planning"]["usage"]["total"]["totalTokens"])
+        self.assertEqual(200, groups["prototype"]["usage"]["total"]["totalTokens"])
+        self.assertEqual(70, groups["review"]["usage"]["total"]["totalTokens"])
+        self.assertEqual(95, groups["testing"]["usage"]["total"]["totalTokens"])
+        self.assertEqual(2, groups["testing"]["threads"])
+        self.assertEqual(40, groups["fineTuning"]["usage"]["total"]["totalTokens"])
+        # 各块之和就是需求会话合计，别让面板上下两个数对不上。
+        self.assertEqual(1405, result["conversations"]["total"]["totalTokens"])
+
+    def test_thread_usage_reads_whichever_executor_cache_holds_the_thread(self):
+        """会话表里的 executorType 可能过时；正文在哪个缓存里，就算哪个执行器的。"""
+        usage = {"inputTokens": 40, "cachedInputTokens": 0, "outputTokens": 10, "reasoningOutputTokens": 0, "totalTokens": 50, "costUsd": None}
+        with tempfile.TemporaryDirectory() as directory:
+            journal = bridge.ThreadItemJournal(Path(directory) / "codex")
+            transcripts = bridge.ClaudeTranscriptStore(Path(directory) / "claude")
+            journal._write("thread-codex", [{"id": "t1", "items": [], "usage": usage}])
+            transcripts.write("thread-claude", [{"id": "t1", "items": [], "usage": usage}])
+
+            with (
+                patch.object(bridge.usage_index, "THREAD_ITEMS", journal),
+                patch.object(bridge.usage_index, "CLAUDE_TRANSCRIPTS", transcripts),
+            ):
+                self.assertEqual("codex", bridge.usage_index.thread_usage("thread-codex")[0])
+                self.assertEqual("claude", bridge.usage_index.thread_usage("thread-claude")[0])
+                self.assertEqual(("", bridge.empty_usage()), bridge.usage_index.thread_usage("thread-missing"))
+
+    def test_thread_item_journal_records_the_turn_token_usage(self):
+        """回合用量只能拿线程累计去减：`last` 是最近一次模型请求，一个回合里请求好多次。"""
+        with tempfile.TemporaryDirectory() as directory:
+            journal = bridge.ThreadItemJournal(Path(directory))
+            journal.record({"method": "turn/started", "params": {"threadId": "t-u", "turn": {"id": "turn-1"}}})
+            # 本轮开始前线程已经累计了 1000/100；两次通知分别是本轮第一次和第二次请求。
+            for total_input, total_output, last_input, last_output in ((1600, 140, 600, 40), (2300, 190, 700, 50)):
+                journal.record({
+                    "method": "thread/tokenUsage/updated",
+                    "params": {
+                        "threadId": "t-u", "turnId": "turn-1",
+                        "tokenUsage": {
+                            "total": {
+                                "inputTokens": total_input, "cachedInputTokens": 0, "outputTokens": total_output,
+                                "reasoningOutputTokens": 0, "totalTokens": total_input + total_output,
+                            },
+                            "last": {
+                                "inputTokens": last_input, "cachedInputTokens": 0, "outputTokens": last_output,
+                                "reasoningOutputTokens": 0, "totalTokens": last_input + last_output,
+                            },
+                        },
+                    },
+                })
+            usage = journal.read("t-u")[0]["usage"]
+
+        # 1000/100 是本轮之前的累计，两次请求之后本轮自己烧了 1300 输入 / 90 输出。
+        self.assertEqual(1300, usage["inputTokens"])
+        self.assertEqual(90, usage["outputTokens"])
+        self.assertEqual(1390, usage["totalTokens"])
+
+    def test_claude_result_event_carries_the_turn_token_usage(self):
+        event = {
+            "type": "result", "subtype": "success", "result": "做完了", "total_cost_usd": 0.42,
+            "usage": {
+                "input_tokens": 300, "cache_creation_input_tokens": 1200, "cache_read_input_tokens": 9000,
+                "output_tokens": 800, "output_tokens_details": {"thinking_tokens": 120},
+            },
+        }
+
+        usage = bridge.claude_turn_usage(event)
+
+        # Claude 把新输入、写缓存、读缓存分三段报，面板要的是「这轮送进去多少」。
+        self.assertEqual(10500, usage["inputTokens"])
+        self.assertEqual(9000, usage["cachedInputTokens"])
+        self.assertEqual(800, usage["outputTokens"])
+        self.assertEqual(120, usage["reasoningOutputTokens"])
+        self.assertEqual(11300, usage["totalTokens"])
+        self.assertEqual(0.42, usage["costUsd"])
+
+    def test_serialized_turns_carry_usage_only_when_the_executor_reported_it(self):
+        turns = bridge.serialize_turns([
+            {
+                "id": "turn-1", "status": "completed",
+                "items": [{"id": "a1", "type": "agentMessage", "text": "做完了"}],
+                "usage": {"inputTokens": 10, "cachedInputTokens": 0, "outputTokens": 5, "reasoningOutputTokens": 0, "totalTokens": 15, "costUsd": None},
+            },
+            {"id": "turn-2", "status": "completed", "items": [{"id": "a2", "type": "agentMessage", "text": "再来一轮"}]},
+        ])
+
+        self.assertEqual(15, turns[0]["usage"]["totalTokens"])
+        # 老会话读不出用量，就别给字段，面板据此不显示这一行。
+        self.assertNotIn("usage", turns[1])
+        total = bridge.turns_usage_total(turns)
+        self.assertEqual(15, total["totalTokens"])
+
+    def test_turn_usage_totals_add_up_across_turns_and_keep_cost_optional(self):
+        total = bridge.merge_usage([
+            {"inputTokens": 100, "cachedInputTokens": 40, "outputTokens": 20, "reasoningOutputTokens": 5, "totalTokens": 120, "costUsd": 0.1},
+            {"inputTokens": 200, "cachedInputTokens": 60, "outputTokens": 30, "reasoningOutputTokens": 0, "totalTokens": 230, "costUsd": None},
+        ])
+
+        self.assertEqual(300, total["inputTokens"])
+        self.assertEqual(100, total["cachedInputTokens"])
+        self.assertEqual(350, total["totalTokens"])
+        # Codex 不报钱：能算的那部分照样给出来，不因为缺一半就整个丢掉。
+        self.assertEqual(0.1, total["costUsd"])
+        self.assertIsNone(bridge.merge_usage([])["costUsd"])
 
     def test_thread_item_journal_never_stores_raw_reasoning(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2737,6 +3426,32 @@ class HttpBridgeTest(unittest.TestCase):
         self.assertIn("@任务 task-a: 关联任务", rendered)
         self.assertIn("所属需求 req-a: 关联需求", rendered)
 
+    def test_conversation_mention_context_truncates_long_details_and_gives_the_path(self):
+        """@ 三四个需求就是几万字上下文，其中真正被用到的往往只有一两段。"""
+        executor = bridge.ExecutionBridge(Path.cwd())
+        requirement = {"requirementKey": "req-a", "name": "关联需求", "detail": "需" * 9000}
+        task = {
+            "itemKey": "task-a", "title": "关联任务", "description": "说" * 9000,
+            "requirementKey": "", "moduleKey": "web",
+        }
+        with (
+            patch.object(bridge.planner, "requirement_record", return_value=requirement),
+            patch.object(executor, "_task_detail", return_value=task),
+        ):
+            lines = executor._conversation_mention_context(
+                {"api_url": "http://test/api", "key": "k"},
+                1,
+                [{"kind": "requirement", "key": "req-a"}, {"kind": "task", "key": "task-a"}],
+                {"items": []},
+            )
+
+        rendered = "\n".join(lines)
+        self.assertIn("需求大纲: doc/requirements/req-a/需求大纲.md", rendered)
+        self.assertIn("全文见 `doc/requirements/req-a/需求大纲.md`", rendered)
+        self.assertIn("全文见 `doc/web/task-a/文档.md`", rendered)
+        self.assertLess(rendered.count("需"), 3000)
+        self.assertLess(rendered.count("说"), 3000)
+
     def test_conversation_naming_runs_at_the_start_of_a_new_chat(self):
         # 名称留空的需求，开聊时就把标题定下来：会话目录和需求名称都不用等整轮拆解跑完。
         # 先落首条消息的前十个字占位，AI 起好名再把占位名换掉。
@@ -3403,6 +4118,37 @@ class HttpBridgeTest(unittest.TestCase):
             received,
         )
 
+    def test_run_sequence_hands_upstream_code_facts_to_the_next_task(self):
+        statuses = {"a": "todo", "b": "todo"}
+        outputs = {
+            "a": "## 进度说明\n\n改完了。\n\n## 代码事实交接\n\n- server/x.go:41 ListItems(ctx, q)\n",
+            "b": "",
+        }
+        received: list[tuple[str, str]] = []
+        executor = bridge.ExecutionBridge(Path.cwd())
+
+        def task_detail(_config, _program_id, item_key):
+            return {
+                "itemKey": item_key, "title": item_key, "version": 1,
+                "status": statuses[item_key], "actionOutput": outputs[item_key],
+            }
+
+        def execute(payload, config=None):
+            item_key = payload["task"]["itemKey"]
+            received.append((item_key, str(payload.get("upstreamCodeFacts") or "")))
+            statuses[item_key] = "done"
+            return {"accepted": True}
+
+        with (
+            patch.object(executor, "_task_detail", side_effect=task_detail),
+            patch.object(executor, "execute", side_effect=execute),
+        ):
+            executor._run_sequence("sequence-1", self.runtime_config(), 1, ["a", "b"], "", "codex")
+
+        self.assertEqual("", received[0][1])
+        self.assertIn("【a】", received[1][1])
+        self.assertIn("server/x.go:41", received[1][1])
+
     def test_execute_sequence_accepts_selected_blocked_task(self):
         context = {"items": [{"itemKey": "a", "status": "blocked", "dependsOnItemKeys": []}]}
         executor = bridge.ExecutionBridge(Path.cwd())
@@ -3586,19 +4332,86 @@ class HttpBridgeTest(unittest.TestCase):
         self.assertIn("动作执行阶段的兜底需求输入", prompt)
         self.assertIn("300-1500 字", prompt)
 
+    def test_task_prompt_asks_batch_items_to_hand_over_code_facts(self):
+        prompt = bridge.build_task_prompt(
+            {
+                "programId": 1,
+                "task": {"itemKey": "a", "title": "Build API", "moduleKey": "svc", "phase": "development"},
+                "batchMode": True,
+            }
+        )
+
+        self.assertIn("## 代码事实交接", prompt)
+        self.assertNotIn(
+            "## 代码事实交接",
+            bridge.build_task_prompt(
+                {
+                    "programId": 1,
+                    "task": {"itemKey": "a", "title": "Build API", "moduleKey": "svc", "phase": "development"},
+                }
+            ),
+        )
+
+    def test_task_prompt_carries_upstream_code_facts_when_the_queue_collected_them(self):
+        prompt = bridge.build_task_prompt(
+            {
+                "programId": 1,
+                "task": {"itemKey": "b", "title": "Build UI", "moduleKey": "svc", "phase": "development"},
+                "upstreamCodeFacts": "【a】\n- server/x.go:41 ListItems(ctx, q) ([]Item, error)",
+            }
+        )
+
+        self.assertIn("同队列上游任务已确认的代码事实", prompt)
+        self.assertIn("server/x.go:41", prompt)
+        self.assertNotIn(
+            "同队列上游任务已确认的代码事实",
+            bridge.build_task_prompt(
+                {"programId": 1, "task": {"itemKey": "b", "title": "Build UI", "moduleKey": "svc"}}
+            ),
+        )
+
+    def test_code_facts_are_read_from_the_handoff_section_only(self):
+        output = (
+            "## 进度说明\n\n"
+            "改了什么：见下。\n\n"
+            "## 代码事实交接\n\n"
+            "- server/x.go:41 ListItems(ctx, q) ([]Item, error)\n"
+            "- 表 zt_task_item 主键 id\n\n"
+            "## 遗留与风险\n\n"
+            "- 无\n"
+        )
+
+        facts = bridge.code_facts_from_output(output)
+
+        self.assertIn("ListItems(ctx, q)", facts)
+        self.assertIn("zt_task_item", facts)
+        self.assertNotIn("遗留与风险", facts)
+        self.assertNotIn("改了什么", facts)
+        self.assertEqual("", bridge.code_facts_from_output("## 进度说明\n\n没有交接节。"))
+
+    def test_code_facts_are_capped_so_a_pasted_file_cannot_ride_the_whole_queue(self):
+        body = "\n".join(f"- 第 {index} 条事实" for index in range(400))
+
+        facts = bridge.code_facts_from_output(f"## 代码事实交接\n\n{body}", limit=200)
+
+        self.assertLessEqual(len(facts), 200)
+        self.assertTrue(facts.startswith("- 第 0 条事实"))
+        self.assertNotIn("第 399 条事实", facts)
+
     def test_task_prompt_forbids_writing_only_the_appended_requirement(self):
         prompt = bridge.build_task_prompt(
             {"programId": 1, "task": {"itemKey": "a", "title": "Build API", "moduleKey": "svc"}}
         )
 
         self.assertIn("doc/svc/a/文档.md` 是跨回合累积的文档", prompt)
-        self.assertIn("整篇写回同一路径", prompt)
+        self.assertIn("按章节定点编辑", prompt)
+        self.assertIn("不要把整篇重写一遍", prompt)
 
     def test_conversation_prompt_carries_the_document_revision_rule(self):
         prompt = bridge.build_conversation_prompt(1, {"itemKey": "a", "moduleKey": "svc", "title": "Build API"}, "再加一条需求")
 
         self.assertIn("跨回合累积的文档", prompt)
-        self.assertIn("禁止只把本轮追加的需求写进文件", prompt)
+        self.assertIn("更不要用只含本轮增量的内容覆盖整份文件", prompt)
 
     def test_follow_up_context_repeats_the_phase_document_and_merge_rule(self):
         lines = bridge.follow_up_context_lines({"itemKey": "a", "moduleKey": "svc", "phase": "development"})
@@ -3606,7 +4419,7 @@ class HttpBridgeTest(unittest.TestCase):
 
         self.assertIn("doc/svc/a/文档.md", context)
         self.assertIn(bridge.PHASE_SKILLS["development"], context)
-        self.assertIn("整篇写回同一路径", context)
+        self.assertIn("按章节定点编辑", context)
 
     def test_follow_up_context_omits_the_document_path_when_the_board_did_not_give_one(self):
         context = "\n".join(bridge.follow_up_context_lines({"itemKey": "a"}))
@@ -3620,8 +4433,8 @@ class HttpBridgeTest(unittest.TestCase):
             requirement={"requirementKey": "req-a"}, write_allowed=True, thread_id="thread-1",
         )
 
-        self.assertIn("读全文 → 合并本轮增量 → 整篇覆盖", prompt)
-        self.assertIn("禁止只把本轮追加的那段需求写进文件", prompt)
+        self.assertIn("按章节定点编辑", prompt)
+        self.assertIn("禁止只把本轮追加的那段需求写进文件覆盖全篇", prompt)
 
     def test_testing_prompt_uses_task_scoped_test_artifact_directory(self):
         prompt = bridge.build_task_prompt(

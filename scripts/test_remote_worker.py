@@ -193,6 +193,88 @@ class RemoteWorkerTest(unittest.TestCase):
         self.assertTrue(result["accepted"])
         self.assertEqual("thread-1", result["threadId"])
 
+    def test_business_conversation_runs_in_the_business_workspace_not_the_project_one(self):
+        business = MagicMock()
+        business.send_business_conversation.return_value = {
+            "accepted": True, "threadId": "thread-b", "turnId": "turn-b", "active": True,
+        }
+        business.business_conversation.side_effect = [
+            {"threadId": "thread-b", "active": True, "turns": [{"id": "turn-b", "status": "running", "items": []}]},
+            {"threadId": "thread-b", "active": False, "turns": [
+                {"id": "turn-old", "status": "completed", "items": [{"type": "agentMessage", "text": "旧的一轮"}]},
+                {"id": "turn-b", "status": "completed", "items": [{"type": "agentMessage", "text": "已整理好文档"}]},
+            ]},
+        ]
+        root = MagicMock()
+        root.for_business_workspace.return_value = business
+        reporter = MagicMock()
+        reporter.cancelled.is_set.return_value = False
+        worker = remote_worker.RemoteCommandWorker(root, api_url="https://app.example.test", worker_id="worker-test")
+
+        result = worker._dispatch_business(
+            {
+                "programId": 16, "itemKey": "business-requirement-42", "message": "想做直播",
+                "workspace": "alice/业务空间/业务项目", "businessIntake": True, "provider": "codex",
+            },
+            16,
+            reporter,
+        )
+
+        root.for_business_workspace.assert_called_once_with("alice/业务空间/业务项目")
+        root.for_workspace.assert_not_called()
+        payload = business.send_business_conversation.call_args.args[0]
+        self.assertNotIn("workspace", payload)
+        # 线程标识必须在第一次快照之前就回传，服务端的 Start 正阻塞等它。
+        first_report = reporter.report.call_args_list[0]
+        self.assertEqual("thread-b", first_report.args[2]["threadId"])
+        self.assertEqual("thread-b", result["threadId"])
+        # 只回传当前这一轮：历史轮次会把 64 KB 的活动上限撑爆。
+        self.assertEqual(["turn-b"], [turn["id"] for turn in result["conversation"]["turns"]])
+        self.assertFalse(result["conversation"]["active"])
+
+    def test_business_conversation_materialises_server_attachments_locally(self):
+        business = MagicMock()
+        business.save_business_attachments.return_value = {"attachments": [{"id": "local-business-id"}]}
+        business.send_business_conversation.return_value = {
+            "accepted": True, "threadId": "thread-b", "turnId": "turn-b", "active": True,
+        }
+        business.business_conversation.return_value = {"threadId": "thread-b", "active": False, "turns": []}
+        root = MagicMock()
+        root.for_business_workspace.return_value = business
+        reporter = MagicMock()
+        reporter.cancelled.is_set.return_value = False
+        reporter.biz_line = "whatsapp"
+        reporter.config = {"key": "token", "key_header": "token"}
+        reporter.api.download_attachment.return_value = {
+            "name": "投放.png", "contentType": "image/png", "data": b"binary",
+        }
+        worker = remote_worker.RemoteCommandWorker(root, api_url="https://app.example.test", worker_id="worker-test")
+
+        worker._dispatch_business(
+            {
+                "programId": 16, "itemKey": "business-requirement-42", "message": "想做直播",
+                "workspace": "alice/业务空间/业务项目",
+                "attachmentIds": ["attachment-0123456789abcdef0123456789abcdef"],
+            },
+            16,
+            reporter,
+        )
+
+        reporter.api.download_attachment.assert_called_once_with(
+            reporter.config, "whatsapp", 16, "attachment-0123456789abcdef0123456789abcdef",
+        )
+        payload = business.send_business_conversation.call_args.args[0]
+        self.assertEqual(["local-business-id"], payload["attachmentIds"])
+
+    def test_business_progress_relay_does_not_overwrite_the_conversation_snapshot(self):
+        worker = remote_worker.RemoteCommandWorker(MagicMock(), api_url="https://app.example.test", worker_id="worker-test")
+        reporter = MagicMock()
+        reporter.command = {"commandType": "business.conversation", "programId": 16, "input": {}}
+
+        worker._relay_progress(reporter, {"workspace": Path("/workspace"), "bizLine": "whatsapp"})
+
+        reporter.report.assert_not_called()
+
     def test_task_session_reads_the_local_session_only_after_server_lease(self):
         bridge = MagicMock()
         bridge.conversation.return_value = {"threadId": "thread-1", "turns": [{"text": "done"}]}
@@ -217,7 +299,9 @@ class RemoteWorkerTest(unittest.TestCase):
         bridge.planning.return_value = {"threadId": "thread-1", "result": {"items": []}}
         worker = remote_worker.RemoteCommandWorker(object(), api_url="https://app.example.test", worker_id="worker-test")
 
-        with patch.object(worker, "_wait_for_planning") as wait:
+        with patch.object(worker, "_wait_for_planning") as wait, patch.object(
+            remote_worker.planner, "request_api", return_value={"requirementKey": "req-a", "name": "需求 A", "detail": "正文"}
+        ) as request_api:
             result = worker._dispatch_task(
                 "task.planning",
                 {"programId": 16, "requirementKey": "req-a", "message": "拆解"},
@@ -228,8 +312,33 @@ class RemoteWorkerTest(unittest.TestCase):
             )
 
         self.assertIn("task.planning", remote_worker.COMMAND_CAPABILITIES)
+        request_api.assert_called_once()
+        # 移动端只传需求键，需求正文由 Worker 从任务面板补齐后再进入拆解会话。
+        self.assertEqual("需求 A", bridge.send_planning.call_args.args[0]["requirementName"])
         wait.assert_called_once_with(bridge, 16, "req-a", unittest.mock.ANY)
         self.assertEqual("thread-1", result["planning"]["threadId"])
+
+    def test_planning_session_command_reads_the_local_snapshot_without_sending(self):
+        bridge = MagicMock()
+        bridge.planning.return_value = {"threadId": "thread-1", "turns": []}
+        worker = remote_worker.RemoteCommandWorker(object(), api_url="https://app.example.test", worker_id="worker-test")
+
+        result = worker._dispatch_task(
+            "task.planning-session",
+            {"programId": 16, "requirementKey": "req-a", "threadId": "thread-1"},
+            bridge,
+            {"_project_id": 16, "_biz_line": "whatsapp"},
+            16,
+            MagicMock(),
+        )
+
+        bridge.send_planning.assert_not_called()
+        bridge.planning.assert_called_once_with(
+            16, selected_thread_id="thread-1", config={"_project_id": 16, "_biz_line": "whatsapp"},
+            requirement_key="req-a", provider="codex",
+        )
+        self.assertEqual("thread-1", result["threadId"])
+        self.assertLessEqual(remote_worker.READ_ONLY_COMMAND_CAPABILITIES, remote_worker.COMMAND_CAPABILITIES)
 
 
 if __name__ == "__main__":

@@ -43,6 +43,7 @@ from delivery_bridge.turn_output import (
     final_agent_text_from_output,
     testing_verdict_from_output,
 )
+from delivery_bridge.token_usage import with_usage
 from delivery_bridge.turn_view import serialize_turns
 
 
@@ -197,7 +198,7 @@ class RequirementTestingMixin:
             entry["active"] = bool(active is not None and entry.get("threadId") == active.get("threadId"))
             if not entry["active"] and entry.get("status") == "running":
                 entry["status"] = "interrupted"
-        return {
+        return with_usage({
             "programId": program_id, "requirementKey": requirement_key, "threadId": selected_thread_id,
             "executorType": provider,
             "turns": serialize_turns(
@@ -212,7 +213,7 @@ class RequirementTestingMixin:
             "testingReportPath": requirement.get("testingReportPath") or "",
             "testingCasesStatus": requirement.get("testingCasesStatus") or "todo", "testingCases": requirement.get("testingCases") or "",
             "testingCasesPath": requirement.get("testingCasesPath") or "",
-        }
+        })
 
     def send_requirement_testing(self, raw: Any, config: dict[str, Any]) -> dict[str, Any]:
         provider = ai_provider_of(raw)

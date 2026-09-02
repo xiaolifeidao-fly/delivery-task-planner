@@ -71,12 +71,19 @@ def document_exists(workspace: Path | None, relative: str) -> bool:
 
 
 def document_revision_rule(document_path: str) -> str:
-    """需求文档是跨回合累积的文档，追加需求时最容易被整段覆盖成只剩本轮内容。"""
+    """需求文档是跨回合累积的文档，追加需求时最容易被整段覆盖成只剩本轮内容。
+
+    改法固定成「按章节定点编辑」而不是「整篇重写」：一份需求文档动辄一两万字，
+    每轮重写一遍就是每轮多烧一份全文的输出 token，而且模型重写长文本时漏章节的
+    概率比定点编辑高得多——两个目标是一致的，不需要靠全文重写来防丢失。
+    """
     return (
-        f"`{document_path}` 是跨回合累积的文档，不是本轮回复的存档。要改它就必须："
-        "先把现有内容完整读一遍，再把本轮新增或调整的部分合并进去，最后整篇写回同一路径；"
-        "本轮没有讨论到的章节原样保留，只有用户明确要求删除的内容才能删。"
-        "禁止只把本轮追加的需求写进文件，那会把之前几轮的需求文档整段丢掉。"
+        f"`{document_path}` 是跨回合累积的文档，不是本轮回复的存档。改它的方式是**按章节定点编辑**："
+        "先定位到要改的章节（文件长就按标题定位，不必整篇载入），把本轮新增或调整的内容写进对应章节，"
+        "需要新增内容时追加新章节；其余章节一个字都不要动。"
+        "不要把整篇重写一遍——既没必要，也最容易在重写时漏掉此前几轮的章节。"
+        "更不要用只含本轮增量的内容覆盖整份文件，那等于把之前的需求文档整段删掉。"
+        "只有用户明确要求删除的内容才能删。"
     )
 
 
@@ -118,55 +125,69 @@ def readable_document(workspace: Path | None, relative: str) -> bool:
         return False
 
 
+def readable_directory(workspace: Path | None, relative: str) -> bool:
+    """目录是否真的存在。没落过盘的任务目录不该出现在清单里。"""
+    if not workspace or not relative:
+        return False
+    candidate = Path(relative)
+    if candidate.is_absolute() or ".." in candidate.parts:
+        return False
+    try:
+        return (workspace / candidate).resolve().is_dir()
+    except OSError:
+        return False
+
+
 def requirement_document_catalog(
     items: list[Any],
     task: dict[str, Any],
     workspace: Path | None,
     limit: int = 60,
 ) -> list[str]:
-    """List the sibling tasks under the same requirement whose documents are already written.
+    """List only the directories of the tasks this one depends on.
 
-    只给清单不给正文：一条需求可能拆出几十个任务，把每份文档都塞进提示词会挤掉真正要干的活，
-    也会把上下文烧在无关任务上。执行器按标题和依赖关系判断相关性，需要哪份自己去读哪份。
+    给目录不给文件、更不给正文：需要的是「上游产出放在哪」这条线索，不是一份可以顺手全读的清单。
+    同需求下的非前置任务一律不列——列出来模型就倾向于挨个打开，上下文会被无关任务占满；
+    真需要时按同一套路径规则（doc/<模块>/<任务键>/）自己去翻。
     """
     requirement_key = str(task.get("requirementKey") or "").strip()
     if not requirement_key:
         return []
     current_key = str(task.get("itemKey") or "")
     dependencies = {str(key) for key in task.get("dependsOnItemKeys") or []}
+    if not dependencies:
+        return []
     lines: list[str] = []
     for item in items:
         if not isinstance(item, dict):
             continue
         item_key = str(item.get("itemKey") or "")
-        if not item_key or item_key == current_key:
+        if not item_key or item_key == current_key or item_key not in dependencies:
             continue
         if str(item.get("requirementKey") or "").strip() != requirement_key:
             continue
-        path = document_path_of(item)
-        if not readable_document(workspace, path):
+        directory = Path(document_path_of(item)).parent.as_posix()
+        if not readable_directory(workspace, directory):
             continue
-        marks = ["前置依赖"] if item_key in dependencies else []
-        if str(item.get("status") or "") == "done":
-            marks.append("已完成")
-        suffix = f"（{'、'.join(marks)}）" if marks else ""
-        lines.append(f"- {item_key}: {item.get('title') or item_key}{suffix} → {path}")
+        suffix = "（已完成）" if str(item.get("status") or "") == "done" else ""
+        lines.append(f"- {item_key}: {item.get('title') or item_key}{suffix} → `{directory}/`")
         if len(lines) >= limit:
             break
     return lines
 
 
 def sibling_document_lines(catalog: Any) -> list[str]:
-    """把同需求的文档清单渲染成提示词片段，并交代按需加载的规则。"""
+    """把前置任务的文档目录渲染成提示词片段，并交代按需加载的规则。"""
     entries = [str(line) for line in catalog or [] if str(line).strip()]
     if not entries:
         return []
     return [
         "",
-        "本需求下其他任务已写好的需求文档（按需加载，不是让你全读）:",
+        "前置任务的文档目录（只给目录，默认不要打开）:",
         *entries,
-        "加载规则：先看标题和依赖判断相关性——与本任务有接口、数据结构、字段口径或前置产出关系的才打开；"
-        "无关的不要读，避免上下文被无关任务占满。读过哪几份、为什么读，在最终回复里说明。",
+        "加载规则：现在不要读这些目录里的任何文件。只有在实现过程中真的卡在某个上游产出上"
+        "——要对接的接口签名、字段口径、数据结构或已定下的约定——才去对应目录里列一下文件，"
+        "只打开那一份、只读需要的章节。读了哪几份、为了解决什么问题，在最终回复里说明。",
     ]
 
 

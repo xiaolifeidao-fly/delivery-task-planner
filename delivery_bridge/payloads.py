@@ -356,6 +356,12 @@ def validate_execute_payload(value: Any) -> dict[str, Any]:
     if len(execution_constraints) > 32 * 1024:
         raise BridgeFailure("任务约束条件说明不能超过 32KB")
     normalized["executionConstraints"] = execution_constraints
+    # 队列里上游任务交接下来的代码事实。桥接器自己拼的，封顶只为防止某一轮把正文抄进来
+    # 之后一路传下去——它会跟着后面每一条任务的每一次请求重发。
+    upstream_code_facts = str(value.get("upstreamCodeFacts") or "").strip()
+    if len(upstream_code_facts) > 16 * 1024:
+        raise BridgeFailure("上游代码事实交接不能超过 16KB")
+    normalized["upstreamCodeFacts"] = upstream_code_facts
     attachments = value.get("followUpAttachments") or []
     if not isinstance(attachments, list) or len(attachments) > MAX_CONVERSATION_ATTACHMENTS:
         raise BridgeFailure("附件数量无效")

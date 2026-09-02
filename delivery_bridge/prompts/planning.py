@@ -60,6 +60,41 @@ def planning_temp_document_path(requirement_name: str, requirement_key: str, thr
     return runtime.PLUGIN_ROOT / ".temp" / "requirements" / f"req_{requirement_segment}" / thread_segment / "temp.md"
 
 
+# 过程摘要分两段存：首轮的全量预览是基线，之后每轮只追加增量。
+# 续聊回合的回复本身就是增量（见 build_planning_follow_up_prompt 的输出规则），
+# 整篇覆盖会把首轮那份全量预览冲掉，恢复上下文时就只剩最后一句改动了。
+PLANNING_TEMP_BASELINE_MARK = "<!-- planning-baseline -->"
+PLANNING_TEMP_BASELINE_END_MARK = "<!-- /planning-baseline -->"
+PLANNING_TEMP_ROUNDS_MARK = "<!-- planning-rounds -->"
+PLANNING_TEMP_ROUND_MARK = "<!-- round -->"
+# 增量轮次留最近这些轮：再往前的改动早就被后面的轮次覆盖掉了，留着只会把恢复上下文撑大。
+MAX_PLANNING_TEMP_ROUNDS = 12
+
+
+def planning_temp_sections(path: Path) -> tuple[str, list[str]]:
+    """把已落盘的过程摘要拆回「基线全量预览」和「历轮增量」。
+
+    读不到、或者是本格式之前写下的旧文件时，基线一律按空处理：调用方会因此
+    把这一轮当成新的基线整篇重写，比在一份认不出结构的文件后面接着追加要安全。
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return "", []
+    baseline = ""
+    if PLANNING_TEMP_BASELINE_MARK in text and PLANNING_TEMP_BASELINE_END_MARK in text:
+        baseline = text.split(PLANNING_TEMP_BASELINE_MARK, 1)[1].split(PLANNING_TEMP_BASELINE_END_MARK, 1)[0].strip()
+    rounds: list[str] = []
+    if PLANNING_TEMP_ROUNDS_MARK in text:
+        # 第一段是标记之前的说明文字或占位符，不是增量轮次。
+        rounds = [
+            block.strip()
+            for block in text.split(PLANNING_TEMP_ROUNDS_MARK, 1)[1].split(PLANNING_TEMP_ROUND_MARK)[1:]
+            if block.strip()
+        ]
+    return baseline, rounds
+
+
 def write_planning_temp_summary(
     path: Path,
     requirement_name: str,
@@ -67,26 +102,68 @@ def write_planning_temp_summary(
     thread_id: str,
     user_message: str,
     summary: str,
+    incremental: bool = False,
 ) -> None:
-    """Atomically refresh the latest process artifact for one planning chat."""
+    """Refresh one planning chat's process artifact, appending incremental rounds.
+
+    `incremental=False`（首轮，或基线还没落盘）把本轮回复整篇写成新的基线；
+    `incremental=True`（续聊轮）保留基线，只在后面追加这一轮的增量。
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
+    baseline, rounds = planning_temp_sections(path) if incremental else ("", [])
+    # 基线不在（旧格式文件、被人删过、或首轮就没写成）时，这一轮只能自己当基线，
+    # 否则恢复上下文时拿到的是一串没有底稿的增量。
+    if incremental and not baseline:
+        incremental = False
+    if incremental:
+        rounds.append("\n".join([
+            f"### 增量轮次 · {utc_now()}",
+            "",
+            "**本轮用户输入**",
+            "",
+            (user_message or "（无文字输入）").strip(),
+            "",
+            "**本轮 AI 增量**",
+            "",
+            (summary or "（本轮没有可保存的总结）").strip(),
+        ]))
+        dropped = max(0, len(rounds) - MAX_PLANNING_TEMP_ROUNDS)
+        rounds = rounds[-MAX_PLANNING_TEMP_ROUNDS:]
+    else:
+        baseline = (summary or "（本轮没有可保存的总结）").strip()
+        rounds = []
+        dropped = 0
+    round_body = (
+        "\n\n".join(f"{PLANNING_TEMP_ROUND_MARK}\n{block}" for block in rounds)
+        if rounds
+        else "（暂无增量轮次，基线就是当前最新方案）"
+    )
     body = "\n".join([
         "# 需求梳理过程摘要",
         "",
         "> 临时过程产物，仅用于接续本聊天窗口；不等同于最终需求文档。",
+        "> 读法：先读「基线完整预览」，再按从旧到新的顺序把「后续增量」叠加上去，后面的结论覆盖前面的。",
         "",
         f"- 需求名称：{requirement_name or requirement_key or '未命名需求'}",
         f"- 需求键：{requirement_key or '未指定'}",
         f"- 聊天窗口 ID：{thread_id}",
         f"- 更新时间：{utc_now()}",
+        f"- 增量轮次：{len(rounds)}" + (f"（更早的 {dropped} 轮已被后续轮次覆盖，不再保留）" if dropped else ""),
         "",
         "## 本轮用户输入",
         "",
         (user_message or "（无文字输入）").strip(),
         "",
-        "## 最新总结性产物",
+        "## 基线完整预览",
         "",
-        (summary or "（本轮没有可保存的总结）").strip(),
+        PLANNING_TEMP_BASELINE_MARK,
+        baseline,
+        PLANNING_TEMP_BASELINE_END_MARK,
+        "",
+        "## 后续增量（从旧到新，逐轮叠加在基线之上）",
+        "",
+        PLANNING_TEMP_ROUNDS_MARK,
+        round_body,
         "",
     ])
     temporary = path.with_suffix(".tmp")
@@ -122,10 +199,11 @@ def planning_temp_rule_lines(temp_path: str, read_required: bool = False) -> lis
         "或当前上下文已找不到此前确认结论时，才读取它作为恢复点。"
     )
     return [
-        f"本聊天窗口的过程总结文件: `{temp_path}`（插件安装目录内，不属于项目正式交付文档）。",
+        f"本聊天窗口的过程总结文件: `{temp_path}`（插件安装目录内，不属于项目正式交付文档）。"
+        "它由「基线完整预览」加上按轮次追加的「后续增量」两段组成：读的时候先读基线，再从旧到新叠加增量，后面的结论覆盖前面的。",
         read_rule,
-        "每轮结束后桥接器会用本轮输入和最新总结性产物整篇刷新它，"
-        "不要把过程记录、未确认方案或聊天流水写入正式需求大纲。",
+        "每轮结束后桥接器自动追加本轮内容，你不需要维护这个文件；"
+        "也不要把过程记录、未确认方案或聊天流水写入正式需求大纲。",
     ]
 
 
@@ -144,14 +222,20 @@ def requirement_outline_rule_lines(outline_path: str, write_allowed: bool = Fals
         *planning_temp_rule_lines(temp_path, read_required=True),
         "写入前先完整读取既有最终大纲（如存在）和本聊天窗口的过程总结，把用户最终确认的方案合并成一份完整需求产物；"
         "过程聊天、被否决方案和未确认草稿不要带入最终文档。",
+        "预览是分轮给出的：首轮是完整方案，之后每轮只给增量。合并时以「基线 + 逐轮增量」的叠加结果为准，"
+        "不要只按最后一轮的增量下结论，也不要把已经被后续轮次改掉的旧版本写进去。",
         "`temp.md` 只是候选材料，禁止整段复制或按聊天顺序改写。先分析每条信息是否直接有助于需求目标、交付范围、实现约束、"
         "关键业务规则、验收标准、测试准备或最终决策；只把有实际交付价值且已经确认的内容提炼成清晰、可执行、可验证的需求表述。",
         "合并重复内容，删除寒暄、反复确认、讨论过程、未采纳备选、无结论推演、工具日志和关于聊天本身的元信息。"
         "但不得借精简遗漏已确认的非目标、兼容性要求、异常与边界场景、风险约束或仍会影响交付的待确认问题。",
-        "写回是「读全文 → 合并本轮增量 → 整篇覆盖」：先完整读一遍现有大纲（用户可能在面板上直接编辑过），"
-        "把本轮追加或调整的需求并进对应章节，本轮没聊到的章节原样保留，只有用户明确要求删除的内容才能删。"
-        "禁止只把本轮追加的那段需求写进文件，那等于把之前几轮的需求大纲整段丢掉。",
-        "大纲用 Markdown 组织，至少包含：需求背景与目标、范围与不做的事、关键约束、勘察到的落点（真实模块/目录/接口）、任务拆解表（与预览一致）、验收标准、待确认问题。",
+        # 一份大纲动辄上万字，每次确认写入都重写一遍就是每次多烧一份全文的输出 token，
+        # 而且重写长文本时漏章节的概率比定点编辑更高。
+        "写回的方式是**按章节定点编辑**：先读现有大纲（用户可能在面板上直接编辑过），定位到要改的章节，"
+        "把本轮追加或调整的需求写进去，需要新增内容时追加新章节，本轮没聊到的章节一个字都不要动，"
+        "只有用户明确要求删除的内容才能删。不要整篇重写，也禁止只把本轮追加的那段需求写进文件覆盖全篇，"
+        "那等于把之前几轮的需求大纲整段丢掉。",
+        "大纲用 Markdown 组织，开头先写一节「摘要」（三到五行说清需求目标、范围边界和验收口径，"
+        "后续阶段靠它决定要不要往下钻，必须能独立读懂），其后至少包含：需求背景与目标、范围与不做的事、关键约束、勘察到的落点（真实模块/目录/接口）、任务拆解表（与预览一致）、验收标准、待确认问题。",
         "把大纲里任务表的最终状态同步成实际落库的那一版。",
     ]
 
@@ -198,15 +282,13 @@ def build_planning_prompt(
         for item in context.get("items") or []
         if requirement_key and str(item.get("requirementKey") or "") == requirement_key
     ]
-    requirement_item_lines = [
-        f"- {item.get('itemKey')}: {item.get('title') or item.get('itemKey')}"
-        f"（{item.get('phase') or '-'}/{item.get('status') or '-'}；收益：{'、'.join(item.get('benefitTags') or []) or '未标注'}）"
-        for item in requirement_items[:100]
-    ]
+    requirement_item_lines = [planning_item_line(item) for item in requirement_items[:100]]
     mode_lines = (
         [
             f"本轮用户已在任务面板点击「确认并写入」，请遵循 {PLANNING_SKILL} 技能执行写入："
-            f"把上一轮预览过的方案（含用户后续提出的修改）用 `{taskboard_command('create-task-board-tasks')}` 一次性提交。",
+            f"把此前预览过的方案（含用户后续提出的修改）用 `{taskboard_command('create-task-board-tasks')}` 一次性提交。",
+            "预览是分轮给出的：首轮给完整方案，之后每轮只给增量。提交前先把首轮全量预览和后续各轮增量叠加成最终一份，"
+            "以最后一次改动为准；上下文里已经找不到早期轮次时，读下面给出的过程总结文件核对，不要凭最后一轮的增量反推整份方案。",
             f"任务面板数据只能通过这个命令行写入：`{taskboard_command('<动作>')}`（参数用连字符，数组参数走 `--json`，内容长时先写文件再 `--json @文件`）。不要自己拼 HTTP 请求、也不要手工改文件来创建任务面板数据。",
             "可用动作：get-task-board-context、create-task-board-stage、create-task-board-module、create-task-board-tasks；"
             f"`{taskboard_command('actions')}` 可以打印全部动作和参数，拿不准时先看它。"
@@ -228,6 +310,11 @@ def build_planning_prompt(
             "本轮的限制只针对任务面板数据：正式需求大纲保持只读；如果用户明确要求生成或更新独立的流程图、图表、HTML 或其他需求资产，允许写入当前需求文档目录，但只能写该目录。过程总结由桥接器写入插件安装目录。已授予项目工作目录及需求指定关联目录的只读勘察权限；可使用终端的只读命令和当前会话可用的读取工具列目录、搜索并读取代码、配置、技能和文档。某个可选读取工具不可用时，改用其他可用的只读工具继续勘察，不要因此停止。",
             "拆解前必须先勘察下方给出的项目工作目录：加载该目录下项目自己的开发技能（如 backend-development、web-development），读相关目录和现有实现，据此判断需求真正的落点。get-task-board-context 只给出面板侧上下文，不包含工程现状，不能拿它替代看代码。",
             "任务要落到勘察出的真实模块、目录或接口上，不要只按业务名词泛化出通用分层；工作区里找不到需求所指的模块时，先向用户说明并确认工作目录或范围，不要硬拆。",
+            "勘察点到为止，只读到能确定落点为止：先用列目录和检索定位需求涉及的目录与入口文件，确有必要再打开具体实现，"
+            "读到能说清「改哪个文件、哪个接口、哪张表」就停；不要通读整个模块、不要逐个文件展开、同一份文件不要重复读，"
+            "也不要为了凑上下文把大段源码搬进回复——引用代码时只贴关键几行并给出路径和行号。"
+            "剩下的预算留给拆解本身；确实还缺关键事实时，直接向用户提问，比继续翻代码更省。",
+            "续聊时不要重复首轮已经做过的勘察：结论沿用本会话已经确认的那些，只补真正还没看过的部分。",
             "请与用户对话把需求问清楚，然后输出一份可评审的拆解预览：先用 Markdown 表格列出「序号 / 任务标题 / 收益标签 / 负责人 / 里程碑 / 模块 / 类型 / 前置依赖」，每项给 1-3 个简短收益或作用标签；负责人统一展示为该需求的第一位主负责人（未指定则标为未指派）；再在表格下方逐条给出完整任务说明，格式和详细程度与实际写入面板的任务说明一致，让用户在确认前就能看到执行器将拿到的原文。",
             *TASK_DESCRIPTION_RULE_LINES,
             "里程碑、模块、类型的取值只能来自下方给出的现有选项；预览里也要说明哪些是新建、哪些复用本需求已有任务。",
@@ -390,6 +477,25 @@ def planning_detail_digest(requirement: dict[str, Any] | None) -> str:
     return hashlib.sha256(detail.encode("utf-8")).hexdigest()
 
 
+def planning_item_line(item: dict[str, Any]) -> str:
+    """本需求已建任务在提示词里的那一行。"""
+    return (
+        f"- {item.get('itemKey')}: {item.get('title') or item.get('itemKey')}"
+        f"（{item.get('phase') or '-'}/{item.get('status') or '-'}；收益：{'、'.join(item.get('benefitTags') or []) or '未标注'}）"
+    )
+
+
+def requirement_item_keys(context: dict[str, Any], requirement_key: str) -> list[str]:
+    """当前需求下已经落库的任务键，顺序与提示词里的清单一致。"""
+    if not requirement_key:
+        return []
+    return [
+        str(item.get("itemKey") or "")
+        for item in context.get("items") or []
+        if str(item.get("requirementKey") or "") == requirement_key and item.get("itemKey")
+    ]
+
+
 def build_planning_follow_up_prompt(
     program_id: int,
     context: dict[str, Any],
@@ -402,6 +508,7 @@ def build_planning_follow_up_prompt(
     mention_context: list[str] | None = None,
     include_detail: bool = False,
     thread_id: str = "",
+    known_item_keys: list[str] | None = None,
 ) -> str:
     """同一条需求拆解会话的追加回合，只带会变的和丢不起的那几项。
 
@@ -409,15 +516,38 @@ def build_planning_follow_up_prompt(
     随轮次变化的（已选里程碑/模块、改动过的需求正文、本轮 @ 的实体）、
     被会话压缩掉就会出事的（本需求已建任务清单、需求大纲读写纪律），
     以及取值必须合法的现有里程碑/模块键。确认写入那一轮仍走 build_planning_prompt 全量。
+
+    `known_item_keys` 是本会话此前轮次已经发过的任务键：给了就只列增量，
+    整份清单留在会话历史里，不必每轮重发几十行。
     """
     requirement = requirement or {}
     requirement_key = str(requirement.get("requirementKey") or "")
-    requirement_item_lines = [
-        f"- {item.get('itemKey')}: {item.get('title') or item.get('itemKey')}"
-        f"（{item.get('phase') or '-'}/{item.get('status') or '-'}；收益：{'、'.join(item.get('benefitTags') or []) or '未标注'}）"
+    requirement_items = [
+        item
         for item in context.get("items") or []
         if requirement_key and str(item.get("requirementKey") or "") == requirement_key
-    ][:100]
+    ]
+    # 已经发过整份清单的会话只补增量：任务清单是「不要重复建任务」这条约束的依据，
+    # 但它逐轮重发就是每轮几十行的固定开销，而会话历史里那一份并不会消失。
+    known = [str(key) for key in known_item_keys or [] if str(key)]
+    incremental_items = bool(known)
+    listed_items = (
+        [item for item in requirement_items if str(item.get("itemKey") or "") not in set(known)]
+        if incremental_items
+        else requirement_items
+    )
+    requirement_item_lines = [planning_item_line(item) for item in listed_items[:100]]
+    if not incremental_items:
+        item_lines = ["本需求已建任务:", *(requirement_item_lines or ["- 无"])]
+    elif requirement_item_lines:
+        item_lines = [
+            f"本需求已建任务（本会话此前轮次已列过 {len(known)} 条，这里只补新增的部分）:",
+            *requirement_item_lines,
+        ]
+    else:
+        item_lines = [
+            f"本需求已建任务: 与此前轮次给出的那 {len(known)} 条相同，没有新增。",
+        ]
     stage_keys = [str(item.get("stageKey") or "") for item in context.get("stages") or [] if item.get("stageKey")]
     module_keys = [str(item.get("moduleKey") or "") for item in context.get("modules") or [] if item.get("moduleKey")]
     split_tasks = bool(requirement.get("splitTasks", True))
@@ -461,28 +591,35 @@ def build_planning_follow_up_prompt(
         "禁止执行 create-task-board-tasks、create-task-board-stage、create-task-board-module，也不要绕过任务面板写入限制。",
         "首轮已经交代过角色、技能、勘察纪律和输出格式，这里不再重复，按本会话已确认的约定继续；"
         "拆解结论仍然要落在工作目录里的真实模块、目录或接口上。",
+        "勘察也不要从头再来：首轮已经看过的目录和文件不用重读，结论直接沿用，只补这一轮真正还缺的那部分事实。",
+        # 追加回合最贵的不是提示词，是回复：把整份预览连同每条 300-1500 字的任务说明再打一遍，
+        # 既要花本轮的输出，又会留在会话历史里，让后面每一轮都跟着重读一遍。
+        "输出增量，不要重印整份预览：任务表里只列本轮新增或被改动的任务行（表头沿用首轮的"
+        "「序号 / 任务标题 / 收益标签 / 负责人 / 里程碑 / 模块 / 类型 / 前置依赖」，并在序号后标明「新增」或「修改」），"
+        "表格下方也只给这几条的完整任务说明，详细程度与首轮一致（目标、真实落点、改动分条、边界、依赖与输入、验收标准）。",
+        "没有改动的任务用一行「其余 N 条不变」带过，不要重复它们的标题、说明或表格行；"
+        "被删掉的任务单独用一行写清楚。用户明确要求「再给一份完整预览」时才整份重印。",
+        "最新的完整方案 = 首轮全量预览 + 后续各轮增量，桥接器已经把它们逐轮存进本聊天窗口的过程总结文件，"
+        "确认写入那一轮会据此合并，所以这里不必为了留档而重复。",
+        "回复结尾照旧提示用户：确认无误后点「确认并写入」，要调整就直接回复修改意见。",
         workspace_instruction(workspace),
         f"项目 program_id: {program_id}",
         f"需求键 requirement_key: {requirement_key or '未指定'}",
         f"需求名称: {requirement.get('name') or '未命名'}",
         f"拆解成多条任务: {'是' if split_tasks else '否（预览里只输出一条覆盖整条需求的任务，不要拆分也不要串依赖）'}",
+        *requirement_outline_rule_lines(outline_path, False, temp_path.as_posix() if temp_path else ""),
+        *document_lines,
+        *prototype_lines,
         *detail_lines,
         f"已选里程碑: {selected_stage or '未选择'}",
         f"已选模块: {selected_module or '未选择'}",
         f"任务类型偏好: {selected_kind or '由你判断'}",
         f"现有里程碑键（取值只能从中选）: {'、'.join(stage_keys) or '无'}",
         f"现有模块键（取值只能从中选）: {'、'.join(module_keys) or '无'}",
-        *requirement_outline_rule_lines(outline_path, False, temp_path.as_posix() if temp_path else ""),
-        *document_lines,
-        *prototype_lines,
         *(mention_context or []),
-        "本需求已建任务:",
-        *(requirement_item_lines or ["- 无"]),
+        *item_lines,
         REQUIREMENT_SCOPE_RULE,
-        "预览里只列本轮打算新增的任务，不要重复上面已经存在的任务；"
-        "输出格式沿用首轮：先用 Markdown 表格列出「序号 / 任务标题 / 收益标签 / 负责人 / 里程碑 / 模块 / 类型 / 前置依赖」，"
-        "再在表格下方逐条给出完整任务说明，详细程度与首轮一致（目标、真实落点、改动分条、边界、依赖与输入、验收标准）；"
-        "回复结尾照旧提示用户：确认无误后点「确认并写入」，要调整就直接回复修改意见。",
+        "预览里只列本轮打算新增的任务，不要重复上面已经存在的任务。",
         (
             f"本会话如果被压缩过，上面提到的需求背景和既往结论你在上下文里可能已经找不到："
             f"先读 `{temp_path.as_posix()}` 把上下文接回来再动手，不要凭印象往下接。"
