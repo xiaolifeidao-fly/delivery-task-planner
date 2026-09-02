@@ -36,14 +36,101 @@ from .common import (
 
 # 任务说明是执行阶段的兜底需求输入：任务没有单独的需求文档时，执行器看到的就只有它，
 # 所以拆解阶段就得把它写成能独立执行的说明，而不是一句话概括。
+# 六段式任务说明的正文在 references/任务拆解与写入.md，本轮提示词已经点名要读它；这里只强调它的作用。
 TASK_DESCRIPTION_RULE_LINES = [
     "任务说明（description）是动作执行阶段的兜底需求输入：这条任务没有单独的任务需求文档时，"
-    "执行器唯一能看到的需求就是它。必须写成脱离本次聊天也能独立执行的说明，不能只给一句话概括。",
-    "每条任务说明至少交代六件事：①要解决的问题和目标；②勘察到的真实落点（具体文件、目录、接口、表、组件，能给路径就给路径）；"
-    "③要做的改动，分条列清；④边界与不做的事；⑤依赖与输入（前置任务产出、字段口径、配置或数据准备）；⑥可验证的验收标准。",
-    "用短句分条写，不要写成长篇叙述；正文控制在 300-1500 字，写满这六件事优先于压字数；"
-    "需要贴大段代码、接口清单或表结构时写进任务需求文档，不要把它塞进任务说明。",
+    "执行器唯一能看到的需求就是它。写法照 `references/任务拆解与写入.md` 里的六段式要求，不能只给一句话概括。",
 ]
+
+
+# 需求聊天是「先聊清楚，再拆」：默认走沟通模式，拆解契约只在真正要拆的那一轮才发。
+# 一上来就把任务表格式、六段式描述和依赖分层塞进提示词，执行器会急着出方案，
+# 而这时候用户往往还在补需求背景。
+PLANNING_MODE_DISCUSSION = "discussion"
+PLANNING_MODE_BREAKDOWN = "breakdown"
+
+# 模型主动引导时的固定问法。桥接靠这句话判断「已经问过要不要拆」，
+# 用户下一轮回一句「好」才能接上，所以改措辞时两边要一起改。
+BREAKDOWN_INVITE_MARK = "是否现在梳理并拆解任务"
+BREAKDOWN_INVITE_QUESTION = f"需求已经聊得差不多了，{BREAKDOWN_INVITE_MARK}？"
+
+# 用户主动要拆解的说法。宁可放宽也不要漏：误判进拆解模式时，那一轮提示词里的
+# 「用户其实只是在补充需求就继续沟通」兜得住；漏判则要用户再说一遍。
+_BREAKDOWN_REQUEST_PATTERN = re.compile(
+    r"拆解|拆分|拆成|拆一下|拆吧|拆任务|拆出|梳理任务|梳理并拆|梳理一下任务|生成任务|创建任务|建任务|出任务"
+    r"|任务清单|任务列表|任务计划|排任务|break\s*down|split.*task",
+    re.IGNORECASE,
+)
+
+# 承接上一轮引导的短肯定。只在模型问过之后才认，而且必须是一句纯应答，
+# 免得把「可以先不管权限」这种带肯定词的补充说明当成同意拆解。
+_AFFIRMATIVE_PATTERN = re.compile(
+    r"^(好|好的|好呀|好吧|可以|行|嗯|是|是的|对|开始|开始吧|继续|来吧|走起|同意|没问题|确认|ok|okay|yes|y|sure)"
+    r"[的吧呀啊了呗\s，,。.!！~]*$",
+    re.IGNORECASE,
+)
+
+
+def planning_round_mode(
+    message: str,
+    confirm_write: bool = False,
+    previous_mode: str = "",
+    invited: bool = False,
+) -> str:
+    """这一轮是继续聊需求，还是该给拆解方案。
+
+    默认聊：需求刚起头时用户还在补背景，先塞一整套拆解契约只会让执行器急着出任务表。
+    用户自己开口要拆、或者接住了上一轮的引导，才切到拆解模式；切过去之后不再退回来。
+    """
+    if confirm_write or previous_mode == PLANNING_MODE_BREAKDOWN:
+        return PLANNING_MODE_BREAKDOWN
+    text = str(message or "").strip()
+    if _BREAKDOWN_REQUEST_PATTERN.search(text):
+        return PLANNING_MODE_BREAKDOWN
+    if invited and _AFFIRMATIVE_PATTERN.match(text):
+        return PLANNING_MODE_BREAKDOWN
+    return PLANNING_MODE_DISCUSSION
+
+
+def planning_invite_offered(reply: str) -> bool:
+    """这一轮模型是不是已经问过「要不要开始拆」。"""
+    return BREAKDOWN_INVITE_MARK in str(reply or "")
+
+
+# 沟通轮和拆解轮共用的两组纪律：写入禁令是两边都得守的底线，
+# 勘察边界则是「读到能说清落点就停」，跟这一轮出不出任务表无关。
+PLANNING_NO_WRITE_LINES = [
+    "禁止执行 create-task-board-tasks、create-task-board-stage、create-task-board-module，也不要借 HTTP 请求或手工改文件绕过任务面板写入限制；未确认前这些写入命令会被命令行直接拒绝。",
+    "本轮的限制只针对任务面板数据：正式需求大纲保持只读；如果用户明确要求生成或更新独立的流程图、图表、HTML 或其他需求资产，允许写入当前需求文档目录，但只能写该目录。过程总结由桥接器写入插件安装目录。已授予项目工作目录及需求指定关联目录的只读勘察权限；可使用终端的只读命令和当前会话可用的读取工具列目录、搜索并读取代码、配置、技能和文档。某个可选读取工具不可用时，改用其他可用的只读工具继续勘察，不要因此停止。",
+]
+
+# 勘察纪律的正文在技能 SKILL.md 第 3 节，那份每轮都会加载；这里只指路，不再复述一遍。
+PLANNING_SURVEY_LINES = [
+    f"工作区勘察严格按 {PLANNING_SKILL} 技能 SKILL.md 第 3 节「勘察工作区现状」执行：读到能说清落点就停，"
+    "同一份文件不要重复读，续聊不要重做首轮已经做过的勘察。",
+]
+
+
+def planning_discussion_lines() -> list[str]:
+    """沟通轮只交代本轮的状态和边界；怎么聊的行为规范在技能里。
+
+    「先给判断再问问题」「能自己查的不要问」「用户还在补背景就跟着聊」这几条不随轮次变化，
+    正文放在 references/需求沟通.md，这里不再复述——两边各说一遍，等于每一次工具往返都为
+    同一条规则付两份钱。这里只保留桥接器才知道的东西：本轮是哪种模式、写入权限、以及
+    面板要靠原文匹配的那句引导语。
+    """
+    return [
+        "这是交付任务面板的需求沟通会话。当前阶段的目标是和用户一起把这条需求聊清楚、聊完整，不是拆任务："
+        "用户没提之前，不要输出任务表、执行层、依赖图或工期计划，也不要提示「确认并写入」。",
+        f"本轮读 {PLANNING_SKILL} 技能的 SKILL.md 和 `references/需求沟通.md`，沟通轮怎么聊按那里的规则来；"
+        "`references/任务拆解与写入.md`、`references/需求文档规范.md` 这一轮用不上，不要预读。",
+        *PLANNING_NO_WRITE_LINES,
+        *PLANNING_SURVEY_LINES,
+        f"当需求的目标、范围边界、真实落点和验收口径都已经清楚、够开始拆任务了，在回复末尾主动问一句："
+        f"「{BREAKDOWN_INVITE_QUESTION}」——这句按原文写，面板靠它识别引导；还没到这一步就不要问，先把缺的部分补齐。",
+        f"用户本轮已经明确要求拆解、或者接住了上面这句引导，就读 {PLANNING_SKILL} 技能的 `references/任务拆解与写入.md`，"
+        "按其中的规则给出可评审的拆解预览，并在结尾提示用户点「确认并写入」；不要再反问一遍才拆。",
+    ]
 
 
 def planning_temp_segment(value: str, fallback: str) -> str:
@@ -142,7 +229,7 @@ def write_planning_temp_summary(
         "# 需求梳理过程摘要",
         "",
         "> 临时过程产物，仅用于接续本聊天窗口；不等同于最终需求文档。",
-        "> 读法：先读「基线完整预览」，再按从旧到新的顺序把「后续增量」叠加上去，后面的结论覆盖前面的。",
+        "> 读法：先读「基线」，再按从旧到新的顺序把「后续增量」叠加上去，后面的结论覆盖前面的。",
         "",
         f"- 需求名称：{requirement_name or requirement_key or '未命名需求'}",
         f"- 需求键：{requirement_key or '未指定'}",
@@ -154,7 +241,7 @@ def write_planning_temp_summary(
         "",
         (user_message or "（无文字输入）").strip(),
         "",
-        "## 基线完整预览",
+        "## 基线（本会话首轮的完整内容）",
         "",
         PLANNING_TEMP_BASELINE_MARK,
         baseline,
@@ -200,7 +287,7 @@ def planning_temp_rule_lines(temp_path: str, read_required: bool = False) -> lis
     )
     return [
         f"本聊天窗口的过程总结文件: `{temp_path}`（插件安装目录内，不属于项目正式交付文档）。"
-        "它由「基线完整预览」加上按轮次追加的「后续增量」两段组成：读的时候先读基线，再从旧到新叠加增量，后面的结论覆盖前面的。",
+        "它由「基线」加上按轮次追加的「后续增量」两段组成：读的时候先读基线，再从旧到新叠加增量，后面的结论覆盖前面的。",
         read_rule,
         "每轮结束后桥接器自动追加本轮内容，你不需要维护这个文件；"
         "也不要把过程记录、未确认方案或聊天流水写入正式需求大纲。",
@@ -222,8 +309,8 @@ def requirement_outline_rule_lines(outline_path: str, write_allowed: bool = Fals
         *planning_temp_rule_lines(temp_path, read_required=True),
         "写入前先完整读取既有最终大纲（如存在）和本聊天窗口的过程总结，把用户最终确认的方案合并成一份完整需求产物；"
         "过程聊天、被否决方案和未确认草稿不要带入最终文档。",
-        "预览是分轮给出的：首轮是完整方案，之后每轮只给增量。合并时以「基线 + 逐轮增量」的叠加结果为准，"
-        "不要只按最后一轮的增量下结论，也不要把已经被后续轮次改掉的旧版本写进去。",
+        "这份总结是分轮累积的：开始拆解之前的轮次是需求沟通，开始拆解那一轮给出完整方案，之后每轮只给增量。"
+        "合并时以「基线 + 逐轮增量」的叠加结果为准，不要只按最后一轮的增量下结论，也不要把已经被后续轮次改掉的旧版本写进去。",
         "`temp.md` 只是候选材料，禁止整段复制或按聊天顺序改写。先分析每条信息是否直接有助于需求目标、交付范围、实现约束、"
         "关键业务规则、验收标准、测试准备或最终决策；只把有实际交付价值且已经确认的内容提炼成清晰、可执行、可验证的需求表述。",
         "合并重复内容，删除寒暄、反复确认、讨论过程、未采纳备选、无结论推演、工具日志和关于聊天本身的元信息。"
@@ -252,10 +339,12 @@ def build_planning_prompt(
     workspace: Path | None = None,
     mention_context: list[str] | None = None,
     thread_id: str = "",
+    mode: str = PLANNING_MODE_BREAKDOWN,
 ) -> str:
     """Give a project-level Codex turn the precise planner-tool contract and scope.
 
-    需求梳理分两步：默认只出可评审的拆解预览（`write_allowed=False`），
+    需求聊天分三档：`mode=discussion` 只和用户把需求聊清楚，提示词里不带任何拆解契约；
+    用户开口要拆（或接住模型的引导）之后才切到 `mode=breakdown`，出可评审的拆解预览；
     用户在面板上点「确认并写入」后才带着 `write_allowed=True` 再来一轮真正落库。
     面板上下文整段包在 <delivery-planning-context> 里，聊天记录只回显用户自己输入的内容。
     `workspace` 是项目管理里绑定的工作目录，也就是本轮的 cwd；写进提示词是为了让执行器
@@ -283,11 +372,15 @@ def build_planning_prompt(
         if requirement_key and str(item.get("requirementKey") or "") == requirement_key
     ]
     requirement_item_lines = [planning_item_line(item) for item in requirement_items[:100]]
+    # 确认写入必然是拆解轮：面板只会在预览过之后才发这一轮。
+    discussion = not write_allowed and mode == PLANNING_MODE_DISCUSSION
     mode_lines = (
         [
-            f"本轮用户已在任务面板点击「确认并写入」，请遵循 {PLANNING_SKILL} 技能执行写入："
+            # 需求大纲、独立资产、任务需求文档的规则下面都带着真实路径和开关逐条给出了，
+            # 比 references/需求文档规范.md 更准，不要再让执行器把那份也读一遍。
+            f"本轮用户已在任务面板点击「确认并写入」，请先读 {PLANNING_SKILL} 技能的 `references/任务拆解与写入.md`，再执行写入："
             f"把此前预览过的方案（含用户后续提出的修改）用 `{taskboard_command('create-task-board-tasks')}` 一次性提交。",
-            "预览是分轮给出的：首轮给完整方案，之后每轮只给增量。提交前先把首轮全量预览和后续各轮增量叠加成最终一份，"
+            "预览是分轮给出的：开始拆解那一轮给完整方案，之后每轮只给增量。提交前先把那份完整方案和后续各轮增量叠加成最终一份，"
             "以最后一次改动为准；上下文里已经找不到早期轮次时，读下面给出的过程总结文件核对，不要凭最后一轮的增量反推整份方案。",
             f"任务面板数据只能通过这个命令行写入：`{taskboard_command('<动作>')}`（参数用连字符，数组参数走 `--json`，内容长时先写文件再 `--json @文件`）。不要自己拼 HTTP 请求、也不要手工改文件来创建任务面板数据。",
             "可用动作：get-task-board-context、create-task-board-stage、create-task-board-module、create-task-board-tasks；"
@@ -305,22 +398,22 @@ def build_planning_prompt(
         ]
         if write_allowed
         else [
-            f"这是交付任务面板的需求梳理会话，请遵循 {PLANNING_SKILL} 技能。本轮只做梳理和预览，禁止写入任何任务面板数据。",
-            "禁止执行 create-task-board-tasks、create-task-board-stage、create-task-board-module，也不要借 HTTP 请求或手工改文件绕过任务面板写入限制；未确认前这些写入命令会被命令行直接拒绝。",
-            "本轮的限制只针对任务面板数据：正式需求大纲保持只读；如果用户明确要求生成或更新独立的流程图、图表、HTML 或其他需求资产，允许写入当前需求文档目录，但只能写该目录。过程总结由桥接器写入插件安装目录。已授予项目工作目录及需求指定关联目录的只读勘察权限；可使用终端的只读命令和当前会话可用的读取工具列目录、搜索并读取代码、配置、技能和文档。某个可选读取工具不可用时，改用其他可用的只读工具继续勘察，不要因此停止。",
+            f"这是交付任务面板的需求梳理会话，请遵循 {PLANNING_SKILL} 技能，并先读它的 `references/任务拆解与写入.md`（本轮的拆解规则都在那里）。"
+            "本轮只做梳理和预览，禁止写入任何任务面板数据。",
+            "本轮用户已经要求梳理并拆解任务。但读下来如果发现他其实只是在补充需求背景、并没有要方案，"
+            "就继续按需求沟通回应，把还没聊清楚的部分问明白，不要硬凑一份任务表出来。",
+            *PLANNING_NO_WRITE_LINES,
             "拆解前必须先勘察下方给出的项目工作目录：加载该目录下项目自己的开发技能（如 backend-development、web-development），读相关目录和现有实现，据此判断需求真正的落点。get-task-board-context 只给出面板侧上下文，不包含工程现状，不能拿它替代看代码。",
             "任务要落到勘察出的真实模块、目录或接口上，不要只按业务名词泛化出通用分层；工作区里找不到需求所指的模块时，先向用户说明并确认工作目录或范围，不要硬拆。",
-            "勘察点到为止，只读到能确定落点为止：先用列目录和检索定位需求涉及的目录与入口文件，确有必要再打开具体实现，"
-            "读到能说清「改哪个文件、哪个接口、哪张表」就停；不要通读整个模块、不要逐个文件展开、同一份文件不要重复读，"
-            "也不要为了凑上下文把大段源码搬进回复——引用代码时只贴关键几行并给出路径和行号。"
-            "剩下的预算留给拆解本身；确实还缺关键事实时，直接向用户提问，比继续翻代码更省。",
-            "续聊时不要重复首轮已经做过的勘察：结论沿用本会话已经确认的那些，只补真正还没看过的部分。",
-            "请与用户对话把需求问清楚，然后输出一份可评审的拆解预览：先用 Markdown 表格列出「序号 / 任务标题 / 收益标签 / 负责人 / 里程碑 / 模块 / 类型 / 前置依赖」，每项给 1-3 个简短收益或作用标签；负责人统一展示为该需求的第一位主负责人（未指定则标为未指派）；再在表格下方逐条给出完整任务说明，格式和详细程度与实际写入面板的任务说明一致，让用户在确认前就能看到执行器将拿到的原文。",
+            *PLANNING_SURVEY_LINES,
+            "先把此前聊清楚的需求收拢成结论，再输出一份可评审的拆解预览：先用 Markdown 表格列出「序号 / 任务标题 / 收益标签 / 负责人 / 里程碑 / 模块 / 类型 / 前置依赖」，每项给 1-3 个简短收益或作用标签；负责人统一展示为该需求的第一位主负责人（未指定则标为未指派）；再在表格下方逐条给出完整任务说明，格式和详细程度与实际写入面板的任务说明一致，让用户在确认前就能看到执行器将拿到的原文。",
             *TASK_DESCRIPTION_RULE_LINES,
             "里程碑、模块、类型的取值只能来自下方给出的现有选项；预览里也要说明哪些是新建、哪些复用本需求已有任务。",
             "本需求已有任务列表在下方给出：预览里只列本轮打算新增的任务，不要重复已经存在的任务。",
             "回复结尾提示用户：确认无误后点击输入框旁的「确认并写入」按钮，需要调整就直接回复修改意见，本轮继续讨论不会写入任何数据。",
         ]
+        if not discussion
+        else planning_discussion_lines()
     )
     # 关掉「拆解成多条任务」时，整条需求只落一条任务：改动本来就不可分的小需求，拆开只会平添依赖和空跑。
     split_tasks = bool(requirement.get("splitTasks", True))
@@ -387,6 +480,11 @@ def build_planning_prompt(
             if pre_generate_task_documents else []
         )
     )
+    # 沟通轮不带任何拆解设置：这三段都是「怎么拆」的约束，需求还没聊清楚时提它们只会催着出方案。
+    if discussion:
+        split_lines = []
+        prototype_lines = []
+        task_document_lines = []
     # 正式大纲只在确认轮更新；预览轮由插件安装目录里的聊天级 temp.md 接续上下文。
     outline_path = requirement_outline_path_of(requirement_key).as_posix() if requirement_key else ""
     outline_lines = requirement_outline_rule_lines(outline_path, write_allowed, temp_path)
@@ -448,9 +546,11 @@ def build_planning_prompt(
         workspace_instruction(workspace),
         f"需求键 requirement_key: {requirement_key or '未指定'}",
         f"任务起始阶段 phase: {requirement.get('startPhase') or 'requirement'}",
-        f"拆解成多条任务: {'是' if split_tasks else '否（只建一条任务）'}",
-        f"预生成任务需求文档: {'是（单任务模式强制写入）' if not split_tasks else '是' if task_document_required else '否（由任务梳理阶段创建）'}",
-        f"拆解后生成原型图: {'是' if prototype_enabled else '否'}",
+        *([] if discussion else [
+            f"拆解成多条任务: {'是' if split_tasks else '否（只建一条任务）'}",
+            f"预生成任务需求文档: {'是（单任务模式强制写入）' if not split_tasks else '是' if task_document_required else '否（由任务梳理阶段创建）'}",
+            f"拆解后生成原型图: {'是' if prototype_enabled else '否'}",
+        ]),
         f"需求名称: {requirement.get('name') or '未命名'}",
         f"主负责人: {requirement.get('owners') or '未指定'}",
         f"辅助人: {requirement.get('assistants') or '未指定'}",
@@ -509,8 +609,11 @@ def build_planning_follow_up_prompt(
     include_detail: bool = False,
     thread_id: str = "",
     known_item_keys: list[str] | None = None,
+    mode: str = PLANNING_MODE_BREAKDOWN,
 ) -> str:
-    """同一条需求拆解会话的追加回合，只带会变的和丢不起的那几项。
+    """同一条需求聊天的追加回合，只带会变的和丢不起的那几项。
+
+    `mode=discussion` 时这一轮仍然只聊需求：不重发拆解契约，也不要求增量预览。
 
     首轮的角色说明、勘察纪律、文档目录纪律和现有里程碑/模块明细不再逐轮重发；这里保留三类：
     随轮次变化的（已选里程碑/模块、改动过的需求正文、本轮 @ 的实体）、
@@ -572,12 +675,13 @@ def build_planning_follow_up_prompt(
             f"若上下文里已经找不到，就去读 `{temp_path.as_posix()}` 里的上一轮总结。",
         ]
     )
+    # 沟通轮不提原型任务：它是任务表里的一行，属于拆解契约。
     prototype_lines = (
         [
             "本需求已启用“拆解后生成原型图”：预览的任务表最后必须固定列出一条“生成需求原型图”任务，"
             "并说明它依赖本轮其余任务。",
         ]
-        if bool(requirement.get("generatePrototype")) else []
+        if bool(requirement.get("generatePrototype")) and mode != PLANNING_MODE_DISCUSSION else []
     )
     document_lines = (
         [
@@ -586,7 +690,20 @@ def build_planning_follow_up_prompt(
         ]
         if document_directory else []
     )
-    lines = [
+    discussion = mode == PLANNING_MODE_DISCUSSION
+    mode_lines = [
+        "这是同一条需求沟通会话的追加回合：本轮仍然只聊需求，"
+        "禁止执行 create-task-board-tasks、create-task-board-stage、create-task-board-module，也不要绕过任务面板写入限制；"
+        "用户没提之前不要输出任务表、执行层或依赖图。",
+        "首轮已经交代过角色、勘察纪律和沟通方式，这里不再重复，按本会话已确认的约定继续。",
+        "勘察也不要从头再来：首轮已经看过的目录和文件不用重读，结论直接沿用，只补这一轮真正还缺的那部分事实。",
+        "接着上一轮的结论往下聊：已经聊清楚的部分不要再复述一遍，只处理用户本轮提出的这部分，"
+        "并说清它对需求范围、技术落点或验收口径的影响；还需要用户定的，一次问最关键的 1-3 个。",
+        f"需求的目标、范围边界、真实落点和验收口径都已经清楚时，在回复末尾主动问一句："
+        f"「{BREAKDOWN_INVITE_QUESTION}」——这句按原文写；还没到这一步就继续把缺的部分补齐。",
+        f"用户本轮已经明确要求拆解、或者接住了上一轮这句引导，就读 {PLANNING_SKILL} 技能的 `references/任务拆解与写入.md`，"
+        "按其中的规则给出可评审的拆解预览，并在结尾提示用户点「确认并写入」。",
+    ] if discussion else [
         "这是同一条需求拆解会话的追加回合：需求和梳理模式都没有变化，本轮仍然只做梳理和预览，"
         "禁止执行 create-task-board-tasks、create-task-board-stage、create-task-board-module，也不要绕过任务面板写入限制。",
         "首轮已经交代过角色、技能、勘察纪律和输出格式，这里不再重复，按本会话已确认的约定继续；"
@@ -599,14 +716,19 @@ def build_planning_follow_up_prompt(
         "表格下方也只给这几条的完整任务说明，详细程度与首轮一致（目标、真实落点、改动分条、边界、依赖与输入、验收标准）。",
         "没有改动的任务用一行「其余 N 条不变」带过，不要重复它们的标题、说明或表格行；"
         "被删掉的任务单独用一行写清楚。用户明确要求「再给一份完整预览」时才整份重印。",
-        "最新的完整方案 = 首轮全量预览 + 后续各轮增量，桥接器已经把它们逐轮存进本聊天窗口的过程总结文件，"
+        "最新的完整方案 = 开始拆解那一轮的全量预览 + 后续各轮增量，桥接器已经把它们逐轮存进本聊天窗口的过程总结文件，"
         "确认写入那一轮会据此合并，所以这里不必为了留档而重复。",
         "回复结尾照旧提示用户：确认无误后点「确认并写入」，要调整就直接回复修改意见。",
+    ]
+    lines = [
+        *mode_lines,
         workspace_instruction(workspace),
         f"项目 program_id: {program_id}",
         f"需求键 requirement_key: {requirement_key or '未指定'}",
         f"需求名称: {requirement.get('name') or '未命名'}",
-        f"拆解成多条任务: {'是' if split_tasks else '否（预览里只输出一条覆盖整条需求的任务，不要拆分也不要串依赖）'}",
+        *([] if discussion else [
+            f"拆解成多条任务: {'是' if split_tasks else '否（预览里只输出一条覆盖整条需求的任务，不要拆分也不要串依赖）'}",
+        ]),
         *requirement_outline_rule_lines(outline_path, False, temp_path.as_posix() if temp_path else ""),
         *document_lines,
         *prototype_lines,
@@ -619,7 +741,9 @@ def build_planning_follow_up_prompt(
         *(mention_context or []),
         *item_lines,
         REQUIREMENT_SCOPE_RULE,
-        "预览里只列本轮打算新增的任务，不要重复上面已经存在的任务。",
+        "上面列的是本需求已经建好的任务：聊需求时可以据此说明哪些工作已经排过，不要重复提议。"
+        if discussion
+        else "预览里只列本轮打算新增的任务，不要重复上面已经存在的任务。",
         (
             f"本会话如果被压缩过，上面提到的需求背景和既往结论你在上下文里可能已经找不到："
             f"先读 `{temp_path.as_posix()}` 把上下文接回来再动手，不要凭印象往下接。"

@@ -83,12 +83,14 @@ def build_requirement_testing_prompt(
     ]
     mode_lines = (
         [
-            "这是交付任务面板的一次需求级「预先生成测试用例」回合。遵循 delivery-requirement-testing 技能的测试用例设计模式。",
+            "这是交付任务面板的一次需求级「预先生成测试用例」回合。遵循 delivery-requirement-testing 技能，"
+            "本轮读它的 `references/用例设计模式.md`；`references/执行验收模式.md` 这一轮用不上，不要读。",
             "本回合只能读取需求、关联任务、代码和既有产物，设计范围、准备、顺序、步骤、预期及证据；绝不调用接口、UI、脚本或构建命令执行真实测试。",
             "不得输出验收判定、不得创建或覆盖测试报告、不得修改业务实现。",
         ]
         if test_case_only else [
-            "这是交付任务面板的一次需求总体测试。遵循 delivery-requirement-testing 技能执行真实测试，不要执行任务拆解命令或修改业务实现。",
+            "这是交付任务面板的一次需求总体测试。遵循 delivery-requirement-testing 技能并读它的 `references/执行验收模式.md`"
+            "（`references/用例设计模式.md` 这一轮用不上，不要读），执行真实测试，不要执行任务拆解命令或修改业务实现。",
             "先读取已有 doc/test/<需求键>/测试用例.md 并按其中用例真实验证；没有明确执行和证据，不得写通过。",
         ]
     )

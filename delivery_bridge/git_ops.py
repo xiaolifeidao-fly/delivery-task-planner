@@ -1354,7 +1354,7 @@ def build_git_merge_repair_prompt(
     """合并冲突时交给 AI 的提示词。只授权它解决这一次合并的冲突，不允许顺手改别的实现。"""
     return wrap_bridge_context(
         [
-            "这是交付任务面板的「时间计划分支合并」回合：面板执行 git merge 时遇到冲突，"
+            "这是交付任务面板的「分支合并」回合（时间计划或需求分支都走这里）：面板执行 git merge 时遇到冲突，"
             "仓库现在停在冲突状态，请你在本机把冲突解决掉并完成这次合并提交。",
             workspace_instruction(workspace),
             f"目标分支（当前所在分支）: {target}",

@@ -29,6 +29,18 @@ assert SPEC.loader is not None
 SPEC.loader.exec_module(bridge)
 
 
+PLANNER_SKILL_DIR = PLUGIN_ROOT / "skills" / "delivery-task-planner"
+
+
+def planner_skill_text(name: str) -> str:
+    """读技能正文。
+
+    提示词和技能正文不再重复同一条规则：随轮次变的（模式、权限、路径、开关）在提示词里，
+    不随轮次变的行为规范在技能里。所以这类用例要盯两头——提示词指对了路，正文也还在。
+    """
+    return (PLANNER_SKILL_DIR / name).read_text(encoding="utf-8")
+
+
 class HttpBridgeTest(unittest.TestCase):
     def stub_claude_help(self, flags: set[str] | None = None) -> None:
         """固定住 CLI 能力探测：用例不该去问本机真装了哪个版本的 claude。"""
@@ -469,6 +481,68 @@ class HttpBridgeTest(unittest.TestCase):
         self.assertIn("不得借精简遗漏已确认的非目标、兼容性要求", confirmed)
         self.assertNotIn("`temp.md` 只是候选材料，禁止整段复制", preview)
 
+    def test_planning_first_round_talks_the_requirement_through_before_planning(self):
+        """需求刚起头时用户还在补背景：这一轮的提示词里不该有任何拆解契约。"""
+        discussion = bridge.build_planning_prompt(
+            1, {"program": {}}, "我想做一个审核台",
+            requirement={"requirementKey": "req-a", "generatePrototype": True, "preGenerateTaskDocuments": True},
+            mode=bridge.PLANNING_MODE_DISCUSSION,
+        )
+
+        self.assertIn("和用户一起把这条需求聊清楚", discussion)
+        self.assertIn(bridge.BREAKDOWN_INVITE_QUESTION, discussion)
+        self.assertIn("禁止执行 create-task-board-tasks", discussion)
+        # 拆解契约、任务说明格式和拆解设置都不出现，免得执行器把「先出方案」当成本轮目标。
+        self.assertNotIn("序号 / 任务标题 / 收益标签", discussion)
+        self.assertNotIn("每条任务说明至少交代六件事", discussion)
+        self.assertNotIn("确认并写入」按钮", discussion)
+        self.assertNotIn("拆解成多条任务:", discussion)
+        self.assertNotIn("拆解后生成原型图:", discussion)
+        self.assertNotIn("预生成任务需求文档", discussion)
+
+    def test_planning_breakdown_round_carries_the_full_contract(self):
+        breakdown = bridge.build_planning_prompt(
+            1, {"program": {}}, "可以拆解了", requirement={"requirementKey": "req-a"},
+            mode=bridge.PLANNING_MODE_BREAKDOWN,
+        )
+
+        self.assertIn("序号 / 任务标题 / 收益标签", breakdown)
+        # 六段式任务说明的正文只在技能里写一份，提示词负责把执行器指过去。
+        self.assertIn("references/任务拆解与写入.md", breakdown)
+        self.assertIn("每条描述至少交代六件事", planner_skill_text("references/任务拆解与写入.md"))
+        # 关键词误判也要兜住：用户其实只是在补需求时，这一轮不能硬凑一份任务表。
+        self.assertIn("不要硬凑一份任务表出来", breakdown)
+
+    def test_planning_round_mode_enters_breakdown_only_when_it_is_asked_for(self):
+        mode = bridge.planning_round_mode
+        self.assertEqual(bridge.PLANNING_MODE_DISCUSSION, mode("这个审核台还要支持批量驳回"))
+        self.assertEqual(bridge.PLANNING_MODE_BREAKDOWN, mode("帮我拆解一下"))
+        self.assertEqual(bridge.PLANNING_MODE_BREAKDOWN, mode("生成任务吧"))
+        # 确认写入必然是拆解轮；进过拆解态之后不再退回沟通态。
+        self.assertEqual(bridge.PLANNING_MODE_BREAKDOWN, mode("好", confirm_write=True))
+        self.assertEqual(
+            bridge.PLANNING_MODE_BREAKDOWN,
+            mode("再补一条", previous_mode=bridge.PLANNING_MODE_BREAKDOWN),
+        )
+        # 模型问过「要不要开始拆」之后，一句「好的」才算接住引导。
+        self.assertEqual(bridge.PLANNING_MODE_DISCUSSION, mode("好的"))
+        self.assertEqual(bridge.PLANNING_MODE_BREAKDOWN, mode("好的", invited=True))
+        self.assertEqual(bridge.PLANNING_MODE_DISCUSSION, mode("可以先不管权限这块", invited=True))
+        self.assertTrue(bridge.planning_invite_offered(f"...\n{bridge.BREAKDOWN_INVITE_QUESTION}"))
+        self.assertFalse(bridge.planning_invite_offered("需求我理解了，还有两个问题"))
+
+    def test_planning_follow_up_prompt_keeps_talking_while_in_discussion_mode(self):
+        follow_up = bridge.build_planning_follow_up_prompt(
+            1, {"program": {}}, "再补充一点背景", requirement={"requirementKey": "req-a"},
+            thread_id="thread-1", mode=bridge.PLANNING_MODE_DISCUSSION,
+        )
+
+        self.assertIn("本轮仍然只聊需求", follow_up)
+        self.assertIn(bridge.BREAKDOWN_INVITE_QUESTION, follow_up)
+        self.assertNotIn("输出增量，不要重印整份预览", follow_up)
+        self.assertNotIn("确认无误后点「确认并写入」", follow_up)
+        self.assertNotIn("拆解成多条任务:", follow_up)
+
     def test_requirement_document_directory_is_scoped_to_the_requirement(self):
         self.assertEqual(
             Path("doc/requirements/req-a"),
@@ -552,7 +626,7 @@ class HttpBridgeTest(unittest.TestCase):
 
         self.assertIn("输出增量，不要重印整份预览", follow_up)
         self.assertIn("其余 N 条不变", follow_up)
-        self.assertIn("首轮全量预览 + 后续各轮增量", follow_up)
+        self.assertIn("开始拆解那一轮的全量预览 + 后续各轮增量", follow_up)
         self.assertIn("确认无误后点「确认并写入」", follow_up)
         self.assertNotIn("输出格式沿用首轮", follow_up)
 
@@ -596,9 +670,12 @@ class HttpBridgeTest(unittest.TestCase):
         """勘察是首轮最容易失控的一段：不封边界就会把整个模块通读一遍。"""
         preview = bridge.build_planning_prompt(1, {"program": {}}, "拆一下", requirement={"requirementKey": "req-a"})
 
-        self.assertIn("勘察点到为止", preview)
-        self.assertIn("不要通读整个模块", preview)
-        self.assertIn("只贴关键几行并给出路径和行号", preview)
+        # 勘察纪律的正文在 SKILL.md 第 3 节（每轮都会加载），提示词只负责点名它。
+        self.assertIn("SKILL.md 第 3 节「勘察工作区现状」", preview)
+        skill = planner_skill_text("SKILL.md")
+        self.assertIn("勘察点到为止", skill)
+        self.assertIn("不要通读整个模块", skill)
+        self.assertIn("只贴关键几行并给出路径和行号", skill)
 
     def test_planning_confirm_prompt_merges_the_incremental_preview(self):
         confirmed = bridge.build_planning_prompt(
@@ -606,7 +683,7 @@ class HttpBridgeTest(unittest.TestCase):
             write_allowed=True, thread_id="thread-1",
         )
 
-        self.assertIn("首轮给完整方案，之后每轮只给增量", confirmed)
+        self.assertIn("开始拆解那一轮给完整方案，之后每轮只给增量", confirmed)
         self.assertIn("不要凭最后一轮的增量反推整份方案", confirmed)
 
     def test_planning_follow_up_prompt_resends_the_detail_only_after_it_changes(self):
@@ -1366,6 +1443,64 @@ class HttpBridgeTest(unittest.TestCase):
         self.assertEqual("write", environments[1][bridge.planner.RUNTIME_WRITE_MODE_ENV])
         # 面板上下文整段裹在标记里，聊天记录只回显用户自己输入的那句。
         self.assertEqual("拆解这个需求", bridge.text_without_attachment_context(preview_prompt))
+
+    def test_planning_talks_first_and_only_plans_once_the_user_asks(self):
+        """需求聊天是引导式的：首轮只沟通，用户开口要拆才发拆解契约，也才允许确认写入。"""
+        executor = bridge.ExecutionBridge(Path.cwd())
+        client = unittest.mock.MagicMock()
+        client.start_task.return_value = ("thread-1", "turn-1")
+        client.start_turn.return_value = "turn-2"
+        context = {"program": {"programId": 2, "name": "项目 2"}, "items": [], "stages": [], "modules": []}
+        config = {"api_url": "http://test/api", "key": "k", "_project_id": 2}
+        payload = {"programId": 2, "message": "我想做一个审核台", "newConversation": True, "requirementKey": "req-a"}
+        planning_sessions = []
+
+        def request_api(_config, method, path, query=None, body=None):
+            if method == "GET" and path == "/delivery/requirement/planning-sessions":
+                return list(planning_sessions)
+            if method == "POST" and path == "/delivery/requirement/planning-session/bind":
+                row = {
+                    "threadId": body["threadId"],
+                    "title": body["title"],
+                    "status": body["status"],
+                    "metadata": body["metadata"],
+                }
+                planning_sessions[:] = [entry for entry in planning_sessions if entry["threadId"] != row["threadId"]]
+                planning_sessions.append(row)
+                return None
+            self.fail(f"unexpected request: {method} {path}")
+
+        def release():
+            with executor.lock:
+                executor.active_runs.clear()
+                executor.active.clear()
+
+        with (
+            patch.object(bridge.planner, "project_context", return_value=context),
+            patch.object(bridge.planner, "request_api", side_effect=request_api),
+            patch.object(bridge.factory, "create_ai_client", return_value=client),
+            patch.object(bridge.threading, "Thread"),
+        ):
+            executor.send_planning(payload, config)
+            release()
+            discussion_prompt = client.start_task.call_args[0][1]
+            first_round_mode = planning_sessions[0]["metadata"]["planningMode"]
+            # 还在沟通阶段就点确认：没有可写的方案，直接拦下。
+            with self.assertRaisesRegex(bridge.BridgeFailure, "请先梳理需求并生成拆解预览"):
+                executor.send_planning(
+                    {**payload, "message": "确认", "newConversation": False, "confirmWrite": True}, config,
+                )
+            executor.send_planning({**payload, "message": "帮我拆解一下", "newConversation": False}, config)
+            release()
+
+        breakdown_prompt = client.start_turn.call_args[0][1]
+        self.assertIn("和用户一起把这条需求聊清楚", discussion_prompt)
+        self.assertNotIn("序号 / 任务标题 / 收益标签", discussion_prompt)
+        self.assertEqual(bridge.PLANNING_MODE_DISCUSSION, first_round_mode)
+        self.assertEqual(bridge.PLANNING_MODE_BREAKDOWN, planning_sessions[0]["metadata"]["planningMode"])
+        # 从沟通转进拆解的那一轮要给全量契约：此前一轮都没发过，增量续聊无从增起。
+        self.assertIn("序号 / 任务标题 / 收益标签", breakdown_prompt)
+        self.assertNotIn("输出增量，不要重印整份预览", breakdown_prompt)
 
     def test_planning_lists_and_reads_chats_left_by_the_other_tool(self):
         """换工具不该让聊天记录消失：目录跨执行器列全，正文按线程自己的执行器读。"""
@@ -4330,7 +4465,8 @@ class HttpBridgeTest(unittest.TestCase):
         )
 
         self.assertIn("动作执行阶段的兜底需求输入", prompt)
-        self.assertIn("300-1500 字", prompt)
+        self.assertIn("references/任务拆解与写入.md", prompt)
+        self.assertIn("300–1500 字", planner_skill_text("references/任务拆解与写入.md"))
 
     def test_task_prompt_asks_batch_items_to_hand_over_code_facts(self):
         prompt = bridge.build_task_prompt(

@@ -232,9 +232,10 @@ class GitMixin:
         }, *children]
 
     def merge_time_plan_branches(self, raw: Any, config: dict[str, Any] | None = None) -> dict[str, Any]:
-        """时间计划的分支合并：把若干来源分支合进目标分支，冲突交给 AI 解，最后推送。
+        """分支合并：把若干来源分支合进目标分支，冲突交给 AI 解，最后推送。
 
-        三个方向（回合基线 / 合并需求分支 / 回推基线）都走这里，只是 target 和 sources 不同。
+        时间计划的三个方向（回合基线 / 合并需求分支 / 回推基线）和需求窗口的「合并到分支」
+        都走这里，只是 target 和 sources 不同。
         执行顺序是「先子项目、最后根工作目录」：子模组的新提交在根仓库里表现为 gitlink，
         根仓库最后推才能把指针一并带上。单个工程失败只记在结果里，不回滚已经合好的工程 ——
         把已完成的部分撤掉比留着更难收拾。
@@ -260,7 +261,7 @@ class GitMixin:
         with self.lock:
             busy = sorted(key for _, _, key in self.active)
         if busy:
-            raise BridgeFailure(f"本机仍有任务在执行（{', '.join(busy)}），不能合并计划分支")
+            raise BridgeFailure(f"本机仍有任务在执行（{', '.join(busy)}），不能合并分支")
         # 勾选哪些子项目由合并弹窗说了算，不做「没传就全合」的猜测。
         targets = git_subproject_targets_of(self.workspace, raw.get("targets") or [])
         skip_root = bool(raw.get("skipRoot"))

@@ -79,7 +79,9 @@ def build_task_prompt(payload: dict[str, Any], workspace: Path | None = None) ->
             "再按当前项目的开发技能实现并交付产物。"
         ),
         "testing": (
-            f"本次只进行成品测试：遵循 {PHASE_SKILLS['testing']} 技能，按上面给出的阅读顺序取需求（{document_source}），"
+            f"本次只进行成品测试：遵循 {PHASE_SKILLS['testing']} 技能并读它的 `references/执行验收模式.md`"
+            "（本轮是执行验收模式，`references/用例设计模式.md` 用不上，不要读），"
+            f"按上面给出的阅读顺序取需求（{document_source}），"
             f"再读取已有 `{test_artifact_directory / '测试用例.md'}`（不存在时说明缺口并补充最小用例），"
             "先准备环境、账号、鉴权和测试数据，再按代码与业务依赖编排实测；"
             f"验证命令沿用当前项目开发技能里的约定；所有测试资产必须写入 `{test_artifact_directory}/`，该目录支持多份文档；"
@@ -198,7 +200,8 @@ def build_task_testing_cases_prompt(
         )
     return wrap_bridge_context(
         [
-            "这是交付任务面板的「预先生成测试用例」回合。遵循 delivery-testing-report 技能的测试用例设计模式。",
+            "这是交付任务面板的「预先生成测试用例」回合。遵循 delivery-testing-report 技能，"
+            "本轮读它的 `references/用例设计模式.md`；`references/执行验收模式.md` 这一轮用不上，不要读。",
             "本回合只读取需求、关联任务、代码和已有产物，设计测试范围、输入数据、依赖顺序、步骤、预期和证据。",
             "绝不调用接口、UI、脚本或构建命令执行真实测试；不得输出验收判定、不得创建测试报告、不得修改业务实现或任务状态。",
             workspace_instruction(workspace),

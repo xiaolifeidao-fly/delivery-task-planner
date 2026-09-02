@@ -31,10 +31,14 @@ from delivery_bridge.prompt_context import with_mention_context
 from delivery_bridge.prompts.common import requirement_document_rule_lines
 from delivery_bridge.prompts.conversation import CONVERSATION_TITLE_TIMEOUT_SECONDS
 from delivery_bridge.prompts.planning import (
+    PLANNING_MODE_BREAKDOWN,
+    PLANNING_MODE_DISCUSSION,
     build_planning_follow_up_prompt,
     build_planning_prompt,
     delete_planning_temp_summary,
     planning_detail_digest,
+    planning_invite_offered,
+    planning_round_mode,
     planning_temp_document_path,
     requirement_item_keys,
     requirement_outline_rule_lines,
@@ -144,6 +148,10 @@ class PlanningMixin:
             "detailDigest": str(metadata.get("detailDigest") or ""),
             # 这条线程此前轮次已经列进提示词的任务键：续聊只补增量，整份清单留在会话历史里。
             "sentItemKeys": [str(key) for key in metadata.get("sentItemKeys") or [] if str(key)],
+            # 这条线程聊到哪一步了。本改动之前建的会话没有这个字段，按拆解态处理：
+            # 它们的历史回合里已经出过预览，退回沟通态反而会把上下文对不上。
+            "planningMode": str(metadata.get("planningMode") or PLANNING_MODE_BREAKDOWN),
+            "planningInvited": bool(metadata.get("planningInvited")),
             "requirementKey": requirement_key,
             "baseline": {name: set(baseline.get(name) or []) for name in ("items", "stages", "modules")},
             "result": metadata.get("result") if isinstance(metadata.get("result"), dict) else {},
@@ -176,6 +184,8 @@ class PlanningMixin:
             "kind": str(session.get("kind") or ""),
             "detailDigest": str(session.get("detailDigest") or ""),
             "sentItemKeys": [str(key) for key in session.get("sentItemKeys") or [] if str(key)],
+            "planningMode": str(session.get("planningMode") or PLANNING_MODE_BREAKDOWN),
+            "planningInvited": bool(session.get("planningInvited")),
             "baseline": {name: sorted(values) for name, values in (session.get("baseline") or {}).items()},
             "result": result,
         }
@@ -251,6 +261,7 @@ class PlanningMixin:
                 "selectedStageKey": "",
                 "selectedModuleKey": "",
                 "selectedKind": "",
+                "planningMode": "",
                 "result": {"items": [], "stages": [], "modules": [], "itemKeys": [], "stageKeys": [], "moduleKeys": [], "updatedAt": ""},
             }
         thread_entry = next((entry for entry in catalog if str(entry.get("threadId")) == thread_id), {})
@@ -289,6 +300,8 @@ class PlanningMixin:
             "selectedStageKey": str((session or {}).get("stageKey") or ""),
             "selectedModuleKey": str((session or {}).get("moduleKey") or ""),
             "selectedKind": str((session or {}).get("kind") or ""),
+            # 这条会话聊到哪一步了：还在沟通态时面板不放行「确认并写入」。
+            "planningMode": str((session or {}).get("planningMode") or ""),
             "result": dict((session or {}).get("result") or {}),
         })
 
@@ -363,6 +376,17 @@ class PlanningMixin:
         started_new_conversation = not session or new_conversation or not session.get("threadId")
         # 这条需求此前一次拆解会话都没有：不管是新增还是编辑进来的，首轮都按用户的问题重定标题。
         first_planning_conversation = started_new_conversation and not catalog
+        # 需求聊天默认先把需求聊清楚：用户自己开口要拆、接住上一轮的引导，或者点了「确认并写入」，才进拆解态。
+        previous_mode = "" if started_new_conversation else str((session or {}).get("planningMode") or "")
+        round_mode = planning_round_mode(
+            message,
+            confirm_write=confirm_write,
+            previous_mode=previous_mode,
+            invited=not started_new_conversation and bool((session or {}).get("planningInvited")),
+        )
+        # 还停在沟通阶段的会话没有可确认的方案：面板上的确认按钮不该把一段对话直接写成任务。
+        if confirm_write and previous_mode == PLANNING_MODE_DISCUSSION:
+            raise BridgeFailure("请先梳理需求并生成拆解预览，再确认写入")
         if started_new_conversation:
             # 一条新会话还没出过预览，没有可确认的方案。
             if confirm_write:
@@ -385,7 +409,10 @@ class PlanningMixin:
                 thread_id, turn_id = client.start_task(
                     title,
                     message_with_attachments(
-                        build_planning_prompt(program_id, context, message, selected_stage, selected_module, selected_kind, requirement, False, self.workspace, mention_context),
+                        build_planning_prompt(
+                            program_id, context, message, selected_stage, selected_module, selected_kind,
+                            requirement, False, self.workspace, mention_context, mode=round_mode,
+                        ),
                         attachments,
                     ),
                     attachments,
@@ -405,6 +432,8 @@ class PlanningMixin:
                 "kind": selected_kind,
                 "requirementKey": requirement_key,
                 "detailDigest": planning_detail_digest(requirement),
+                "planningMode": round_mode,
+                "planningInvited": False,
                 # 首轮提示词里列了整份任务清单，后面几轮据此只补增量。
                 "sentItemKeys": requirement_item_keys(context, requirement_key),
                 "baseline": baseline,
@@ -431,18 +460,25 @@ class PlanningMixin:
                 # 追加回合不重发首轮那整段拆解纪律，只带会变的和丢不起的：本需求已建任务清单
                 # （「不要重复建任务」这条约束正是靠它成立，会话被压缩后必须还在）、大纲读写纪律、
                 # 本轮的选择与 @ 引用。确认写入是另一套指令（写入契约、命令行动作），仍然走全量。
+                # 这条线程刚从沟通态转进拆解态：拆解契约此前一轮都没发过，这一轮要给全量，
+                # 增量续聊的那套（「只列新增或改动的行」）此时还没有可增量的基线。
+                entering_breakdown = (
+                    round_mode == PLANNING_MODE_BREAKDOWN and previous_mode != PLANNING_MODE_BREAKDOWN
+                )
                 follow_up_prompt = (
                     build_planning_prompt(
                         program_id, context, message, selected_stage, selected_module, selected_kind,
-                        requirement, True, self.workspace, mention_context, thread_id,
+                        requirement, confirm_write, self.workspace, mention_context, thread_id,
+                        mode=PLANNING_MODE_BREAKDOWN,
                     )
-                    if confirm_write
+                    if confirm_write or entering_breakdown
                     else build_planning_follow_up_prompt(
                         program_id, context, message, selected_stage, selected_module, selected_kind, requirement,
                         self.workspace, mention_context,
                         include_detail=detail_digest != str(session.get("detailDigest") or ""),
                         thread_id=thread_id,
                         known_item_keys=list(session.get("sentItemKeys") or []),
+                        mode=round_mode,
                     )
                 )
                 turn_id = client.start_turn(
@@ -460,7 +496,7 @@ class PlanningMixin:
             # 本轮列进提示词的任务键并进来：下一轮从这里算增量。确认写入轮走的是全量提示词，
             # 同样以本轮的清单为准。
             session["sentItemKeys"] = requirement_item_keys(context, requirement_key)
-            session.update({"threadId": thread_id, "turnId": turn_id, "detailDigest": detail_digest, "stageKey": selected_stage or session.get("stageKey") or "", "moduleKey": selected_module or session.get("moduleKey") or "", "kind": selected_kind or session.get("kind") or ""})
+            session.update({"threadId": thread_id, "turnId": turn_id, "detailDigest": detail_digest, "planningMode": round_mode, "stageKey": selected_stage or session.get("stageKey") or "", "moduleKey": selected_module or session.get("moduleKey") or "", "kind": selected_kind or session.get("kind") or ""})
             for entry in session.get("catalog") or []:
                 if entry.get("threadId") == thread_id:
                     entry["status"] = "running"
@@ -483,8 +519,16 @@ class PlanningMixin:
         self.progress.publish(
             identity,
             "status",
-            "正在写入任务" if confirm_write else "正在梳理需求",
-            f"{provider_label(provider)} 正在{'调用任务规划插件写入任务' if confirm_write else '整理拆解预览，确认前不会写入任务'}。",
+            "正在写入任务" if confirm_write else "正在梳理需求" if round_mode == PLANNING_MODE_BREAKDOWN else "正在沟通需求",
+            f"{provider_label(provider)} 正在"
+            + (
+                "调用任务规划插件写入任务"
+                if confirm_write
+                else "整理拆解预览，确认前不会写入任务"
+                if round_mode == PLANNING_MODE_BREAKDOWN
+                else "理解并核实需求，这一轮只聊需求，不会拆解或写入任务"
+            )
+            + "。",
             "running",
         )
         namer: threading.Thread | None = None
@@ -498,7 +542,7 @@ class PlanningMixin:
             target=self._follow_planning,
             args=(identity, client, config, program_id, requirement_key, provider, session, thread_id, turn_id,
                   model, reasoning_effort, fast_mode, message, started_new_conversation, confirm_write,
-                  namer, naming_outcome, first_planning_conversation),
+                  namer, naming_outcome, first_planning_conversation, round_mode),
             daemon=True,
         ).start()
         return {"accepted": True, "bizLine": biz_line, "programId": program_id, "requirementKey": requirement_key, "threadId": thread_id, "turnId": turn_id, "active": True}
@@ -545,6 +589,7 @@ class PlanningMixin:
         namer: threading.Thread | None = None,
         naming_outcome: dict[str, str] | None = None,
         first_conversation: bool = False,
+        round_mode: str = PLANNING_MODE_BREAKDOWN,
     ) -> None:
         status = "failed"
         try:
@@ -559,6 +604,9 @@ class PlanningMixin:
             if status == "completed":
                 turn = client.read_turn(thread_id, turn_id, client.next_request_id())
                 reply = final_agent_text_from_output(execution_output(status, turn))
+                # 沟通轮里模型问过「要不要开始拆」时记一笔：下一轮用户回一句「好」也能接住。
+                if round_mode == PLANNING_MODE_DISCUSSION:
+                    session["planningInvited"] = planning_invite_offered(reply)
             # 只有新开聊天的首回合才自动命名；后续追问不能覆盖用户已经识别出的会话标题。
             if started_new_conversation:
                 # 开聊时那轮命名一般早就回来了；万一还在跑，等它一下再决定要不要重命名。
