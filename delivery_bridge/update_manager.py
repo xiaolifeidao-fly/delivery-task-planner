@@ -15,6 +15,7 @@ import queue
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -168,29 +169,50 @@ class PluginUpdateManager:
             return ""
         return updated_at.isoformat().replace("+00:00", "Z")
 
+    def _resolve_head_commit(self) -> tuple[str, str, str]:
+        """Read the remote HEAD without letting the working directory interfere.
+
+        The bridge normally runs from the installed plugin directory, which can
+        still carry a ``.git`` file left over from a submodule checkout. Git then
+        aborts during repository discovery before it ever reaches the network, so
+        run from a scratch directory and keep the reason when it still fails —
+        a swallowed error here only resurfaces later as an unexplained install
+        failure.
+        """
+        environment = dict(os.environ)
+        environment["GIT_TERMINAL_PROMPT"] = "0"
+        try:
+            with tempfile.TemporaryDirectory(prefix="delivery-task-planner-ls-remote-") as scratch:
+                environment["GIT_CEILING_DIRECTORIES"] = str(Path(scratch).parent)
+                completed = subprocess.run(
+                    ["git", "ls-remote", "--symref", self.repository, "HEAD"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    cwd=scratch,
+                    env=environment,
+                )
+        except subprocess.CalledProcessError as exc:
+            detail = (exc.stderr or exc.stdout or "").strip().splitlines()
+            return "", "", detail[-1] if detail else f"git ls-remote 退出码 {exc.returncode}"
+        except subprocess.TimeoutExpired:
+            return "", "", "git ls-remote 超时（10 秒）"
+        except OSError as exc:
+            return "", "", f"无法执行 git 命令：{exc}"
+        branch_match = re.search(r"^ref:\s+refs/heads/(.+?)\s+HEAD$", completed.stdout, re.MULTILINE)
+        commit_match = re.search(r"^([0-9a-f]{40})\s+HEAD$", completed.stdout, re.MULTILINE)
+        branch = branch_match.group(1) if branch_match else ""
+        commit = commit_match.group(1) if commit_match else ""
+        return branch, commit, "" if commit else "git ls-remote 没有返回 HEAD 提交"
+
     def _resolve_remote(self, force: bool = False) -> dict[str, str]:
         now = time.monotonic()
         with self.lock:
             if not force and self.remote_cache and now - self.remote_cache[0] < self.cache_seconds:
                 return dict(self.remote_cache[1])
-        branch = "main"
-        commit = ""
-        try:
-            completed = subprocess.run(
-                ["git", "ls-remote", "--symref", self.repository, "HEAD"],
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            branch_match = re.search(r"^ref:\s+refs/heads/(.+?)\s+HEAD$", completed.stdout, re.MULTILINE)
-            commit_match = re.search(r"^([0-9a-f]{40})\s+HEAD$", completed.stdout, re.MULTILINE)
-            if branch_match:
-                branch = branch_match.group(1)
-            if commit_match:
-                commit = commit_match.group(1)
-        except (OSError, subprocess.SubprocessError):
-            pass
+        resolved_branch, commit, git_error = self._resolve_head_commit()
+        branch = resolved_branch or "main"
         revision = commit or branch
         manifest_url = f"{self.raw_base_url}/{quote(revision, safe='')}/.codex-plugin/plugin.json"
         request = Request(manifest_url, headers={"User-Agent": "delivery-task-planner-updater"})
@@ -202,7 +224,13 @@ class PluginUpdateManager:
         version = str(manifest.get("version") or "").strip() if isinstance(manifest, dict) else ""
         if not version:
             raise UpdateFailure("Git 仓库中的插件版本信息为空")
-        result = {"branch": branch, "commit": commit, "revision": revision, "version": version}
+        result = {
+            "branch": branch,
+            "commit": commit,
+            "revision": revision,
+            "version": version,
+            "gitError": git_error,
+        }
         with self.lock:
             self.remote_cache = (now, result)
         return dict(result)
@@ -360,7 +388,8 @@ class PluginUpdateManager:
         try:
             remote = self._resolve_remote(force=True)
             if not remote["commit"]:
-                raise UpdateFailure("无法锁定 GitHub 提交，请确认本机 Git 可用后重试")
+                reason = remote.get("gitError") or "未知原因"
+                raise UpdateFailure(f"无法锁定 GitHub 提交，请确认本机 Git 可用后重试：{reason}")
             if expected_version and compare_versions(remote["version"], expected_version) != 0:
                 raise UpdateFailure(f"远程版本已经变化：期望 {expected_version}，当前 {remote['version']}")
             if compare_versions(remote["version"], self.installed_version()) <= 0:
