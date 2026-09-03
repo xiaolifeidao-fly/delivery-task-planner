@@ -17,6 +17,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from .context_window import turn_context, turns_context
+
 USAGE_FIELDS = ("inputTokens", "cachedInputTokens", "outputTokens", "reasoningOutputTokens", "totalTokens")
 
 
@@ -81,6 +83,20 @@ def codex_usage_base(params: Any) -> dict[str, Any]:
     return {field: max(0, total[field] - last[field]) for field in USAGE_FIELDS} | {"costUsd": None}
 
 
+def codex_turn_context(params: Any, model: str = "") -> dict[str, Any]:
+    """同一条用量通知里还带着「现在占了多少上下文」。
+
+    ``last`` 是最近一次模型请求：Responses API 每次都要把整段对话重新送进去，
+    所以它的输入就是此刻的上下文，加上这次的输出就是下一次请求的起点。
+    窗口大小由 app-server 按当前模型给出（``modelContextWindow``），比查表准。
+    """
+    payload = params.get("tokenUsage") if isinstance(params, dict) else None
+    if not isinstance(payload, dict):
+        return turn_context(0, 0, "codex", model)
+    last = codex_usage_breakdown(payload.get("last"))
+    return turn_context(last["totalTokens"], payload.get("modelContextWindow"), "codex", model)
+
+
 def claude_turn_usage(event: Any) -> dict[str, Any]:
     """Claude 的 stream-json `result` 事件；它一条就是整轮的合计。"""
     if not isinstance(event, dict):
@@ -101,6 +117,44 @@ def claude_turn_usage(event: Any) -> dict[str, Any]:
         "totalTokens": input_tokens + output_tokens,
         "costUsd": float(cost) if isinstance(cost, (int, float)) and cost > 0 else None,
     }
+
+
+def claude_message_context(event: Any, window_tokens: Any = 0, model: str = "") -> dict[str, Any]:
+    """Claude 的 stream-json `assistant` 事件；一条就是一次模型请求。
+
+    这次请求的输入（新输入 + 写缓存 + 读缓存）就是此刻的上下文，加上它的输出
+    正好是下一次请求要带的量——和 Codex 侧的口径对齐。
+
+    子代理（Task）的消息带 ``parent_tool_use_id``，它跑在自己那份小上下文里，
+    算进来会让主会话的读数无缘无故掉下去，所以整条跳过。
+    """
+    if isinstance(event, dict) and event.get("parent_tool_use_id"):
+        return turn_context(0, window_tokens, "claude", model)
+    message = event.get("message") if isinstance(event, dict) else None
+    raw = message.get("usage") if isinstance(message, dict) and isinstance(message.get("usage"), dict) else {}
+    used = (
+        _int(raw.get("input_tokens"))
+        + _int(raw.get("cache_creation_input_tokens"))
+        + _int(raw.get("cache_read_input_tokens"))
+        + _int(raw.get("output_tokens"))
+    )
+    name = str((message or {}).get("model") or model or "")
+    return turn_context(used, window_tokens, "claude", name)
+
+
+def claude_context_window(event: Any, model: str = "") -> int:
+    """`result` 事件里 Claude 自己报的窗口大小，按模型分列，比查表准。
+
+    一轮里可能不止一个模型（子代理、起标题都会用小模型），所以按主模型取；
+    取不到就退回最大的那个——主模型的窗口不会比顺带用过的小模型更小。
+    """
+    usage = event.get("modelUsage") if isinstance(event, dict) else None
+    if not isinstance(usage, dict) or not usage:
+        return 0
+    entry = usage.get(model) if model else None
+    if isinstance(entry, dict) and _int(entry.get("contextWindow")):
+        return _int(entry["contextWindow"])
+    return max((_int(value.get("contextWindow")) for value in usage.values() if isinstance(value, dict)), default=0)
 
 
 def merge_usage(usages: Any) -> dict[str, Any]:
@@ -129,9 +183,10 @@ def turns_usage_total(turns: Any) -> dict[str, Any]:
 
 
 def with_usage(payload: dict[str, Any]) -> dict[str, Any]:
-    """给一份带 `turns` 的会话返回补上这条会话的用量合计。
+    """给一份带 `turns` 的会话返回补上这条会话的用量合计和当前上下文占用。
 
     面板每种会话（任务、需求拆解、需求原型、review、测试、微调）都有自己的返回结构，
-    但都带同一份 `turns`；合计只依赖它，所以统一在出口补，不必在每处重复写一遍。
+    但都带同一份 `turns`；两个数都只依赖它，所以统一在出口补，不必在每处重复写一遍。
     """
-    return {**payload, "usage": turns_usage_total(payload.get("turns"))}
+    turns = payload.get("turns")
+    return {**payload, "usage": turns_usage_total(turns), "context": turns_context(turns)}

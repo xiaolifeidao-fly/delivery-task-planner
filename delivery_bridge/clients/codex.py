@@ -211,6 +211,8 @@ class AppServerClient:
         if not thread_id:
             raise BridgeFailure("Codex 没有返回 thread id")
         self.thread_id = thread_id
+        # 用量通知里没有模型名，上下文读数要靠这一笔登记才署得上名。
+        THREAD_ITEMS.note_model(thread_id, model)
         self.send("thread/name/set", 2, {"threadId": thread_id, "name": title[:128]})
         self.wait_response(2)
         turn_params = {
@@ -264,6 +266,7 @@ class AppServerClient:
             "approvalPolicy": "never",
             "sandboxPolicy": {"type": "dangerFullAccess"},
         }
+        THREAD_ITEMS.note_model(thread_id, model)
         if model:
             params["model"] = model
         if reasoning_effort:

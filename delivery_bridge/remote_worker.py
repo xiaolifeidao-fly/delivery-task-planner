@@ -357,6 +357,7 @@ class RemoteCommandWorker:
         self._registered_identity: tuple[str, tuple[tuple[str, tuple[int, ...]], ...]] | None = None
         self.last_error = ""
         self.last_registered_at = 0
+        self._last_state = ""
 
     @staticmethod
     def _worker_id() -> str:
@@ -390,10 +391,28 @@ class RemoteCommandWorker:
             "lastRegisteredAt": self.last_registered_at,
         }
 
+    def _log_state(self, state: str, message: str) -> None:
+        """只在状态发生变化时打印，别把 15 秒一轮的空转刷成日志噪音。"""
+        if self._last_state == state:
+            return
+        self._last_state = state
+        print(message, flush=True)
+
     def stop(self) -> None:
         self.stop_event.set()
 
     def run_forever(self) -> None:
+        # 禁用和坏掉在日志里必须长得不一样。没有这一行时，一个漏配
+        # DELIVERY_COMMAND_API_URL 的 bridge 会安静地空转，面板上只剩一句
+        # 「未登记执行电脑」，日志里一条线索都没有。
+        if self.api_url:
+            print(f"远程命令 Worker 已启用：{self.api_url}（worker {self.worker_id}）", flush=True)
+        else:
+            print(
+                "远程命令 Worker 未启用：没有配置 DELIVERY_COMMAND_API_URL，也没有传 --command-api-url。"
+                "任务面板会一直显示「未登记执行电脑」，本机回环接口不受影响。",
+                flush=True,
+            )
         threading.Thread(target=self._read_forever, daemon=True, name="delivery-remote-worker-read").start()
         while not self.stop_event.is_set():
             try:
@@ -420,8 +439,12 @@ class RemoteCommandWorker:
         config = planner.load_config()
         mappings = self.mappings.snapshot()
         if not mappings:
+            # 同样别静默：没有映射时 Worker 一次心跳都不会发，面板上的表现和
+            # 插件没开完全一样，只有这行日志能把两者分开。
+            self._log_state("no-mappings", "远程命令 Worker 空转：本机还没有登记任何项目工作目录映射，不会注册也不会领命令。")
             self.stop_event.wait(WORKER_BACKOFF_SECONDS)
             return False
+        self._log_state("mapped", f"远程命令 Worker 已登记 {len(mappings)} 个项目工作目录映射。")
         api = CommandAPI(self.api_url)
         self._register(api, config, mappings)
         claim_body: dict[str, Any] = {"workerId": self.worker_id}

@@ -122,10 +122,25 @@ class RestartHelperTest(unittest.TestCase):
 
     def test_windows_service_arguments_preserve_workspace_and_origin(self):
         self.assertEqual(
-            ("C:\\work tree", "https://console.example"),
+            ("C:\\work tree", "https://console.example", ""),
             restart_helper.windows_service_arguments([
                 "--workspace", "C:\\work tree",
                 "--allow-origin=https://console.example",
+            ]),
+        )
+
+    def test_windows_service_arguments_preserve_command_api_url(self):
+        """重装丢掉这个参数，Worker 会在重启后静默禁用，日志里查不到原因。"""
+        self.assertEqual(
+            ("", "*", "http://app-api.example:10002"),
+            restart_helper.windows_service_arguments([
+                "--command-api-url", "http://app-api.example:10002",
+            ]),
+        )
+        self.assertEqual(
+            ("", "*", "http://app-api.example:10002"),
+            restart_helper.windows_service_arguments([
+                "--command-api-url=http://app-api.example:10002",
             ]),
         )
 

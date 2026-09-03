@@ -19,7 +19,7 @@ from typing import Any
 from .. import runtime
 from ..reasoning import reasoning_summary_text
 from ..timeutil import utc_now
-from ..token_usage import codex_turn_usage, codex_usage_base
+from ..token_usage import codex_turn_context, codex_turn_usage, codex_usage_base
 from ..turn_output import file_changes_of, text_from_user_item
 
 # 落盘目录按模块名取，测试改写运行时目录时这里跟着变。
@@ -67,6 +67,9 @@ class ThreadItemJournal:
         self.lock = threading.Lock()
         # item 事件不一定带 turnId，按线程记住当前回合，落到正确的那一轮上。
         self.current_turns: dict[str, str] = {}
+        # 用量通知里没有模型名，只有发起回合的那一路知道；记在这儿供上下文读数署名。
+        # 只留在内存里：每一轮都是本进程发起的，署名跟着这一轮走就够，重启后新回合会重新登记。
+        self.thread_models: dict[str, str] = {}
 
     def _path(self, thread_id: str) -> Path:
         return self.root / f"{hashlib.sha256(thread_id.encode('utf-8')).hexdigest()[:32]}.json"
@@ -133,6 +136,8 @@ class ThreadItemJournal:
                     base = codex_usage_base(params)
                     entry["usageBase"] = base
                 entry["usage"] = codex_turn_usage(params, base)
+                # 同一条通知还回答「现在占了多少上下文」：它不是累加的账，每次直接覆盖。
+                entry["context"] = codex_turn_context(params, self.thread_models.get(thread_id, ""))
             elif method in REASONING_SUMMARY_METHODS:
                 # 推理摘要不在 item 上，它是单独流出来的：item/completed 里的 summary 实测是空的。
                 item_id = str(params.get("itemId") or params.get("targetItemId") or item.get("id") or "")
@@ -174,6 +179,14 @@ class ThreadItemJournal:
         if not isinstance(target.get("summary"), list):
             target["summary"] = [target["summary"]] if isinstance(target.get("summary"), str) and target["summary"] else []
         return target
+
+    def note_model(self, thread_id: str, model: str) -> None:
+        """登记这条线程当前用的是哪个模型，供上下文读数署名。"""
+        thread_id = str(thread_id or "").strip()
+        if not thread_id:
+            return
+        with self.lock:
+            self.thread_models[thread_id] = str(model or "")
 
     def read_unlocked(self, thread_id: str) -> list[dict[str, Any]]:
         path = self._path(thread_id)
@@ -277,7 +290,13 @@ def merge_journal_turns(thread: dict[str, Any], journal_turns: list[dict[str, An
             if journal_item_signature(item) not in known:
                 items.append(item)
         usage = recorded.get("usage") if isinstance(recorded.get("usage"), dict) else None
-        merged.append({**turn, "items": items, **({"usage": usage} if usage else {})})
+        context = recorded.get("context") if isinstance(recorded.get("context"), dict) else None
+        merged.append({
+            **turn, "items": items,
+            **({"usage": usage} if usage else {}),
+            # 上下文读数只在实时流里出现，`thread/read` 同样读不回来，得从记录里补。
+            **({"context": context} if context else {}),
+        })
     # 线程刚跑完就读，服务端有时还没把这一轮写进历史；记录里已经有了就直接补上。
     merged.extend(turn for turn in journal_turns if str(turn.get("id") or "") not in seen)
     return {**thread, "turns": merged}

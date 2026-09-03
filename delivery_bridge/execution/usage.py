@@ -3,7 +3,7 @@
 线程清单来自任务面板（需求会话表和任务的执行会话表），用量来自执行器自己的
 会话缓存；这一层只做「把线程归到需求或任务名下，再按执行器加起来」。
 
-需求侧不是一整块：拆解、原型、review、需求测试、微调各算各的——它们是需求窗口里
+需求侧不是一整块：需求分析、拆解、原型、review、需求测试、微调各算各的——它们是需求窗口里
 几个独立的入口，「这条需求贵在哪一步」只有分块列出来才答得上。
 
 按需求整体算一次，顺带就把每条任务的分账算出来了，所以进度页和「消耗」按钮
@@ -18,7 +18,11 @@ from typing import Any
 import server as planner
 
 from delivery_bridge.errors import BridgeFailure
-from delivery_bridge.item_keys import REQUIREMENT_FINE_TUNING_SESSION_KIND, REQUIREMENT_REVIEW_SESSION_KIND
+from delivery_bridge.item_keys import (
+    REQUIREMENT_ANALYSIS_SESSION_KIND,
+    REQUIREMENT_FINE_TUNING_SESSION_KIND,
+    REQUIREMENT_REVIEW_SESSION_KIND,
+)
 from delivery_bridge.payloads import (
     assert_runtime_project,
     config_biz_line,
@@ -34,7 +38,7 @@ from delivery_bridge.usage_index import empty_provider_usage, usage_by_provider
 MAX_USAGE_TASKS = 200
 
 # 需求侧会话分成这几块，顺序就是面板上从上到下的顺序（跟需求窗口的入口顺序一致）。
-REQUIREMENT_SESSION_GROUPS = ("planning", "prototype", "review", "testing", "fineTuning")
+REQUIREMENT_SESSION_GROUPS = ("analysis", "planning", "prototype", "review", "testing", "fineTuning")
 
 # 原型会话跟拆解共用一张表，靠执行器类型的用途后缀区分，不是靠 metadata.kind——
 # 早期的原型会话没写 kind，只有这个后缀一直都在。
@@ -49,12 +53,14 @@ def _planning_session_group(row: dict[str, Any]) -> str:
 
 
 def _testing_session_group(row: dict[str, Any]) -> str:
-    """测试会话表装了三块，靠 metadata.kind 分流；老数据没写 kind，按需求测试算。"""
+    """测试会话表装了四块，靠 metadata.kind 分流；老数据没写 kind，按需求测试算。"""
     kind = session_kind_of(row)
     if kind == REQUIREMENT_REVIEW_SESSION_KIND:
         return "review"
     if kind == REQUIREMENT_FINE_TUNING_SESSION_KIND:
         return "fineTuning"
+    if kind == REQUIREMENT_ANALYSIS_SESSION_KIND:
+        return "analysis"
     return "testing"
 
 

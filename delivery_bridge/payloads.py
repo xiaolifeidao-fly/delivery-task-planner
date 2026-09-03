@@ -108,6 +108,36 @@ def validate_requirement_review_payload(value: Any) -> tuple[int, str, str, str,
         bool(value.get("generateReport")),
     )
 
+def validate_requirement_analysis_payload(value: Any) -> tuple[int, str, str, str, bool, str, str, bool, list[dict[str, str]], bool, bool]:
+    """需求分析会话的一轮输入。
+
+    和 review 一样分两种回合：平时只在聊天里补信息、确认口径，只有「确认生成」那一轮
+    才允许落文档；原型是可选的附加产出，由面板上的开关决定这一轮要不要顺带画。
+    """
+    if not isinstance(value, dict):
+        raise BridgeFailure("请求体必须是 JSON 对象")
+    program_id = program_id_of(value.get("programId"))
+    requirement_key = str(value.get("requirementKey") or "").strip()
+    message = str(value.get("message") or "").strip()
+    thread_id = str(value.get("threadId") or "").strip()
+    model = str(value.get("model") or "").strip()
+    provider = ai_provider_of(value)
+    reasoning_effort = reasoning_effort_of(value, provider)
+    fast_mode = fast_mode_of(value, provider)
+    if not program_id or not requirement_key or len(requirement_key) > 64:
+        raise BridgeFailure("缺少或无效的项目、需求标识")
+    if not message:
+        raise BridgeFailure("请输入本轮要分析的需求内容")
+    if len(message) > 32 * 1024:
+        raise BridgeFailure("需求分析内容不能超过 32KB")
+    if len(thread_id) > 255 or len(model) > 128:
+        raise BridgeFailure("会话或模型标识无效")
+    return (
+        program_id, requirement_key, message, thread_id, bool(value.get("newConversation")), model,
+        reasoning_effort, fast_mode, conversation_references_of(value.get("chatReferences")),
+        bool(value.get("generateDocument")), bool(value.get("generatePrototype")),
+    )
+
 def validate_requirement_testing_payload(value: Any) -> tuple[int, str, str, str, bool, str, str, bool, list[str], list[dict[str, str]], bool]:
     if not isinstance(value, dict):
         raise BridgeFailure("请求体必须是 JSON 对象")
@@ -280,7 +310,10 @@ def conversation_references_of(value: Any) -> list[dict[str, str]]:
             scope = str(entry.get("scope") or "").strip()
             path = Path(key)
             if (
-                scope not in {"requirement-outline", "requirement-testing", "requirement-prototype", "requirement-review"}
+                scope not in {
+                    "requirement-outline", "requirement-testing", "requirement-prototype",
+                    "requirement-review", "requirement-analysis",
+                }
                 or not key
                 or len(key) > 512
                 or "\x00" in key

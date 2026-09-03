@@ -16,7 +16,12 @@ from delivery_bridge.clients import factory
 from delivery_bridge.clients.codex import AppServerClient
 from delivery_bridge.errors import BridgeFailure
 from delivery_bridge.executor_env import codex_environment
-from delivery_bridge.item_keys import REQUIREMENT_REVIEW_SESSION_KIND, REQUIREMENT_TESTING_ITEM_KEY
+from delivery_bridge.item_keys import (
+    REQUIREMENT_ANALYSIS_SESSION_KIND,
+    REQUIREMENT_FINE_TUNING_SESSION_KIND,
+    REQUIREMENT_REVIEW_SESSION_KIND,
+    REQUIREMENT_TESTING_ITEM_KEY,
+)
 from delivery_bridge.payloads import (
     assert_runtime_project,
     config_biz_line,
@@ -47,6 +52,14 @@ from delivery_bridge.token_usage import with_usage
 from delivery_bridge.turn_view import serialize_turns
 
 
+# 需求测试会话表里混着好几类会话；这些 kind 都不属于需求测试，列目录时逐一排掉。
+NON_TESTING_SESSION_KINDS = frozenset({
+    REQUIREMENT_REVIEW_SESSION_KIND,
+    REQUIREMENT_FINE_TUNING_SESSION_KIND,
+    REQUIREMENT_ANALYSIS_SESSION_KIND,
+})
+
+
 class RequirementTestingMixin:
     @staticmethod
     def _requirement_testing_item_key(requirement_key: str) -> str:
@@ -60,7 +73,8 @@ class RequirementTestingMixin:
         self, config: dict[str, Any], program_id: int, requirement_key: str, provider: str, thread_id: str = "",
     ) -> dict[str, Any] | None:
         # 不按执行器过滤：换工具之后也要能看见此前那批聊天。
-        # 和 review 会话共用一张表，这里要把 kind 是 review 的那些行排掉；老数据没写 kind，按需求测试处理。
+        # 这张表还装着 review、微调和需求分析，逐一排掉——按「不是 review 就算测试」筛的话，
+        # 后加进来的每一类都会漏到测试目录里。老数据没写 kind，仍按需求测试处理。
         rows = planner.request_api(
             config, "GET", "/delivery/requirement/testing-sessions",
             query={"programId": program_id, "requirementKey": requirement_key},
@@ -68,7 +82,7 @@ class RequirementTestingMixin:
         rows = [
             row for row in (rows or [])
             if isinstance(row, dict) and str(row.get("threadId") or "") and same_executor_purpose(row, "")
-            and session_kind_of(row) != REQUIREMENT_REVIEW_SESSION_KIND
+            and session_kind_of(row) not in NON_TESTING_SESSION_KINDS
         ]
         if not rows:
             return None

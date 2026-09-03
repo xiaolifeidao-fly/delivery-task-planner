@@ -21,6 +21,7 @@ from delivery_bridge.documents import (
     document_upload_name,
     legacy_task_outline_path_of,
     outline_file_in_workspace,
+    requirement_analysis_directory_of,
     requirement_outline_path_of,
     testing_asset_directory_of,
 )
@@ -28,7 +29,10 @@ from delivery_bridge.errors import BridgeFailure
 from delivery_bridge.item_keys import document_attachment_item_key
 from delivery_bridge.payloads import config_biz_line, request_scoped_config
 from delivery_bridge.prompts.common import document_path_of
-from delivery_bridge.prompts.requirement import requirement_review_report_relative_path
+from delivery_bridge.prompts.requirement import (
+    requirement_analysis_document_relative_path,
+    requirement_review_report_relative_path,
+)
 from delivery_bridge.providers import DEFAULT_BIZ_LINE
 
 
@@ -120,12 +124,19 @@ class DocumentsMixin:
         key_value = str(key or "").strip()
         if not key_value:
             raise BridgeFailure("缺少文档栏目标识")
-        if scope_value in {"requirement-outline", "requirement-testing", "requirement-review"}:
+        if scope_value in {"requirement-outline", "requirement-analysis", "requirement-testing", "requirement-review"}:
             self._requirement_for_prototype(config, program_id, key_value)
             if scope_value == "requirement-outline":
                 outline = requirement_outline_path_of(key_value)
                 # 需求目录下还挂着 prototype/，大纲栏目只列顶层的文本文档。
                 return outline.parent, outline.as_posix(), False
+            if scope_value == "requirement-analysis":
+                # 需求分析目录支持多份文档（主文档、接口清单、数据字典……），全部列出来。
+                return (
+                    requirement_analysis_directory_of(key_value),
+                    requirement_analysis_document_relative_path(key_value).as_posix(),
+                    True,
+                )
             if scope_value == "requirement-review":
                 # review 报告固定写在 doc/review/<需求键>/ 下，同一条需求重复生成就覆盖那一份。
                 report = requirement_review_report_relative_path(key_value)

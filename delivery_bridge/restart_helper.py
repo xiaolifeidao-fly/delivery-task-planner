@@ -118,9 +118,15 @@ def wait_for_bridge_ready(bridge_args: Sequence[str], timeout: float = WINDOWS_R
     return False
 
 
-def windows_service_arguments(bridge_args: Sequence[str]) -> tuple[str, str]:
+def windows_service_arguments(bridge_args: Sequence[str]) -> tuple[str, str, str]:
+    """重装计划任务时要把启动参数原样带回去。
+
+    漏掉 ``--command-api-url`` 不会报错，只会让远程命令 Worker 在下次重启后静默
+    禁用——任务面板上就变成「未登记执行电脑」，而日志里什么都查不到。
+    """
     workspace = ""
     allow_origin = "*"
+    command_api_url = ""
     for index, value in enumerate(bridge_args):
         if value == "--workspace" and index + 1 < len(bridge_args):
             workspace = bridge_args[index + 1]
@@ -130,7 +136,11 @@ def windows_service_arguments(bridge_args: Sequence[str]) -> tuple[str, str]:
             allow_origin = bridge_args[index + 1]
         elif value.startswith("--allow-origin="):
             allow_origin = value.split("=", 1)[1]
-    return workspace, allow_origin
+        elif value == "--command-api-url" and index + 1 < len(bridge_args):
+            command_api_url = bridge_args[index + 1]
+        elif value.startswith("--command-api-url="):
+            command_api_url = value.split("=", 1)[1]
+    return workspace, allow_origin, command_api_url
 
 
 def reinstall_windows_scheduled_task(plugin_root: Path, bridge_args: Sequence[str]) -> bool:
@@ -139,7 +149,7 @@ def reinstall_windows_scheduled_task(plugin_root: Path, bridge_args: Sequence[st
     if not installer.is_file() or not powershell:
         restart_log("Windows scheduled-task installer or PowerShell was not found; using detached supervisor fallback.")
         return False
-    workspace, allow_origin = windows_service_arguments(bridge_args)
+    workspace, allow_origin, command_api_url = windows_service_arguments(bridge_args)
     command = [
         powershell,
         "-NoProfile",
@@ -154,6 +164,8 @@ def reinstall_windows_scheduled_task(plugin_root: Path, bridge_args: Sequence[st
     ]
     if workspace:
         command.extend(["-Workspace", workspace])
+    if command_api_url:
+        command.extend(["-CommandApiUrl", command_api_url])
     completed = subprocess.run(command, check=False, capture_output=True, text=True, timeout=45)
     restart_log(
         f"Windows scheduled task reinstall exited {completed.returncode}: "

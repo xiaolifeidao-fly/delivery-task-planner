@@ -2,6 +2,8 @@
 
 import json
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -121,6 +123,41 @@ class PluginUpdateTest(unittest.TestCase):
             self.assertTrue((destination / ".git").is_dir())
             self.assertFalse((destination / "obsolete.txt").exists())
             self.assertIn("0.3.0", (destination / "http_bridge.py").read_text(encoding="utf-8"))
+
+    def test_head_resolution_survives_a_broken_git_file_in_the_working_directory(self):
+        if not shutil.which("git"):
+            self.skipTest("git 不可用")
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = Path(directory)
+            origin = temporary / "origin"
+            origin.mkdir()
+            git = ["git", "-c", "user.name=test", "-c", "user.email=test@example.test"]
+            subprocess.run([*git, "init", "-q", "-b", "main"], cwd=origin, check=True)
+            (origin / "readme.md").write_text("origin\n", encoding="utf-8")
+            subprocess.run([*git, "add", "readme.md"], cwd=origin, check=True, capture_output=True)
+            subprocess.run([*git, "commit", "-qm", "init"], cwd=origin, check=True, capture_output=True)
+
+            plugin_root = make_package(temporary / "installed", "0.4.4")
+            # A submodule checkout leaves this behind; git then aborts on
+            # repository discovery before it ever reaches the remote.
+            (plugin_root / ".git").write_text("gitdir: ../.git/modules/missing\n", encoding="utf-8")
+            manager = PluginUpdateManager(
+                plugin_root,
+                temporary / "runtime",
+                str(origin),
+                "https://example.test/plugin",
+            )
+
+            previous = Path.cwd()
+            os.chdir(plugin_root)
+            try:
+                branch, commit, error = manager._resolve_head_commit()
+            finally:
+                os.chdir(previous)
+
+            self.assertEqual("", error)
+            self.assertEqual("main", branch)
+            self.assertRegex(commit, r"^[0-9a-f]{40}$")
 
     def test_claude_cache_install_is_versioned_and_updates_index_atomically(self):
         with tempfile.TemporaryDirectory() as directory:

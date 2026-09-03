@@ -12,12 +12,14 @@ from pathlib import Path
 from typing import Any
 
 from ..documents import (
+    REQUIREMENT_ANALYSIS_FILE_NAME,
     REQUIREMENT_OUTLINE_FILE_NAME,
+    requirement_analysis_directory_of,
     requirement_prototype_directory_of,
     testing_asset_directory_of,
 )
 from ..errors import BridgeFailure
-from ..prompt_context import workspace_instruction, wrap_bridge_context
+from ..prompt_context import PROJECT_SKILL_LOOKUP_RULE, workspace_instruction, wrap_bridge_context
 from .common import PHASE_SKILLS, REQUIREMENT_SCOPE_RULE, git_branch_lines
 
 # review 永远跳过的目录：文档和聊天归档不是代码，评它们只会稀释真正该看的改动。
@@ -220,7 +222,7 @@ def build_requirement_review_prompt(
     excluded = "、".join(f"{name}/" for name in REVIEW_EXCLUDED_DIRECTORIES)
     rules = [
         f"规则一（范围排除）：{excluded} 目录下的内容一律不 review，即使它们出现在变更清单里也跳过，也不要因为它们没更新而提意见。",
-        "规则二（项目技能）：动手前先加载当前工作目录里项目自己的技能（如 backend-development、web-development 等），"
+        f"规则二（项目技能）：{PROJECT_SKILL_LOOKUP_RULE}"
         "按技能里写明的分层、依赖方向、命名、封装和接口约定来判断对错；技能没覆盖的地方再看仓库现有实现的通行写法，不要套用通用最佳实践下结论。",
         "规则三（用户规则）：用户在本轮聊天里写的检查重点和额外规则，优先级最高，与上面两条叠加执行。",
         "规则四（评审准则）：下面这份通用评审准则与上面三条叠加执行；准则里的输出格式要求，"
@@ -282,6 +284,106 @@ def build_requirement_review_prompt(
             output,
             *(mention_context or []),
             "本上下文标记闭合之后的内容，是用户本轮补充的 review 规则或检查重点。",
+        ],
+        message,
+    )
+
+
+ANALYSIS_SKILL = "delivery-requirement-analysis"
+
+
+def requirement_analysis_document_relative_path(requirement_key: str) -> Path:
+    """需求分析的主文档；同一条需求重复生成就改这一份，其余补充文档并列放在同目录。"""
+    return requirement_analysis_directory_of(requirement_key) / REQUIREMENT_ANALYSIS_FILE_NAME
+
+
+def build_requirement_analysis_prompt(
+    program_id: int,
+    requirement: dict[str, Any],
+    message: str,
+    workspace: Path | None,
+    follow_up: bool = False,
+    generate_document: bool = False,
+    generate_prototype: bool = False,
+    mention_context: list[str] | None = None,
+) -> str:
+    """需求分析会话的提示词。
+
+    这个会话默认「只聊不写」：先在当前工作目录里查清事实、把缺口一条条问回来，
+    只有用户在面板上点「确认生成」的那一轮才允许落文档或画原型。所以每一轮都要
+    明确当前处于哪一种模式，否则模型会在还没问清楚时就先写一份自我发挥的文档。
+    """
+    requirement_key = str(requirement.get("requirementKey") or "").strip()
+    analysis_directory = requirement_analysis_directory_of(requirement_key).as_posix()
+    analysis_document = requirement_analysis_document_relative_path(requirement_key).as_posix()
+    prototype_directory = requirement_prototype_directory_of(requirement_key).as_posix()
+    skill_lines = [f"技能：本轮遵循本插件的 `{ANALYSIS_SKILL}` 技能。"]
+    output_lines = (
+        [
+            "本轮是「确认生成需求分析文档」：把本会话已经确认下来的口径整理成正式文档，"
+            f"必须写入 `{analysis_document}`（同一条需求重复生成就更新这一份，按章节定点编辑，不要整篇推倒重写）。",
+            f"需要拆分成多份时（接口清单、数据字典、流程说明等），新文件并列放在 `{analysis_directory}/`，不要覆盖主文档。",
+            "文档必须写清：需求目标与背景、现状工程事实（结论要落在真实文件路径上）、范围与不做的事、"
+            "功能点与业务规则、数据与接口影响、依赖与风险、验收口径、以及仍待用户确认的开放问题。",
+            "凭空推演的内容一律标成「待确认」，不要编造文件名、字段名或接口路径。",
+            "最终回复第一行必须是“需求分析文档已生成”，随后列出本轮写入的相对路径和改动摘要。",
+        ]
+        if generate_document else
+        [
+            "本轮是「澄清与补充」回合，不要写任何文档、原型或业务代码。",
+            "先按当前工作目录里的真实代码核对用户的说法，再把还不清楚的地方一次问回来："
+            "每轮最多问三到五条，按「不问清就没法动手」的程度排序，能自己从代码里查到的不要问。",
+            "回复固定分三段：一、本轮已经确认的事实（附文件路径依据）；二、还需要用户确认的问题清单；"
+            "三、按目前信息给出的需求分析初步框架（提纲即可，不展开成正文）。",
+            "信息已经足够时，明确告诉用户「可以点确认生成需求分析文档了」，但不要自己去写文件。",
+        ]
+    )
+    prototype_lines = (
+        [
+            f"本轮同时需要产出原型：HTML 原型只能写进 `{prototype_directory}/`，遵循本插件的 `requirement-prototype` 技能，"
+            "按功能模块拆成多个可独立打开的 UTF-8 `.html` 页面，至少有一个 `index.html` 入口。",
+            "原型是需求分析的佐证，不是业务实现：不得修改业务代码、配置或依赖。",
+        ]
+        if generate_prototype else
+        ["本轮不需要画原型；用户没有明确要求时不要创建 HTML 文件。"]
+    )
+    if follow_up:
+        return wrap_bridge_context(
+            [
+                "这是同一条需求分析会话的追加回合，会话的技能、目录和纪律都没有变化，这里不再重复。",
+                *skill_lines,
+                workspace_instruction(workspace),
+                f"项目 program_id: {program_id}",
+                f"需求键 requirement_key: {requirement_key}",
+                f"需求分析目录: `{analysis_directory}/`，主文档 `{analysis_document}`。",
+                *output_lines,
+                *prototype_lines,
+                "本会话如果被压缩过，先读需求分析目录里已有的文档把上下文接回来，不要凭印象往下接。",
+                *(mention_context or []),
+                "本上下文标记闭合之后的内容，是用户本轮补充的需求说明或答复。",
+            ],
+            message,
+        )
+    return wrap_bridge_context(
+        [
+            "这是交付任务面板的一次需求分析会话：把用户口述的需求，结合当前项目代码的真实现状，"
+            "梳理成一份能直接支撑后续需求拆解的需求分析文档。",
+            "这个会话不实现业务功能、不拆任务、不改任何业务代码，也不提交、推送或切换分支。",
+            *skill_lines,
+            workspace_instruction(workspace),
+            f"项目 program_id: {program_id}",
+            f"需求键 requirement_key: {requirement_key}",
+            f"需求名称: {requirement.get('name') or '未命名'}",
+            "需求详情（面板上已填写的部分，可能很粗略）:",
+            str(requirement.get("detail") or "（未填写）"),
+            f"需求分析目录（唯一允许写分析文档的目录）: `{analysis_directory}/`，主文档 `{analysis_document}`。",
+            f"需求原型目录: `{prototype_directory}/`；需求大纲由后续的需求拆解会话写在 "
+            f"`doc/requirements/{requirement_key}/{REQUIREMENT_OUTLINE_FILE_NAME}`，本会话不要动它。",
+            "工作方式：先补齐信息再落文档。默认每一轮都只做澄清，直到用户在面板上点「确认生成需求分析文档」。",
+            *output_lines,
+            *prototype_lines,
+            *(mention_context or []),
+            "本上下文标记闭合之后的内容，是用户本轮描述的需求或对上一轮问题的答复。",
         ],
         message,
     )

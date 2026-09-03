@@ -17,6 +17,7 @@ from delivery_bridge.clients.pool import (
     THREAD_READERS,
     read_thread_or_empty,
 )
+from delivery_bridge.context_window import empty_context, turns_context
 from delivery_bridge.errors import BridgeFailure
 from delivery_bridge.executor_env import codex_environment
 from delivery_bridge.payloads import (
@@ -76,6 +77,7 @@ class ConversationMixin:
                 "active": False,
                 "taskHasActiveConversation": any(session.get("status") == "running" for session in bindings),
                 "usage": empty_usage(),
+                "context": empty_context(),
                 "taskStatus": str(task.get("status") or "todo"),
                 "taskPhase": str(task.get("phase") or "requirement"),
                 "taskProgress": int(task.get("progress") or 0),
@@ -141,6 +143,8 @@ class ConversationMixin:
             # 本条会话所有回合的合计：面板的「本任务累计消耗」。一条任务开过多条会话时，
             # 面板按 conversations 逐条取回后相加即可。
             "usage": turns_usage_total(turns),
+            # 「现在占了多少上下文」和累计用量不是一回事：它是此刻提示词的长度，压缩后会掉下来。
+            "context": turns_context(turns),
             "sessionPhase": str((binding or {}).get("phase") or task.get("phase") or "requirement"),
             "sessionProgress": int((binding or {}).get("progress") or 0),
         }

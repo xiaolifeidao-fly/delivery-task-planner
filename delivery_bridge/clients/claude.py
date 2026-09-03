@@ -23,9 +23,10 @@ from typing import Any
 
 from .. import runtime
 from ..attachments_text import message_with_attachments
+from ..context_window import has_context, turn_context
 from ..errors import BridgeFailure
 from ..timeutil import utc_now
-from ..token_usage import claude_turn_usage, has_usage
+from ..token_usage import claude_context_window, claude_message_context, claude_turn_usage, has_usage
 
 # 会话正文的落盘位置按模块名取，测试改写运行时目录时这里跟着变。
 CLAUDE_TRANSCRIPTS_DIR = runtime.RUNTIME_DIR / "claude-transcripts"
@@ -205,6 +206,9 @@ class ClaudeCLIClient:
         self.transcripts = transcripts or CLAUDE_TRANSCRIPTS
         # 落盘用的键固定成面板认识的那个会话号，即使 Claude 自己换了 session_id 也不换文件。
         self.transcript_key = ""
+        # 这条会话的上下文窗口。只有回合末尾的 result 事件报得出真值，所以记下来给下一轮用；
+        # 一轮跑到一半时面板要显示「总共多少」，靠的就是上一轮留下的这个数。
+        self.context_window = 0
 
     def _start(self, prompt: str, model: str = "", resume: str = "", reasoning_effort: str = "", fast_mode: bool = False) -> tuple[str, str]:
         if shutil.which("claude") is None:
@@ -248,6 +252,7 @@ class ClaudeCLIClient:
         # 续聊时把之前几轮读回来，面板刷新后聊天记录不能只剩当前这一轮。
         self.transcript_key = self.thread_id
         self.turns = self.transcripts.read(self.transcript_key)
+        self.context_window = self.context_window or self._recorded_context_window()
         self.turn_id = secrets.token_urlsafe(16)
         self.turn_status = "running"
         turn = {"id": self.turn_id, "status": "running", "createdAt": utc_now(), "items": [{"id": secrets.token_urlsafe(8), "type": "userMessage", "content": prompt}]}
@@ -266,6 +271,14 @@ class ClaudeCLIClient:
         threading.Thread(target=self._consume, args=(turn,), daemon=True).start()
         return self.thread_id, self.turn_id
 
+    def _recorded_context_window(self) -> int:
+        """续聊时把上一轮问出来的窗口捡回来，别让面板在本轮跑完前显示成查表值。"""
+        for turn in reversed(self.turns):
+            context = turn.get("context") if isinstance(turn, dict) else None
+            if isinstance(context, dict) and int(context.get("windowTokens") or 0) > 0:
+                return int(context["windowTokens"])
+        return 0
+
     def _persist(self) -> None:
         self.transcripts.write(self.transcript_key or self.thread_id, self.turns)
 
@@ -279,6 +292,8 @@ class ClaudeCLIClient:
         # 鉴权过期这类失败，Claude 会照常收尾并把错误当正文吐出来，只有 result 里的
         # is_error 说明这轮没成。不认它的话，面板会把「登录过期」显示成一条完成的回答。
         result_failed = False
+        # 这一轮到目前为止占住的上下文：每条 assistant 事件就是一次模型请求，后一条盖前一条。
+        context: dict[str, Any] = {}
         pending_tools: dict[str, dict[str, Any]] = {}
         for line in self.process.stdout:
             try:
@@ -291,6 +306,12 @@ class ClaudeCLIClient:
                 self.thread_id = session_id
             event_type = str(event.get("type") or "")
             if event_type == "assistant":
+                # 上下文占用跟着最近一次模型请求走，和「本轮烧了多少」不是一个数：
+                # 前者是此刻提示词有多长，压缩之后会掉回去，后者只增不减。
+                reading = claude_message_context(event, self.context_window)
+                if has_context(reading):
+                    context = reading
+                    turn["context"] = context
                 content = (event.get("message") or {}).get("content") or []
                 for block in content if isinstance(content, list) else []:
                     if not isinstance(block, dict):
@@ -330,6 +351,15 @@ class ClaudeCLIClient:
                 usage = claude_turn_usage(event)
                 if has_usage(usage):
                     turn["usage"] = usage
+                # 窗口大小只有这条事件报得出（modelUsage 按模型分列）；拿到真值就回填，
+                # 本轮那些按查表值显示的读数也一并纠正过来。
+                window = claude_context_window(event, str(context.get("model") or ""))
+                if window:
+                    self.context_window = window
+                    if has_context(context):
+                        turn["context"] = turn_context(
+                            context.get("usedTokens"), window, "claude", str(context.get("model") or ""),
+                        )
                 if not self.transcript_key:
                     self.thread_id = str(event.get("session_id") or self.thread_id)
         return_code = self.process.wait()

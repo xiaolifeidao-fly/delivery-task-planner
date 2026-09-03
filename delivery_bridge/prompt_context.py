@@ -30,6 +30,17 @@ def with_mention_context(message: str, mention_context: list[str]) -> str:
     return wrap_bridge_context(mention_context, message) if mention_context else message
 
 
+# 项目技能不一定挂在工作目录根上：单仓多工程的项目里，前端、服务端、移动端各自的根目录
+# 都可能带一份自己的技能，只看根目录就会漏掉真正管着这次改动的那一份。
+PROJECT_SKILL_LOOKUP_RULE = (
+    "开始前先加载这个工作目录里项目自己的开发技能（如 backend-development、web-development）。"
+    "找技能时不要只看工作目录根：根目录不一定放技能，各个子工程自己的根目录同样可能带一份"
+    "（例如 `client/web/`、`client/app/`、`server/` 各自的 `.claude/skills/`、`.codex/skills/`），"
+    "每个子工程都可能有自己的一份。先按本轮要改的端和模块定位到对应子工程，"
+    "把它那一份技能连同根目录的一起加载；两处都没有才算没有，不要拿通用最佳实践顶替。"
+)
+
+
 def workspace_instruction(workspace: Path | None) -> str:
     """Point every phase at the project's bound working directory and its own dev skills.
 
@@ -40,7 +51,7 @@ def workspace_instruction(workspace: Path | None) -> str:
         return "项目工作目录: 未提供。动手前先向用户确认代码仓库位置，不要拿当前目录或安装目录顶替。"
     return (
         f"项目工作目录（项目管理里为本项目绑定的代码仓库，也是本轮 cwd）: {workspace}。"
-        "开始前先加载该目录下项目自己的开发技能（如 backend-development、web-development），"
+        f"{PROJECT_SKILL_LOOKUP_RULE}"
         "并读相关目录和现有实现；结论要落在真实文件路径上，不要凭业务名词推演。"
     )
 

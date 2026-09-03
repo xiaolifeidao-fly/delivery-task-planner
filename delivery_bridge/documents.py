@@ -76,6 +76,22 @@ def requirement_outline_path_of(requirement_key: str) -> Path:
     return Path("doc") / "requirements" / value / REQUIREMENT_OUTLINE_FILE_NAME
 
 
+# 需求分析会话把分析文档写在 doc/analysis/<需求键>/ 下：它和需求大纲（拆解沉淀）、
+# 测试资产各占一个目录，互不覆盖，面板按栏目分别列出来。
+REQUIREMENT_ANALYSIS_ROOT = "analysis"
+
+
+REQUIREMENT_ANALYSIS_FILE_NAME = "需求分析.md"
+
+
+def requirement_analysis_directory_of(requirement_key: str) -> Path:
+    """Return the workspace-relative directory the analysis skill writes for one requirement."""
+    value = str(requirement_key or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value):
+        raise BridgeFailure("需求标识无效")
+    return Path("doc") / REQUIREMENT_ANALYSIS_ROOT / value
+
+
 def requirement_document_directory_of(requirement_key: str) -> Path:
     """Return the requirement document directory for standalone deliverables."""
     value = str(requirement_key or "").strip()

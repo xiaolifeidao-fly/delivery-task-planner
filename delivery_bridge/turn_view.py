@@ -13,6 +13,7 @@ from .artifacts import MARKDOWN_ARTIFACT_RE
 from .attachments_text import attachment_ids_from_text, text_without_attachment_context
 from .errors import BridgeFailure
 from .reasoning import reasoning_summary_text
+from .context_window import has_context
 from .token_usage import has_usage
 from .turn_output import file_changes_of, text_from_user_item
 
@@ -104,6 +105,7 @@ def serialize_turns(
                     item for item in turn_attachments if str(item.get("id") or "") not in known_ids
                 )
         usage = turn.get("usage") if isinstance(turn.get("usage"), dict) else None
+        context = turn.get("context") if isinstance(turn.get("context"), dict) else None
         serialized.append(
             {
                 "id": turn_id,
@@ -113,6 +115,8 @@ def serialize_turns(
                 "items": messages,
                 # 用量问不出来的回合（老会话、执行器没报）不给字段，面板据此不显示这一行。
                 **({"usage": usage} if has_usage(usage) else {}),
+                # 这一轮结束时占住了多少上下文；会话级的读数取最后一个有它的回合。
+                **({"context": context} if has_context(context) else {}),
             }
         )
     return serialized

@@ -101,3 +101,10 @@ REQUIREMENT_REVIEW_SESSION_KIND = "requirement-review"
 
 
 REQUIREMENT_FINE_TUNING_SESSION_KIND = "requirement-fine-tuning"
+
+
+REQUIREMENT_ANALYSIS_ITEM_KEY = "__requirement_analysis__"
+
+
+# 需求分析会话同样落在需求的测试会话表里，靠 metadata.kind 和测试、review、微调分流。
+REQUIREMENT_ANALYSIS_SESSION_KIND = "requirement-analysis"

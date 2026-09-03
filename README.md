@@ -4,10 +4,11 @@ Task-planning plugin for creating projects, stages, modules, and dependency-awar
 
 ## Skills
 
-All six delivery-board skills are maintained here under `skills/`. Four cover the task life cycle; `requirement-prototype` and `delivery-requirement-testing` cover requirement-level work.
+All seven delivery-board skills are maintained here under `skills/`. Four cover the task life cycle; `delivery-requirement-analysis`, `requirement-prototype` and `delivery-requirement-testing` cover requirement-level work.
 
 | Skill | Scope |
 | --- | --- |
+| `delivery-requirement-analysis` | Analyse one requirement against the real codebase before breakdown — clarify first, then write `doc/analysis/<requirementKey>/需求分析.md` (and optionally a prototype) once the user confirms |
 | `delivery-task-planner` | Break a requirement into tasks and write them to the board (preview first, write only after the user confirms in the board); keeps per-chat process summaries under the installed plugin's `.temp/requirements/` tree, updates `doc/requirements/<requirementKey>/需求大纲.md` only on confirmation, and can pre-generate each task's primary requirement document at `doc/<moduleKey>/<itemKey>/文档.md` |
 | `delivery-requirement-grooming` | A task's `requirement` phase — produce `doc/<module>/<itemKey>/文档.md` |
 | `delivery-action-execution` | A task's `development` phase — implement against that document; the final reply is stored as the task's action output |

@@ -9,6 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from ..cloud_documents import fine_tuning_document_directory_of
 from ..errors import BridgeFailure
 from ..prompt_context import workspace_instruction, wrap_bridge_context
 from .common import (
@@ -230,6 +231,23 @@ def fine_tuning_skill_instruction() -> list[str]:
     ]
 
 
+def fine_tuning_record_instruction(key: str) -> list[str]:
+    """微调改的是已交付的东西，改动本身要留一份可回看的记录。
+
+    面板把这个目录当作「微调」栏目展示，所以路径是约定的，不能由执行器自己另选一处。
+    """
+    try:
+        directory = fine_tuning_document_directory_of(key).as_posix()
+    except ValueError:
+        return []
+    return [
+        f"本轮实际改了东西时，把这次微调写成一份记录，追加或新建到 `{directory}/` 下的 Markdown 文档"
+        "（默认 `微调记录.md`，同一条需求或任务的多次微调按时间倒序追加在同一份里）："
+        "写清本轮诉求、实际改动的文件与要点、验证方式与结论，以及仍需用户决定的事项。",
+        "没有实际改动（例如只是回答问题）时不要写这份记录，也不要留空文件。",
+    ]
+
+
 def build_requirement_fine_tuning_prompt(
     program_id: int,
     requirement: dict[str, Any],
@@ -260,6 +278,7 @@ def build_requirement_fine_tuning_prompt(
         "需求详情:",
         str(requirement.get("detail") or "（未填写）"),
         f"需求文档目录: doc/requirements/{requirement_key}/；按需读取其中的需求文档和原型，不存在时先说明。",
+        *fine_tuning_record_instruction(requirement_key),
         "本需求关联任务（仅作上下文，不得改变它们的面板状态）:",
         *(task_lines or ["- 暂无任务"]),
         "最终回复需简要列出实际改动、验证结果，以及仍需用户决定的事项。",
@@ -310,6 +329,7 @@ def build_task_fine_tuning_prompt(
         "所属需求详情:",
         str((requirement or {}).get("detail") or "（未填写）"),
         *sibling_document_lines(requirement_document_catalog(context.get("items") or [], task, workspace)),
+        *fine_tuning_record_instruction(item_key),
         "最终回复需简要列出实际改动、验证结果，以及仍需用户决定的事项。",
         "本上下文标记闭合之后的内容，是用户本轮输入的原文。",
     ]

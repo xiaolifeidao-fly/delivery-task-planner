@@ -22,6 +22,7 @@ from delivery_bridge.chat_archive import (
     cloud_sync_workspace_entries,
     read_workspace_chat_archive,
 )
+from delivery_bridge.cloud_documents import CloudDocumentIndex
 from delivery_bridge.clients.pool import (
     ACTIVE_THREAD_READ_TIMEOUT_SECONDS,
     THREAD_READERS,
@@ -69,6 +70,9 @@ class SyncMixin:
         relative_path: str,
         content_type: str,
         content: bytes,
+        owner_kind: str = "program",
+        owner_key: str = "",
+        stage: str = "",
     ) -> None:
         if category not in CLOUD_SYNC_SCOPES:
             raise BridgeFailure("云端同步类别无效")
@@ -84,9 +88,47 @@ class SyncMixin:
                 "relativePath": relative_path,
                 "contentType": content_type,
                 "contentBase64": base64.b64encode(content).decode("ascii"),
+                "ownerKind": owner_kind,
+                "ownerKey": owner_key,
+                "stage": stage,
                 "actorName": "delivery-http-bridge",
             },
         )
+
+    def _cloud_document_index(self, config: dict[str, Any], program_id: int) -> CloudDocumentIndex:
+        """需求与任务清单是归属判断的唯一依据；读不回来就整批按未归类上传。
+
+        面板上「这份文档属于哪条需求 / 哪条任务」不能靠猜路径里的目录名，
+        所以清单请求失败时宁可不归类，也不要造出一条不存在的需求或任务。
+        """
+        try:
+            requirements = planner.request_api(
+                config, "GET", "/delivery/requirements", query={"programId": program_id},
+            ) or []
+        except planner.ToolFailure as exc:
+            print(f"读取需求清单失败，本次云端同步不归类：{program_id}: {exc}", file=sys.stderr, flush=True)
+            requirements = []
+        items: list[Any] = []
+        page_index = 1
+        while True:
+            try:
+                page = planner.request_api(
+                    config, "GET", "/delivery/items",
+                    query={"programId": program_id, "pageIndex": page_index, "pageSize": 200},
+                ) or {}
+            except planner.ToolFailure as exc:
+                print(f"读取任务清单失败，本次云端同步不归类：{program_id}: {exc}", file=sys.stderr, flush=True)
+                items = []
+                break
+            rows = page.get("data") if isinstance(page, dict) else None
+            if not isinstance(rows, list) or not rows:
+                break
+            items.extend(rows)
+            if len(items) >= int(page.get("total") or len(items)):
+                break
+            page_index += 1
+        requirement_rows = requirements if isinstance(requirements, list) else []
+        return CloudDocumentIndex(requirement_rows, items)
 
     def _sync_workspace_cloud_files(
         self,
@@ -94,13 +136,15 @@ class SyncMixin:
         program_id: int,
         scopes: set[str],
     ) -> dict[str, Any]:
-        entries, skipped = cloud_sync_workspace_entries(self.workspace, scopes, program_id)
+        index = self._cloud_document_index(config, program_id)
+        entries, skipped = cloud_sync_workspace_entries(self.workspace, scopes, program_id, index)
         uploaded: list[str] = []
-        for category, relative, source, content_type in entries:
+        for entry in entries:
             self._upload_cloud_sync_file(
-                config, program_id, category, relative, content_type, source.read_bytes(),
+                config, program_id, entry.category, entry.relative_path, entry.content_type,
+                entry.source.read_bytes(), entry.owner_kind, entry.owner_key, entry.stage,
             )
-            uploaded.append(relative)
+            uploaded.append(entry.relative_path)
         return {
             "enabled": bool(scopes), "scopes": sorted(scopes),
             "uploaded": len(uploaded), "skipped": skipped, "files": uploaded,
@@ -164,6 +208,7 @@ class SyncMixin:
                     )
                     print(f"聊天记录已归档：{relative.as_posix()}", file=sys.stderr, flush=True)
                 if "chat" in cloud_scopes:
+                    owning_requirement = resource_key if resource_kind == "requirement" else requirement_key
                     self._upload_cloud_sync_file(
                         config,
                         program_id,
@@ -182,6 +227,9 @@ class SyncMixin:
                             terminal_status=terminal_status,
                             turns=turns,
                         ).encode("utf-8"),
+                        "requirement" if owning_requirement else "program",
+                        owning_requirement,
+                        "chat",
                     )
             document_scopes = cloud_scopes - {"chat"}
             if document_scopes:

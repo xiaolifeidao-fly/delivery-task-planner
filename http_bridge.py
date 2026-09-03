@@ -425,12 +425,28 @@ from delivery_bridge.usage_index import (
 
 
 from delivery_bridge.token_usage import (
+    claude_context_window,
+    claude_message_context,
     claude_turn_usage,
+    codex_turn_context,
     codex_turn_usage,
     empty_usage,
     merge_usage,
     turns_usage_total,
     with_usage,
+)
+
+
+from delivery_bridge.context_window import (
+    CLAUDE_DEFAULT_CONTEXT_WINDOW,
+    CLAUDE_LONG_CONTEXT_WINDOW,
+    CODEX_DEFAULT_CONTEXT_WINDOW,
+    context_snapshot,
+    default_context_window,
+    empty_context,
+    has_context,
+    turn_context,
+    turns_context,
 )
 
 
@@ -974,8 +990,10 @@ from delivery_bridge.item_keys import (
     REQUIREMENT_TESTING_ITEM_KEY,
     REQUIREMENT_REVIEW_ITEM_KEY,
     REQUIREMENT_FINE_TUNING_ITEM_KEY,
+    REQUIREMENT_ANALYSIS_ITEM_KEY,
     REQUIREMENT_REVIEW_SESSION_KIND,
     REQUIREMENT_FINE_TUNING_SESSION_KIND,
+    REQUIREMENT_ANALYSIS_SESSION_KIND,
     MAX_REQUIREMENT_PROTOTYPE_FILES,
     MAX_REQUIREMENT_PROTOTYPE_FILE_BYTES,
     MAX_REQUIREMENT_PROTOTYPE_TOTAL_BYTES,
@@ -998,6 +1016,8 @@ from delivery_bridge.prompts.requirement import (
     review_scope_lines,
     requirement_review_report_relative_path,
     build_requirement_review_prompt,
+    build_requirement_analysis_prompt,
+    requirement_analysis_document_relative_path,
     prototype_session_detail_digest,
     build_requirement_prototype_prompt,
 )
@@ -1312,6 +1332,16 @@ from delivery_bridge.chat_archive import (
     archived_chat_turns,
     read_workspace_chat_archive,
     cloud_sync_workspace_entries,
+    CloudSyncEntry,
+)
+
+from delivery_bridge.cloud_documents import (
+    CLOUD_DOCUMENT_OWNER_KINDS,
+    CLOUD_DOCUMENT_STAGES,
+    REQUIREMENT_DOCUMENT_STAGES,
+    TASK_DOCUMENT_STAGES,
+    CloudDocumentIndex,
+    fine_tuning_document_directory_of,
 )
 
 
@@ -1406,6 +1436,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
         "/v1/codex/models": "_get_health",
         "/v1/codex/planning": "_get_planning",
         "/v1/codex/prototype-directory": "_get_prototype_directory",
+        "/v1/codex/requirement-analysis": "_get_requirement_analysis",
         "/v1/codex/requirement-document": "_get_requirement_document",
         "/v1/codex/requirement-fine-tuning": "_get_requirement_fine_tuning",
         "/v1/codex/requirement-outline": "_get_requirement_outline",
@@ -1437,6 +1468,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
         "/v1/codex/git/push": (200, "workspace", "push_requirement_branch", False),
         "/v1/codex/planning": (202, "workspace", "send_planning", False),
         "/v1/codex/planning/stop": (202, "workspace", "stop_planning", False),
+        "/v1/codex/requirement-analysis": (202, "workspace", "send_requirement_analysis", False),
+        "/v1/codex/requirement-analysis/stop": (202, "workspace", "stop_requirement_analysis", False),
         "/v1/codex/requirement-fine-tuning": (202, "workspace", "send_requirement_fine_tuning", False),
         "/v1/codex/requirement-fine-tuning/stop": (202, "workspace", "stop_requirement_fine_tuning", False),
         "/v1/codex/requirement-prototype/conversation": (202, "workspace", "send_requirement_prototype_message", False),
@@ -1839,6 +1872,31 @@ class BridgeHandler(BaseHTTPRequestHandler):
             self.json_response(500, {"error": f"读取代码 review 会话失败：{exc}"})
         return
 
+    def _get_requirement_analysis(self, parsed: ParseResult) -> None:
+        if not self.allowed_origin():
+            self.json_response(403, {"error": "origin not allowed"})
+            return
+        query = parse_qs(parsed.query)
+        try:
+            program_id = program_id_of((query.get("programId") or [""])[0])
+            requirement_key = str((query.get("requirementKey") or [""])[0]).strip()
+            thread_id = str((query.get("threadId") or [""])[0]).strip()
+            provider = ai_provider_of((query.get("provider") or ["codex"])[0])
+            if not requirement_key:
+                raise BridgeFailure("缺少需求标识")
+            selected_bridge = self.bridge.for_workspace((query.get("workspace") or [""])[0])
+            config = self.bridge.request_config(
+                {"programId": program_id}, self.allowed_origin() or "", self.headers.get("token", "").strip(),
+            )
+            self.json_response(200, selected_bridge.requirement_analysis(
+                program_id, requirement_key, thread_id, provider, config=config,
+            ))
+        except (BridgeFailure, planner.ToolFailure, ValueError) as exc:
+            self.json_response(400, {"error": str(exc)})
+        except Exception as exc:
+            self.json_response(500, {"error": f"读取需求分析会话失败：{exc}"})
+        return
+
     def _get_requirement_fine_tuning(self, parsed: ParseResult) -> None:
         if not self.allowed_origin():
             self.json_response(403, {"error": "origin not allowed"})
@@ -2188,6 +2246,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
             "/v1/codex/requirement-review/stop",
             "/v1/codex/requirement-fine-tuning",
             "/v1/codex/requirement-fine-tuning/stop",
+            "/v1/codex/requirement-analysis",
+            "/v1/codex/requirement-analysis/stop",
             "/v1/codex/attachments",
             "/v1/codex/business-attachments",
             "/v1/codex/prototype-directory/open",

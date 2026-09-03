@@ -15,9 +15,11 @@ import mimetypes
 import os
 import re
 import secrets
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .cloud_documents import CloudDocumentIndex
 from .documents import DOCUMENT_SET_SUFFIXES
 from .errors import BridgeFailure
 from .attachments_text import text_without_attachment_context
@@ -53,6 +55,19 @@ CLOUD_SYNC_SCOPES = {"chat", "requirement", "design", "test", "prototype", "exec
 MAX_CLOUD_SYNC_FILE_BYTES = 8 * 1024 * 1024
 
 MAX_CLOUD_SYNC_FILES_PER_RUN = 500
+
+
+@dataclass(frozen=True)
+class CloudSyncEntry:
+    """一份待上传的项目文件：同步类别、工作区相对路径，以及它属于谁的哪个阶段。"""
+
+    category: str
+    relative_path: str
+    source: Path
+    content_type: str
+    owner_kind: str = "program"
+    owner_key: str = ""
+    stage: str = ""
 
 def chat_archive_component(value: Any, fallback: str, max_bytes: int) -> str:
     """Return one human-readable, cross-platform-safe filename component."""
@@ -351,19 +366,25 @@ def cloud_sync_workspace_entries(
     workspace: Path,
     scopes: set[str],
     program_id: int | str | None = None,
-) -> tuple[list[tuple[str, str, Path, str]], int]:
+    index: CloudDocumentIndex | None = None,
+) -> tuple[list[CloudSyncEntry], int]:
     """Return only configured, workspace-contained files for a project cloud sync.
 
     `chat/` is isolated from regular project files. Documents, design notes, test material
     and HTML prototypes are classified from their stable workspace directories. Execution
     artifacts and attachments are resolved through their local manifests and only included
     when the manifest belongs to the requested program.
+
+    每条记录除了同步类别，还带上这份文件属于哪条需求或任务、属于哪个阶段，面板据此
+    把需求文档和任务文档分开展示。`index` 为空表示这次同步没拿到面板清单，
+    所有文件按未归类上传，不去猜归属。
     """
     wanted = scopes & CLOUD_SYNC_SCOPES
     if not wanted:
         return [], 0
     root = workspace.resolve()
-    entries: dict[tuple[str, str], tuple[str, str, Path, str]] = {}
+    catalog = index or CloudDocumentIndex()
+    entries: dict[tuple[str, str], CloudSyncEntry] = {}
     skipped = 0
 
     def offer(category: str, source: Path, relative_path: str | None = None) -> None:
@@ -381,7 +402,11 @@ def cloud_sync_workspace_entries(
             skipped += 1
             return
         content_type = mimetypes.guess_type(relative)[0] or "application/octet-stream"
-        entries[(category, relative)] = (category, relative, resolved, content_type)
+        owner_kind, owner_key, stage = catalog.classify(category, relative)
+        entries[(category, relative)] = CloudSyncEntry(
+            category=category, relative_path=relative, source=resolved, content_type=content_type,
+            owner_kind=owner_kind, owner_key=owner_key, stage=stage,
+        )
 
     if "chat" in wanted:
         chat_root = root / CHAT_ARCHIVE_DIRECTORY_NAME

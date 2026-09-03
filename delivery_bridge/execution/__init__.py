@@ -12,6 +12,7 @@ from .sync import SyncMixin
 from .naming import NamingMixin
 from .planning import PlanningMixin
 from .environment import EnvironmentMixin
+from .requirement_analysis import RequirementAnalysisMixin
 from .requirement_testing import RequirementTestingMixin
 from .requirement_review import RequirementReviewMixin
 from .fine_tuning import FineTuningMixin
@@ -33,6 +34,7 @@ class ExecutionBridge(
     EnvironmentMixin,
     RequirementTestingMixin,
     RequirementReviewMixin,
+    RequirementAnalysisMixin,
     FineTuningMixin,
     TaskTestingMixin,
     GitMixin,

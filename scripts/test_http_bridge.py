@@ -2553,6 +2553,44 @@ class HttpBridgeTest(unittest.TestCase):
         self.assertEqual(50, turn["usage"]["outputTokens"])
         self.assertEqual(0.21, turn["usage"]["costUsd"])
 
+    def test_claude_consume_tracks_the_context_window_on_the_turn(self):
+        """上下文跟着最近一次模型请求走；窗口大小以 result 里 modelUsage 报的为准。"""
+        events = [
+            {"type": "system", "subtype": "init", "session_id": "s-1"},
+            {"type": "assistant", "message": {
+                "model": "claude-opus-5",
+                "content": [{"type": "text", "text": "在看"}],
+                "usage": {"input_tokens": 10, "cache_creation_input_tokens": 20000, "cache_read_input_tokens": 0, "output_tokens": 90},
+            }},
+            {"type": "assistant", "message": {
+                "model": "claude-opus-5",
+                "content": [{"type": "text", "text": "做完了"}],
+                "usage": {"input_tokens": 30, "cache_creation_input_tokens": 5000, "cache_read_input_tokens": 20000, "output_tokens": 120},
+            }},
+            {
+                "type": "result", "subtype": "success", "is_error": False, "result": "做完了",
+                "usage": {"input_tokens": 40, "cache_creation_input_tokens": 25000, "cache_read_input_tokens": 20000, "output_tokens": 210},
+                "modelUsage": {"claude-opus-5": {"contextWindow": 200000}},
+            },
+        ]
+        with tempfile.TemporaryDirectory() as workspace:
+            store = bridge.ClaudeTranscriptStore(Path(workspace) / "transcripts")
+            client = bridge.ClaudeCLIClient(Path(workspace), transcripts=store)
+            client.transcript_key = "thread-1"
+            client.thread_id = "thread-1"
+            turn = {"id": "turn-1", "status": "running", "items": []}
+            client.turns = [turn]
+            client.process = unittest.mock.MagicMock()
+            client.process.stdout = [json.dumps(event) + "\n" for event in events]
+            client.process.wait.return_value = 0
+
+            client._consume(turn)
+
+        # 后一次请求盖前一次：占用是此刻提示词的长度，不是两次相加。
+        self.assertEqual(25150, turn["context"]["usedTokens"])
+        self.assertEqual(200000, turn["context"]["windowTokens"])
+        self.assertEqual("claude-opus-5", turn["context"]["model"])
+
     def test_merged_journal_turns_keep_the_recorded_usage(self):
         """`thread/read` 的回合里没有用量字段，合并时不能把记录里的那份丢掉。"""
         usage = {"inputTokens": 10, "cachedInputTokens": 0, "outputTokens": 5, "reasoningOutputTokens": 0, "totalTokens": 15, "costUsd": None}
@@ -2561,6 +2599,86 @@ class HttpBridgeTest(unittest.TestCase):
         merged = bridge.merge_journal_turns(thread, [{"id": "turn-1", "status": "completed", "items": [], "usage": usage}])
 
         self.assertEqual(usage, merged["turns"][0]["usage"])
+
+    def test_every_conversation_payload_carries_the_current_context_window(self):
+        """每个对话窗口都要能回答「上下文用了多少、还剩多少、总共多少」。"""
+        payload = bridge.with_usage({
+            "turns": [
+                {"id": "t1", "context": {"usedTokens": 30000, "windowTokens": 200000, "provider": "claude", "model": "claude-opus-5"}},
+                # 起标题这类回合没有读数，不能把它当成「上下文清空了」。
+                {"id": "t2"},
+                {"id": "t3", "context": {"usedTokens": 120000, "windowTokens": 200000, "provider": "claude", "model": "claude-opus-5"}},
+            ],
+        })
+
+        self.assertEqual(120000, payload["context"]["usedTokens"])
+        self.assertEqual(80000, payload["context"]["remainingTokens"])
+        self.assertEqual(200000, payload["context"]["windowTokens"])
+        self.assertEqual(60.0, payload["context"]["usedPercent"])
+        # 一轮都没跑过的会话给一份零值，面板据此按当前选中的模型自己补「总共多少」。
+        self.assertEqual(0, bridge.with_usage({"turns": []})["context"]["windowTokens"])
+
+    def test_codex_context_reading_is_the_last_request_not_the_thread_total(self):
+        """上下文是此刻提示词的长度：只有最近一次请求算数，线程累计不是它。"""
+        params = {
+            "tokenUsage": {
+                "last": {"inputTokens": 90000, "cachedInputTokens": 80000, "outputTokens": 1000, "totalTokens": 91000},
+                "total": {"inputTokens": 500000, "outputTokens": 9000, "totalTokens": 509000},
+                "modelContextWindow": 272000,
+            },
+        }
+
+        context = bridge.codex_turn_context(params, "gpt-5.6-terra")
+
+        self.assertEqual(91000, context["usedTokens"])
+        self.assertEqual(272000, context["windowTokens"])
+        self.assertEqual("gpt-5.6-terra", context["model"])
+        # 执行器没报窗口时按模型兜底，面板不会显示成「总共 0」。
+        self.assertEqual(
+            bridge.CODEX_DEFAULT_CONTEXT_WINDOW,
+            bridge.codex_turn_context({"tokenUsage": {"last": {"totalTokens": 100}}})["windowTokens"],
+        )
+
+    def test_claude_context_reading_follows_the_last_model_request(self):
+        """Claude 的一次请求 = 一条 assistant 事件：输入三段加输出才是占住的上下文。"""
+        event = {
+            "message": {
+                "model": "claude-opus-5",
+                "usage": {
+                    "input_tokens": 12,
+                    "cache_creation_input_tokens": 6000,
+                    "cache_read_input_tokens": 40000,
+                    "output_tokens": 300,
+                },
+            },
+        }
+
+        context = bridge.claude_message_context(event)
+
+        self.assertEqual(46312, context["usedTokens"])
+        # 回合跑到一半时窗口只能查表；result 事件到了再用执行器报的真值覆盖。
+        self.assertEqual(bridge.CLAUDE_DEFAULT_CONTEXT_WINDOW, context["windowTokens"])
+        self.assertEqual(
+            200000,
+            bridge.claude_context_window({"modelUsage": {"claude-opus-5": {"contextWindow": 200000}}}, "claude-opus-5"),
+        )
+        # 一轮里用过小模型时按主模型取，取不到就退回最大的那个。
+        self.assertEqual(
+            1000000,
+            bridge.claude_context_window({"modelUsage": {
+                "claude-haiku-4-5": {"contextWindow": 200000},
+                "claude-sonnet-5": {"contextWindow": 1000000},
+            }}),
+        )
+
+    def test_merged_journal_turns_keep_the_recorded_context(self):
+        """上下文读数和执行过程一样只在实时流里出现，合并时不能丢。"""
+        context = {"usedTokens": 51000, "windowTokens": 272000, "provider": "codex", "model": "gpt-5.6-terra"}
+        thread = {"turns": [{"id": "turn-1", "status": "completed", "items": []}]}
+
+        merged = bridge.merge_journal_turns(thread, [{"id": "turn-1", "status": "completed", "items": [], "context": context}])
+
+        self.assertEqual(context, merged["turns"][0]["context"])
 
     def test_requirement_sessions_ask_for_reasoning_summaries_and_task_runs_do_not(self):
         """需求对话读的是模型怎么想的，任务执行读的是命令和结论——摘要按会话类型开关。"""
@@ -2668,13 +2786,14 @@ class HttpBridgeTest(unittest.TestCase):
         self.assertEqual(1960, result["usage"]["total"]["totalTokens"])
 
     def test_requirement_usage_splits_requirement_sessions_by_block(self):
-        """拆解、原型、review、需求测试、微调各算各的；没跑过的块也留一行零值。"""
+        """需求分析、拆解、原型、review、需求测试、微调各算各的；没跑过的块也留一行零值。"""
         def usage(total):
             return {"inputTokens": total, "cachedInputTokens": 0, "outputTokens": 0, "reasoningOutputTokens": 0, "totalTokens": total, "costUsd": None}
 
         stored = {
             "thread-planning": usage(1000),
             "thread-prototype": usage(200),
+            "thread-analysis": usage(300),
             "thread-review": usage(70),
             "thread-testing": usage(90),
             "thread-fine-tuning": usage(40),
@@ -2690,6 +2809,7 @@ class HttpBridgeTest(unittest.TestCase):
                 ]
             if path == "/delivery/requirement/testing-sessions":
                 return [
+                    {"threadId": "thread-analysis", "metadata": {"kind": "requirement-analysis"}},
                     {"threadId": "thread-review", "metadata": {"kind": "requirement-review"}},
                     {"threadId": "thread-testing", "metadata": {"kind": "requirement-testing"}},
                     {"threadId": "thread-fine-tuning", "metadata": {"kind": "requirement-fine-tuning"}},
@@ -2712,9 +2832,10 @@ class HttpBridgeTest(unittest.TestCase):
 
         groups = {group["key"]: group for group in result["conversationGroups"]}
         self.assertEqual(
-            ["planning", "prototype", "review", "testing", "fineTuning"],
+            ["analysis", "planning", "prototype", "review", "testing", "fineTuning"],
             [group["key"] for group in result["conversationGroups"]],
         )
+        self.assertEqual(300, groups["analysis"]["usage"]["total"]["totalTokens"])
         self.assertEqual(1000, groups["planning"]["usage"]["total"]["totalTokens"])
         self.assertEqual(200, groups["prototype"]["usage"]["total"]["totalTokens"])
         self.assertEqual(70, groups["review"]["usage"]["total"]["totalTokens"])
@@ -2722,7 +2843,7 @@ class HttpBridgeTest(unittest.TestCase):
         self.assertEqual(2, groups["testing"]["threads"])
         self.assertEqual(40, groups["fineTuning"]["usage"]["total"]["totalTokens"])
         # 各块之和就是需求会话合计，别让面板上下两个数对不上。
-        self.assertEqual(1405, result["conversations"]["total"]["totalTokens"])
+        self.assertEqual(1705, result["conversations"]["total"]["totalTokens"])
 
     def test_thread_usage_reads_whichever_executor_cache_holds_the_thread(self):
         """会话表里的 executorType 可能过时；正文在哪个缓存里，就算哪个执行器的。"""
@@ -2771,6 +2892,29 @@ class HttpBridgeTest(unittest.TestCase):
         self.assertEqual(90, usage["outputTokens"])
         self.assertEqual(1390, usage["totalTokens"])
 
+    def test_thread_item_journal_records_the_context_window(self):
+        """同一条用量通知还带上下文占用：它按最近一次请求算，和累计用量各记各的。"""
+        with tempfile.TemporaryDirectory() as directory:
+            journal = bridge.ThreadItemJournal(Path(directory))
+            journal.note_model("t-c", "gpt-5.6-terra")
+            journal.record({"method": "turn/started", "params": {"threadId": "t-c", "turn": {"id": "turn-1"}}})
+            journal.record({
+                "method": "thread/tokenUsage/updated",
+                "params": {
+                    "threadId": "t-c", "turnId": "turn-1",
+                    "tokenUsage": {
+                        "total": {"inputTokens": 120000, "outputTokens": 4000, "totalTokens": 124000},
+                        "last": {"inputTokens": 60000, "cachedInputTokens": 55000, "outputTokens": 800, "totalTokens": 60800},
+                        "modelContextWindow": 272000,
+                    },
+                },
+            })
+            context = journal.read("t-c")[0]["context"]
+
+        self.assertEqual(60800, context["usedTokens"])
+        self.assertEqual(272000, context["windowTokens"])
+        self.assertEqual("gpt-5.6-terra", context["model"])
+
     def test_claude_result_event_carries_the_turn_token_usage(self):
         event = {
             "type": "result", "subtype": "success", "result": "做完了", "total_cost_usd": 0.42,
@@ -2789,6 +2933,22 @@ class HttpBridgeTest(unittest.TestCase):
         self.assertEqual(120, usage["reasoningOutputTokens"])
         self.assertEqual(11300, usage["totalTokens"])
         self.assertEqual(0.42, usage["costUsd"])
+
+    def test_serialized_turns_carry_the_context_reading_through_to_the_panel(self):
+        """会话正文要重新投影一遍才发给面板；上下文读数不能在这一步被过滤掉。"""
+        turns = bridge.serialize_turns([
+            {
+                "id": "turn-1", "status": "completed",
+                "items": [{"id": "a1", "type": "agentMessage", "text": "做完了"}],
+                "context": {"usedTokens": 88000, "windowTokens": 272000, "provider": "codex", "model": "gpt-5.6-terra"},
+            },
+            {"id": "turn-2", "status": "completed", "items": [{"id": "a2", "type": "agentMessage", "text": "再来一轮"}]},
+        ])
+
+        self.assertEqual(88000, turns[0]["context"]["usedTokens"])
+        # 没测到读数的回合不给字段，会话级读数据此往前找上一条。
+        self.assertNotIn("context", turns[1])
+        self.assertEqual(88000, bridge.with_usage({"turns": turns})["context"]["usedTokens"])
 
     def test_serialized_turns_carry_usage_only_when_the_executor_reported_it(self):
         turns = bridge.serialize_turns([
@@ -3129,13 +3289,66 @@ class HttpBridgeTest(unittest.TestCase):
             (workspace / "doc" / "core" / "task-a" / "文档.md").write_text("requirement", encoding="utf-8")
             (workspace / "doc" / "core" / "task-a" / "prototype").mkdir()
             (workspace / "doc" / "core" / "task-a" / "prototype" / "index.html").write_text("<main/>", encoding="utf-8")
-            entries, skipped = bridge.cloud_sync_workspace_entries(workspace, {"chat", "prototype"})
+            index = bridge.CloudDocumentIndex(
+                [{"requirementKey": "req-api"}],
+                [{"itemKey": "task-a", "requirementKey": "req-api", "moduleKey": "core"}],
+            )
+            entries, skipped = bridge.cloud_sync_workspace_entries(workspace, {"chat", "prototype"}, None, index)
 
         self.assertEqual(0, skipped)
         self.assertEqual(
             [("chat", "chat/requirements/req-api/task/聊天.md"), ("prototype", "doc/core/task-a/prototype/index.html")],
-            [(category, relative) for category, relative, _source, _content_type in entries],
+            [(entry.category, entry.relative_path) for entry in entries],
         )
+        # 归属和阶段跟着文件一起上云，面板才能把需求文档和任务文档分开展示。
+        self.assertEqual(
+            [("requirement", "req-api", "chat"), ("task", "task-a", "prototype")],
+            [(entry.owner_kind, entry.owner_key, entry.stage) for entry in entries],
+        )
+
+    def test_cloud_sync_splits_requirement_documents_by_stage(self):
+        """一条需求的文档要按阶段分开：拆解、原型、评审、测试、微调各归各的。"""
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            for relative, content in [
+                ("doc/requirements/req-api/需求大纲.md", "outline"),
+                ("doc/requirements/req-api/prototype/index.html", "<main/>"),
+                ("doc/review/req-api/review报告.md", "review"),
+                ("doc/test/req-api/测试用例.md", "cases"),
+                ("doc/fine-tuning/req-api/微调记录.md", "tuning"),
+            ]:
+                path = workspace / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content, encoding="utf-8")
+            index = bridge.CloudDocumentIndex([{"requirementKey": "req-api"}], [])
+            entries, skipped = bridge.cloud_sync_workspace_entries(
+                workspace, {"requirement", "prototype", "test"}, None, index,
+            )
+
+        self.assertEqual(0, skipped)
+        self.assertEqual(
+            {
+                "doc/requirements/req-api/需求大纲.md": ("requirement", "req-api", "outline"),
+                "doc/requirements/req-api/prototype/index.html": ("requirement", "req-api", "prototype"),
+                "doc/review/req-api/review报告.md": ("requirement", "req-api", "review"),
+                "doc/test/req-api/测试用例.md": ("requirement", "req-api", "testing"),
+                "doc/fine-tuning/req-api/微调记录.md": ("requirement", "req-api", "fine-tuning"),
+            },
+            {entry.relative_path: (entry.owner_kind, entry.owner_key, entry.stage) for entry in entries},
+        )
+
+    def test_cloud_sync_does_not_invent_an_owner_the_board_never_reported(self):
+        """面板没给过的键不能凭空变成一条需求或任务的分组。"""
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            path = workspace / "doc" / "unknown-module" / "unknown-task" / "文档.md"
+            path.parent.mkdir(parents=True)
+            path.write_text("orphan", encoding="utf-8")
+            entries, _skipped = bridge.cloud_sync_workspace_entries(
+                workspace, {"requirement"}, None, bridge.CloudDocumentIndex([], []),
+            )
+
+        self.assertEqual([("program", "", "requirement")], [(e.owner_kind, e.owner_key, e.stage) for e in entries])
 
     def test_cloud_sync_includes_test_execution_and_owning_attachments_only(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -3160,7 +3373,10 @@ class HttpBridgeTest(unittest.TestCase):
                 "id": "artifact-16", "programId": 16, "itemKey": "task-a", "relativePath": "server/result.txt",
             }), encoding="utf-8")
 
-            entries, skipped = bridge.cloud_sync_workspace_entries(workspace, {"test", "execution", "attachment"}, 16)
+            index = bridge.CloudDocumentIndex([], [{"itemKey": "task-a", "moduleKey": "core"}])
+            entries, skipped = bridge.cloud_sync_workspace_entries(
+                workspace, {"test", "execution", "attachment"}, 16, index,
+            )
 
         self.assertEqual(0, skipped)
         self.assertEqual(
@@ -3169,7 +3385,11 @@ class HttpBridgeTest(unittest.TestCase):
                 ("execution", "execution/task-a/server/result.txt"),
                 ("test", "doc/test/task-a/用例.md"),
             ],
-            [(category, relative) for category, relative, _source, _content_type in entries],
+            [(entry.category, entry.relative_path) for entry in entries],
+        )
+        self.assertEqual(
+            [("task", "task-a", "attachment"), ("task", "task-a", "execution"), ("task", "task-a", "testing")],
+            [(entry.owner_kind, entry.owner_key, entry.stage) for entry in entries],
         )
 
     def test_cloud_chat_sync_does_not_require_git_or_create_a_workspace_archive(self):
@@ -4629,6 +4849,83 @@ class HttpBridgeTest(unittest.TestCase):
         self.assertIn("测试用例.md", prompt)
         self.assertIn("不得输出验收判定", prompt)
         self.assertIn("Use a staging account.", prompt)
+
+    def test_requirement_analysis_prompt_clarifies_before_it_writes(self):
+        """澄清回合一个字都不许落盘；确认生成那一轮才允许写分析文档。"""
+        requirement = {"requirementKey": "req-a", "name": "结算改造", "detail": "支持分期"}
+
+        clarify = bridge.build_requirement_analysis_prompt(1, requirement, "想做分期结算", Path("/tmp/workspace"))
+        generate = bridge.build_requirement_analysis_prompt(
+            1, requirement, "信息补齐了", Path("/tmp/workspace"), generate_document=True,
+        )
+
+        self.assertIn("不要写任何文档、原型或业务代码", clarify)
+        self.assertIn("delivery-requirement-analysis", clarify)
+        # 技能不一定挂在工作目录根上，每个子工程的根目录都可能各带一份。
+        self.assertIn("子工程", clarify)
+        self.assertNotIn("需求分析文档已生成", clarify)
+        self.assertIn("doc/analysis/req-a/需求分析.md", generate)
+        self.assertIn("需求分析文档已生成", generate)
+
+    def test_requirement_analysis_prompt_only_draws_a_prototype_on_request(self):
+        requirement = {"requirementKey": "req-a", "name": "结算改造", "detail": "支持分期"}
+
+        without = bridge.build_requirement_analysis_prompt(1, requirement, "先聊聊", Path("/tmp/workspace"))
+        with_prototype = bridge.build_requirement_analysis_prompt(
+            1, requirement, "顺便画一版", Path("/tmp/workspace"), generate_prototype=True,
+        )
+
+        self.assertIn("本轮不需要画原型", without)
+        self.assertIn("doc/requirements/req-a/prototype", with_prototype)
+
+    def test_requirement_analysis_history_is_isolated_from_testing_and_review(self):
+        """需求分析和测试、review 共用一张会话表，三边的目录都只看得见自己那一类。"""
+        rows = [
+            {"threadId": "testing-thread", "title": "总体测试", "executorType": "codex", "metadata": {"kind": "requirement-testing"}},
+            {"threadId": "review-thread", "title": "代码 review", "executorType": "codex", "metadata": {"kind": "requirement-review"}},
+            {"threadId": "analysis-thread", "title": "需求分析", "executorType": "codex", "metadata": {"kind": "requirement-analysis"}},
+        ]
+
+        with tempfile.TemporaryDirectory() as directory:
+            executor = bridge.ExecutionBridge(Path(directory))
+            with patch.object(bridge.planner, "request_api", return_value=rows):
+                analysis = executor._load_requirement_analysis_session(self.runtime_config(), 1, "req-a", "codex")
+                testing = executor._load_requirement_testing_session(self.runtime_config(), 1, "req-a", "codex")
+                review = executor._load_requirement_review_session(self.runtime_config(), 1, "req-a", "codex")
+
+        self.assertEqual(["analysis-thread"], [entry["threadId"] for entry in analysis["catalog"]])
+        self.assertEqual(["testing-thread"], [entry["threadId"] for entry in testing["catalog"]])
+        self.assertEqual(["review-thread"], [entry["threadId"] for entry in review["catalog"]])
+
+    def test_requirement_analysis_column_lists_every_analysis_document(self):
+        """分析目录支持多份文档，主文档没落盘时也要能选到别的那份。"""
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            column = workspace / "doc/analysis/req-a"
+            column.mkdir(parents=True)
+            (column / "需求分析.md").write_text("# 分析\n", encoding="utf-8")
+            (column / "接口清单.md").write_text("# 接口\n", encoding="utf-8")
+            executor = bridge.ExecutionBridge(workspace)
+            with patch.object(executor, "_requirement_for_prototype", return_value={"requirementKey": "req-a"}):
+                result = executor.document_set(1, "requirement-analysis", "req-a", config=self.runtime_config())
+
+            self.assertEqual("doc/analysis/req-a/需求分析.md", result["primaryPath"])
+            self.assertEqual(
+                {"doc/analysis/req-a/需求分析.md", "doc/analysis/req-a/接口清单.md"},
+                {entry["path"] for entry in result["files"]},
+            )
+
+    def test_requirement_analysis_documents_can_be_mentioned_from_the_planning_chat(self):
+        """拆解聊天 @ 的分析文档必须真的在这条需求的分析目录里，别的路径一律拒掉。"""
+        references = bridge.conversation_references_of([
+            {"kind": "file", "key": "doc/analysis/req-a/需求分析.md", "scope": "requirement-analysis"},
+            {"kind": "file", "key": "../etc/passwd", "scope": "requirement-analysis"},
+        ])
+
+        self.assertEqual(
+            [{"kind": "file", "key": "doc/analysis/req-a/需求分析.md", "scope": "requirement-analysis"}],
+            references,
+        )
 
     def test_requirement_testing_history_excludes_review_sessions(self):
         """review 和测试共用一张会话表，两边的目录都只能看见自己那一类。"""
