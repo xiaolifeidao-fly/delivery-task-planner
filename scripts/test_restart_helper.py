@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -105,6 +106,40 @@ class RestartHelperTest(unittest.TestCase):
                 restart_helper.restart_windows_bridge(789, Path("/tmp/plugin"), [])
 
         fallback.assert_not_called()
+
+    def test_linux_restart_hands_over_to_systemd_instead_of_starting_a_second_bridge(self):
+        completed = SimpleNamespace(returncode=0, stdout="active", stderr="")
+        with (
+            patch.object(restart_helper.sys, "platform", "linux"),
+            patch.object(restart_helper.time, "sleep"),
+            patch.object(restart_helper.shutil, "which", return_value="/usr/bin/systemctl"),
+            patch.object(restart_helper.subprocess, "run", return_value=completed) as run,
+            patch.object(restart_helper.subprocess, "Popen") as popen,
+        ):
+            restart_helper.main(["--pid", "321", "--plugin-root", "/tmp/plugin", "--allow-origin", "*"])
+
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertIn(["systemctl", "--user", "is-active", restart_helper.SYSTEMD_USER_UNIT], commands)
+        self.assertIn(["systemctl", "--user", "restart", restart_helper.SYSTEMD_USER_UNIT], commands)
+        # systemd 已经在看着这个进程，自己再拉一个只会有两个 bridge 抢 8765。
+        popen.assert_not_called()
+
+    def test_linux_restart_falls_back_to_a_detached_relaunch_without_systemd(self):
+        with tempfile.TemporaryDirectory() as directory, (
+            patch.object(restart_helper.sys, "platform", "linux")
+        ), (
+            patch.object(restart_helper.time, "sleep")
+        ), (
+            patch.object(restart_helper.shutil, "which", return_value=None)
+        ), (
+            patch.object(restart_helper.Path, "home", return_value=Path(directory))
+        ), (
+            patch.object(restart_helper, "terminate_bridge")
+        ), patch.object(restart_helper.subprocess, "Popen") as popen:
+            restart_helper.main(["--pid", "321", "--plugin-root", "/tmp/plugin", "--allow-origin", "*"])
+
+        popen.assert_called_once()
+        self.assertIn("--allow-origin", popen.call_args.args[0])
 
     def test_bridge_health_url_preserves_custom_host_and_port(self):
         self.assertEqual(

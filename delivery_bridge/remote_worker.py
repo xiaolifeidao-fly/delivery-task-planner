@@ -46,8 +46,17 @@ from delivery_bridge.providers import ai_provider_of
 WORKSPACE_MAPPINGS_PATH = runtime.RUNTIME_DIR / "remote-worker-workspaces.json"
 WORKER_STATE_PATH = runtime.RUNTIME_DIR / "remote-worker.json"
 COMMAND_API_URL_ENV = "DELIVERY_COMMAND_API_URL"
+# 服务端地址跟 server.py 里的任务面板地址一样写死：只有这一套部署，而漏配的代价
+# 全落在用户那边——Worker 静默不启用，控制台本机功能一切正常，只有手机端一直显示
+# 「未登记执行电脑」，而且日志里除了那句「未启用」再没有别的线索。
+DEFAULT_COMMAND_API_URL = "http://47.110.3.214:10002/api"
+# 留一个明确的关闭开关：本地开发和测试仍然要能只跑回环桥接，不去连远端。
+COMMAND_API_URL_OFF_VALUES = {"off", "none", "disabled", "false", "0"}
 WORKER_ACTIVITY_SECONDS = 20
 WORKER_BACKOFF_SECONDS = 15
+# 当前账号能写哪些业务线：没有工作目录映射时，这是唯一能知道「往哪注册」的来源。
+# 空间成员关系变动不频繁，五分钟一问既跟得上，也不会把它变成新的轮询噪音。
+SPACES_REFRESH_SECONDS = 300
 MAX_RESULT_BYTES = 480 * 1024
 MAX_COMMAND_ATTACHMENT_COUNT = 5
 MAX_COMMAND_ATTACHMENT_BYTES = 20 * 1024 * 1024
@@ -232,15 +241,18 @@ def channel_of(command_type: str) -> tuple[dict[str, str], str, str] | None:
 
 
 def command_api_url(value: str = "") -> str:
-    """Return a configured app-api base URL, normalized to include ``/api``.
+    """Return the app-api base URL, normalized to include ``/api``.
 
     The address is deployment configuration, never a browser or command input.
-    Leaving it empty deliberately disables the background worker while keeping
-    the existing loopback bridge fully usable.
+    没配就用写死的默认值：这套插件只连这一套服务端，而「忘了传 --command-api-url」
+    和「插件根本没开」在面板上长得一模一样，代价远大于少一个默认值换来的灵活性。
+    只有把开关显式设成 off/none/disabled 时才退回纯回环桥接。
     """
     raw = str(value or os.environ.get(COMMAND_API_URL_ENV, "")).strip().rstrip("/")
-    if not raw:
+    if raw.lower() in COMMAND_API_URL_OFF_VALUES:
         return ""
+    if not raw:
+        return DEFAULT_COMMAND_API_URL
     parsed = urllib.parse.urlparse(raw)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.query or parsed.fragment:
         raise BridgeFailure(f"{COMMAND_API_URL_ENV} 必须是有效的 http 或 https URL")
@@ -342,7 +354,7 @@ class CommandAPI:
         timeout: int = 30,
     ) -> Any:
         if not self.base_url:
-            raise BridgeFailure(f"未配置 {COMMAND_API_URL_ENV}，远程命令 Worker 未启用")
+            raise BridgeFailure(f"{COMMAND_API_URL_ENV} 被设成了 off，远程命令 Worker 未启用")
         url = f"{self.base_url}{path}"
         values = {key: value for key, value in (query or {}).items() if value not in (None, "")}
         if values:
@@ -388,7 +400,7 @@ class CommandAPI:
         mapped local bridge attachment store.
         """
         if not self.base_url:
-            raise BridgeFailure(f"未配置 {COMMAND_API_URL_ENV}，远程命令 Worker 未启用")
+            raise BridgeFailure(f"{COMMAND_API_URL_ENV} 被设成了 off，远程命令 Worker 未启用")
         value = str(attachment_id or "").strip()
         if not re.fullmatch(r"attachment-[a-f0-9]{32}", value):
             raise BridgeFailure("远程命令附件标识无效")
@@ -482,6 +494,13 @@ class RemoteCommandWorker:
         self._reading_lock = threading.Lock()
         self._reading_command = ""
         self._registered_identity: tuple[str, tuple[tuple[str, tuple[int, ...]], ...]] | None = None
+        # 已经注册成功、因而可以发心跳的业务线。注册失败的那条不能跟着发心跳：
+        # 服务端会回「记录不存在」，把一条业务线的问题变成整轮的异常。
+        self._registered_biz_lines: set[str] = set()
+        self._biz_lines: tuple[str, ...] = ()
+        self._biz_lines_key = ""
+        self._biz_lines_at = 0
+        self._spaces_error = ""
         self.last_error = ""
         self.last_registered_at = 0
         self._last_state = ""
@@ -512,6 +531,9 @@ class RemoteCommandWorker:
                 {"programId": item["programId"], "bizLine": item["bizLine"], "workspace": Path(item["workspace"]).name}
                 for item in self.mappings.snapshot()
             ],
+            # 登记成功、正在发心跳的业务线：一台机器为什么在某条线上显示离线，
+            # 答案要么在这里（压根没注册上），要么在上面的映射里。
+            "registeredBizLines": sorted(self._registered_biz_lines),
             "runningCommand": self._running_command,
             "readingCommand": self._reading_command,
             "lastError": self.last_error,
@@ -529,14 +551,13 @@ class RemoteCommandWorker:
         self.stop_event.set()
 
     def run_forever(self) -> None:
-        # 禁用和坏掉在日志里必须长得不一样。没有这一行时，一个漏配
-        # DELIVERY_COMMAND_API_URL 的 bridge 会安静地空转，面板上只剩一句
-        # 「未登记执行电脑」，日志里一条线索都没有。
+        # 禁用和坏掉在日志里必须长得不一样：地址现在有写死的默认值，走到「未启用」
+        # 这一支只可能是有人显式关掉了，日志得把这句话说全，别让人再去翻启动参数。
         if self.api_url:
             print(f"远程命令 Worker 已启用：{self.api_url}（worker {self.worker_id}）", flush=True)
         else:
             print(
-                "远程命令 Worker 未启用：没有配置 DELIVERY_COMMAND_API_URL，也没有传 --command-api-url。"
+                f"远程命令 Worker 已被显式关闭（{COMMAND_API_URL_ENV} 或 --command-api-url 设成了 off）。"
                 "任务面板会一直显示「未登记执行电脑」，本机回环接口不受影响。",
                 flush=True,
             )
@@ -565,13 +586,13 @@ class RemoteCommandWorker:
             return False
         config = planner.load_config()
         mappings = self.mappings.snapshot()
-        if not mappings:
-            # 同样别静默：没有映射时 Worker 一次心跳都不会发，面板上的表现和
-            # 插件没开完全一样，只有这行日志能把两者分开。
-            self._log_state("no-mappings", "远程命令 Worker 空转：本机还没有登记任何项目工作目录映射，不会注册也不会领命令。")
-            self.stop_event.wait(WORKER_BACKOFF_SECONDS)
-            return False
-        self._log_state("mapped", f"远程命令 Worker 已登记 {len(mappings)} 个项目工作目录映射。")
+        if mappings:
+            self._log_state("mapped", f"远程命令 Worker 已登记 {len(mappings)} 个项目工作目录映射。")
+        else:
+            # 没有映射也要注册上线：这台电脑确实在听，只是还没有哪个项目落到本机。
+            # 早先这里直接空转，服务端一行 Worker 都没有，客户端只能说「未登记执行
+            # 电脑」——和插件根本没开长得一模一样，谁也查不出差别在哪。
+            self._log_state("no-mappings", "远程命令 Worker 已上线，但本机还没有登记任何项目工作目录映射：领不到命令，请先在控制台给项目选一次本机工作目录。")
         api = CommandAPI(self.api_url)
         self._register(api, config, mappings)
         claim_body: dict[str, Any] = {"workerId": self.worker_id}
@@ -597,29 +618,91 @@ class RemoteCommandWorker:
         self._run_claimed(api, config, command, lease_token, mapping, read_only=bool(command_types))
         return True
 
+    def _writable_biz_lines(self, api: CommandAPI, config: dict[str, Any]) -> list[str]:
+        """当前账号能写的业务线。
+
+        本机一个工作目录映射都没有时，业务线无从推断——注册到哪条线只有服务端知道。
+        换账号（凭证变了）必须立刻重问，否则会拿上一个账号的空间去注册。
+        """
+        key = str(config.get("key") or "")
+        now = int(time.time())
+        if key == self._biz_lines_key and now - self._biz_lines_at < SPACES_REFRESH_SECONDS:
+            return list(self._biz_lines)
+        try:
+            spaces = api.request(config, "GET", "/spaces")
+        except BridgeFailure:
+            if key == self._biz_lines_key:
+                # 问不到就先用上一次的答案：空间成员关系不会秒级变化，一次网络抖动
+                # 不该让这台机器从所有业务线上消失。换了账号（key 变了）才必须报错。
+                return list(self._biz_lines)
+            raise
+        codes: set[str] = set()
+        for space in spaces or []:
+            if not isinstance(space, dict) or not space.get("canWrite"):
+                continue
+            code = str(space.get("code") or "").strip()
+            if code:
+                codes.add(code)
+        self._biz_lines = tuple(sorted(codes))
+        self._biz_lines_key = key
+        self._biz_lines_at = now
+        return list(self._biz_lines)
+
     def _register(self, api: CommandAPI, config: dict[str, Any], mappings: list[dict[str, Any]]) -> None:
         by_biz_line: dict[str, list[int]] = {}
+        try:
+            for biz_line in self._writable_biz_lines(api, config):
+                by_biz_line.setdefault(biz_line, [])
+        except BridgeFailure as exc:
+            # 空间列表问不到不该拦住已有映射：那些业务线本来就知道自己往哪注册。
+            # 单独记一份「上次说过的话」，别和 run_once 的状态行共用——两边交替出现
+            # 时会把 15 秒一轮的重试刷成满屏。
+            message = _safe_text(str(exc), None, 256)
+            if message != self._spaces_error:
+                self._spaces_error = message
+                print(f"远程命令 Worker 读不到可写业务线，先只注册已绑定的项目：{message}", flush=True)
+        else:
+            self._spaces_error = ""
         for mapping in mappings:
             by_biz_line.setdefault(str(mapping["bizLine"]), []).append(int(mapping["programId"]))
+        # 不再属于自己的业务线要从心跳里摘掉，否则会一直给一台已经不该在听的机器续命。
+        self._registered_biz_lines &= set(by_biz_line)
         fingerprint = tuple(sorted((line, tuple(sorted(set(ids)))) for line, ids in by_biz_line.items()))
         identity = (str(config.get("key") or ""), fingerprint)
         now = int(time.time())
         if identity != self._registered_identity or now - self.last_registered_at >= 60:
             display = f"{platform.node() or 'delivery'} remote worker"
-            for biz_line, program_ids in by_biz_line.items():
-                api.request(
-                    config, "POST", "/workers/register", biz_line=biz_line,
-                    body={
-                        "workerId": self.worker_id,
-                        "displayName": display[:128],
-                        "capabilities": sorted(COMMAND_CAPABILITIES),
-                        "programIds": sorted(set(program_ids)),
-                    },
-                )
-            self._registered_identity = identity
+            failures: list[str] = []
+            for biz_line, program_ids in sorted(by_biz_line.items()):
+                try:
+                    api.request(
+                        config, "POST", "/workers/register", biz_line=biz_line,
+                        body={
+                            "workerId": self.worker_id,
+                            "displayName": display[:128],
+                            "capabilities": sorted(COMMAND_CAPABILITIES),
+                            "programIds": sorted(set(program_ids)),
+                        },
+                    )
+                    self._registered_biz_lines.add(biz_line)
+                except BridgeFailure as exc:
+                    # 一条业务线注册失败只影响它自己。串成一条链的时候，映射里一个
+                    # 被删掉的项目就能让整台机器在所有业务线上一起掉线。
+                    self._registered_biz_lines.discard(biz_line)
+                    failures.append(f"{biz_line}：{_safe_text(str(exc), None, 256)}")
             self.last_registered_at = now
-        for biz_line in by_biz_line:
-            api.request(config, "POST", "/workers/heartbeat", biz_line=biz_line, body={"workerId": self.worker_id})
+            # 有失败就不要记住这次身份：下一轮（十几秒后）再试，而不是等满 60 秒。
+            self._registered_identity = None if failures else identity
+            if failures:
+                print("远程命令 Worker 有业务线注册失败，其余业务线不受影响：" + "；".join(failures), flush=True)
+        for biz_line in sorted(self._registered_biz_lines):
+            try:
+                api.request(config, "POST", "/workers/heartbeat", biz_line=biz_line, body={"workerId": self.worker_id})
+            except BridgeFailure as exc:
+                # 心跳被拒说明服务端那行没了（换账号、被清理），下一轮重新注册。
+                self._registered_biz_lines.discard(biz_line)
+                self._registered_identity = None
+                print(f"远程命令 Worker 心跳失败，下一轮会重新登记（{biz_line}）：{_safe_text(str(exc), None, 256)}", flush=True)
 
     def _run_claimed(
         self,

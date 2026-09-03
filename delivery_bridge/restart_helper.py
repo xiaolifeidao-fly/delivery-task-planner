@@ -17,6 +17,7 @@ from urllib.request import urlopen
 
 
 LAUNCH_AGENT_LABEL = "com.universe.delivery-task-planner.codex-bridge"
+SYSTEMD_USER_UNIT = "delivery-task-planner-bridge.service"
 RESTART_WAIT_ATTEMPTS = 100
 WINDOWS_READY_TIMEOUT_SECONDS = 30.0
 
@@ -56,10 +57,15 @@ def parse_arguments(argv: Sequence[str] | None = None) -> tuple[argparse.Namespa
     return args, bridge_args
 
 
-def terminate_for_launch_agent(pid: int) -> None:
+def terminate_for_supervisor(pid: int, supervisor: str = "LaunchAgent KeepAlive") -> None:
+    """交给常驻托管去拉起来。
+
+    进程管理器已经在看着这个 pid 时，绝不能自己再 Popen 一个：那会有两个 bridge
+    抢同一个 8765 端口，后起的那个直接起不来，用户看到的却是「重启过了」。
+    """
     try:
         os.kill(pid, signal.SIGTERM)
-        restart_log(f"Sent SIGTERM to bridge pid {pid}; LaunchAgent KeepAlive will relaunch it.")
+        restart_log(f"Sent SIGTERM to bridge pid {pid}; {supervisor} will relaunch it.")
     except OSError as exc:
         restart_log(f"Bridge pid {pid} was already gone: {exc}")
     for _ in range(RESTART_WAIT_ATTEMPTS):
@@ -67,6 +73,41 @@ def terminate_for_launch_agent(pid: int) -> None:
             return
         time.sleep(0.1)
     raise RuntimeError(f"bridge pid {pid} did not stop")
+
+
+def terminate_for_launch_agent(pid: int) -> None:
+    terminate_for_supervisor(pid)
+
+
+def systemd_user_unit_active(unit: str = SYSTEMD_USER_UNIT) -> bool:
+    """这台 Linux 上的 bridge 是不是由 systemd --user 托管着。"""
+    if not shutil.which("systemctl"):
+        return False
+    try:
+        completed = subprocess.run(
+            ["systemctl", "--user", "is-active", unit],
+            check=False, capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        restart_log(f"systemctl --user is-active failed: {exc}")
+        return False
+    return completed.returncode == 0 and completed.stdout.strip() == "active"
+
+
+def restart_systemd_user_bridge(unit: str = SYSTEMD_USER_UNIT) -> bool:
+    try:
+        completed = subprocess.run(
+            ["systemctl", "--user", "restart", unit],
+            check=False, capture_output=True, text=True, timeout=45,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        restart_log(f"systemctl --user restart failed: {exc}")
+        return False
+    restart_log(
+        f"systemctl --user restart exited {completed.returncode}: "
+        f"{(completed.stderr or completed.stdout).strip() or 'no output'}"
+    )
+    return completed.returncode == 0
 
 
 def terminate_bridge(pid: int) -> None:
@@ -121,8 +162,8 @@ def wait_for_bridge_ready(bridge_args: Sequence[str], timeout: float = WINDOWS_R
 def windows_service_arguments(bridge_args: Sequence[str]) -> tuple[str, str, str]:
     """重装计划任务时要把启动参数原样带回去。
 
-    漏掉 ``--command-api-url`` 不会报错，只会让远程命令 Worker 在下次重启后静默
-    禁用——任务面板上就变成「未登记执行电脑」，而日志里什么都查不到。
+    ``--command-api-url`` 现在有写死的默认值，漏掉它只是回到默认地址；但显式关闭
+    （off）同样走这个参数，不带回去就会把用户关掉的 Worker 悄悄打开。
     """
     workspace = ""
     allow_origin = "*"
@@ -229,12 +270,19 @@ def main(argv: Sequence[str] | None = None, home_dir: Path | None = None) -> Non
                     return
             except (OSError, subprocess.SubprocessError) as exc:
                 restart_log(f"launchctl kickstart failed: {exc}")
-            terminate_for_launch_agent(args.pid)
+            terminate_for_supervisor(args.pid)
             return
 
     plugin_root = Path(args.plugin_root).resolve()
     if sys.platform == "win32":
         restart_windows_bridge(args.pid, plugin_root, bridge_args)
+        return
+
+    if sys.platform.startswith("linux") and systemd_user_unit_active():
+        if restart_systemd_user_bridge():
+            return
+        # 单元还活着，Restart=always 会把它拉回来；这里再 Popen 一个只会撞端口。
+        terminate_for_supervisor(args.pid, f"systemd --user ({SYSTEMD_USER_UNIT})")
         return
 
     terminate_bridge(args.pid)

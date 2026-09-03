@@ -20,12 +20,18 @@ from delivery_bridge.execution import ExecutionBridge
 
 
 class FakeCommandAPI:
-    def __init__(self, claimed):
+    def __init__(self, claimed, spaces=None, failing_biz_lines=()):
         self.claimed = claimed
+        self.spaces = spaces if spaces is not None else []
+        self.failing_biz_lines = set(failing_biz_lines)
         self.calls = []
 
     def request(self, _config, method, path, **kwargs):
         self.calls.append((method, path, kwargs))
+        if path == "/spaces":
+            return self.spaces
+        if path == "/workers/register" and kwargs.get("biz_line") in self.failing_biz_lines:
+            raise BridgeFailure("远程命令接口请求失败：记录不存在")
         if path == "/workers/commands/claim":
             result, self.claimed = self.claimed, None
             return result
@@ -51,6 +57,20 @@ class RootBridge:
 
 
 class RemoteWorkerTest(unittest.TestCase):
+    def test_command_api_url_falls_back_to_the_baked_in_address(self):
+        """漏配不能再让 Worker 静默禁用：那会让「插件没开」和「插件开着但没登记」
+        在面板上长成同一句话，而日志里只有一行「未启用」。"""
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(remote_worker.DEFAULT_COMMAND_API_URL, remote_worker.command_api_url())
+        with patch.dict(os.environ, {remote_worker.COMMAND_API_URL_ENV: "https://app-api.example.test"}, clear=True):
+            self.assertEqual("https://app-api.example.test/api", remote_worker.command_api_url())
+            self.assertEqual("https://other.example.test/api", remote_worker.command_api_url("https://other.example.test"))
+        # 显式关闭仍然要能退回纯回环桥接，本地开发不该被强行连上远端。
+        with patch.dict(os.environ, {remote_worker.COMMAND_API_URL_ENV: "off"}, clear=True):
+            self.assertEqual("", remote_worker.command_api_url())
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual("", remote_worker.command_api_url("OFF"))
+
     def test_workspace_mapping_is_local_and_prunes_missing_directories(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -117,6 +137,64 @@ class RemoteWorkerTest(unittest.TestCase):
             self.assertEqual("succeeded", complete["state"])
             self.assertEqual(["doc/module/a/文档.md"], complete["result"]["files"])
             self.assertNotIn(str(workspace), str(complete))
+
+    def test_worker_registers_every_writable_space_before_any_workspace_is_bound(self):
+        """插件起来就该在服务端留下一行，哪怕本机还没绑过任何项目。
+
+        早先没有映射就一次注册都不发，客户端只能说「未登记执行电脑」——和插件根本
+        没开完全同一句话，用户没有任何办法把两者分开。
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            store = remote_worker.WorkspaceMappingStore(Path(directory) / "mappings.json")
+            api = FakeCommandAPI(None, spaces=[
+                {"code": "yinni", "name": "印尼业务线", "canWrite": True},
+                {"code": "onlyread", "name": "只读空间", "canWrite": False},
+            ])
+            worker = remote_worker.RemoteCommandWorker(
+                object(), mappings=store, api_url="https://app.example.test", worker_id="worker-test",
+            )
+
+            with (
+                patch.object(remote_worker, "CommandAPI", return_value=api),
+                patch.object(remote_worker.planner, "load_config", return_value={"key": "token", "key_header": "token", "user_id": "user"}),
+            ):
+                self.assertFalse(worker.run_once(wait_seconds=1))
+
+            registered = [(kwargs["biz_line"], kwargs["body"]["programIds"]) for _method, path, kwargs in api.calls if path == "/workers/register"]
+            # 只读空间不注册：那里本来也不允许这台机器写任何东西。
+            self.assertEqual([("yinni", [])], registered)
+            self.assertEqual(["yinni"], [kwargs["biz_line"] for _method, path, kwargs in api.calls if path == "/workers/heartbeat"])
+
+    def test_one_failing_business_line_keeps_the_others_registered_and_beating(self):
+        """一条业务线注册失败不能连坐：映射里一个被删掉的项目曾经足以让整台机器
+        在所有业务线上一起显示离线，而日志里只有一行「记录不存在」。"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            store = remote_worker.WorkspaceMappingStore(root / "mappings.json")
+            store.record(16, workspace, "whatsapp")
+            api = FakeCommandAPI(None, spaces=[
+                {"code": "yinni", "canWrite": True},
+                {"code": "whatsapp", "canWrite": True},
+            ], failing_biz_lines={"whatsapp"})
+            worker = remote_worker.RemoteCommandWorker(
+                object(), mappings=store, api_url="https://app.example.test", worker_id="worker-test",
+            )
+
+            with (
+                patch.object(remote_worker, "CommandAPI", return_value=api),
+                patch.object(remote_worker.planner, "load_config", return_value={"key": "token", "key_header": "token", "user_id": "user"}),
+            ):
+                self.assertFalse(worker.run_once(wait_seconds=1))
+
+            self.assertEqual(
+                ["whatsapp", "yinni"],
+                sorted(kwargs["biz_line"] for _method, path, kwargs in api.calls if path == "/workers/register"),
+            )
+            self.assertEqual(["yinni"], [kwargs["biz_line"] for _method, path, kwargs in api.calls if path == "/workers/heartbeat"])
+            # 失败过就不记住这次身份，下一轮十几秒后重试，而不是等满 60 秒。
+            self.assertIsNone(worker._registered_identity)
 
     def test_worker_rejects_unknown_commands_without_dynamic_dispatch(self):
         worker = remote_worker.RemoteCommandWorker(object(), api_url="https://app.example.test", worker_id="worker-test")

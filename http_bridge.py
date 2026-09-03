@@ -2557,7 +2557,7 @@ def main() -> None:
     parser.add_argument(
         "--command-api-url",
         default=os.environ.get("DELIVERY_COMMAND_API_URL", ""),
-        help="app-api base URL for the optional remote command Worker (for example https://api.example.com)",
+        help="app-api base URL for the remote command Worker; defaults to the address baked into remote_worker.py, pass off to disable",
     )
     # 进程级工作目录是可选的：真正干活的目录由每个请求带的 workspace 决定（见 for_workspace）。
     # 不给就落到一个空的中性占位目录，绝不拿安装目录或启动目录冒充某个项目的仓库。
