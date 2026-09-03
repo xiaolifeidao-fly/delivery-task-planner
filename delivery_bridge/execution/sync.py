@@ -22,7 +22,7 @@ from delivery_bridge.chat_archive import (
     cloud_sync_workspace_entries,
     read_workspace_chat_archive,
 )
-from delivery_bridge.cloud_documents import CloudDocumentIndex
+from delivery_bridge.cloud_documents import CloudDocumentIndex, chat_archive_owner_of
 from delivery_bridge.clients.pool import (
     ACTIVE_THREAD_READ_TIMEOUT_SECONDS,
     THREAD_READERS,
@@ -208,7 +208,10 @@ class SyncMixin:
                     )
                     print(f"聊天记录已归档：{relative.as_posix()}", file=sys.stderr, flush=True)
                 if "chat" in cloud_scopes:
-                    owning_requirement = resource_key if resource_kind == "requirement" else requirement_key
+                    # 归属跟着刚拼出来的归档路径走：任务会话归任务，需求会话归需求。
+                    # 这里的任务键来自正在跑的这条任务本身，比事后照目录名反推可靠，
+                    # 所以不经过 CloudDocumentIndex——那一路要防的是路径里的陌生目录名。
+                    owner_kind, owner_key = chat_archive_owner_of(resource_kind, resource_key, requirement_key)
                     self._upload_cloud_sync_file(
                         config,
                         program_id,
@@ -227,8 +230,8 @@ class SyncMixin:
                             terminal_status=terminal_status,
                             turns=turns,
                         ).encode("utf-8"),
-                        "requirement" if owning_requirement else "program",
-                        owning_requirement,
+                        owner_kind,
+                        owner_key,
                         "chat",
                     )
             document_scopes = cloud_scopes - {"chat"}

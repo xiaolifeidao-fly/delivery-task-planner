@@ -54,8 +54,13 @@ MAX_COMMAND_ATTACHMENT_BYTES = 20 * 1024 * 1024
 BUSINESS_POLL_SECONDS = 2
 # 业务访谈回传的是给业务方看的整段回复，确认文档那一轮就是一篇完整业务文档。
 # 任务类命令的 4096 字截断会把它切掉，所以按命令类型放宽单条文本上限。
-COMMAND_TEXT_LIMITS = {"business.conversation": 60000}
+COMMAND_TEXT_LIMITS = {"business.conversation": 60000, "task.conversation": 20000, "task.planning": 20000}
 DEFAULT_COMMAND_TEXT_LIMIT = 4096
+# 回合跑着的时候，正文顺着活动流一起回传：手机端因此不必每隔几秒单独发一条快照
+# 命令去读同一段文字。节奏跟界面对齐，上限留出余量给服务端 64KB 的活动体。
+LIVE_SNAPSHOT_SECONDS = 3
+MAX_LIVE_SNAPSHOT_BYTES = 32 * 1024
+LIVE_SNAPSHOT_COMMANDS = frozenset({"task.conversation", "task.planning"})
 
 
 # These are the only command names a remote client can cause the worker to
@@ -63,6 +68,24 @@ DEFAULT_COMMAND_TEXT_LIMIT = 4096
 # Python attribute, or shell process.
 COMMAND_CAPABILITIES = frozenset({
     "business.conversation",
+    # 需求窗口里的辅助会话：分析、原型、评审、总体测试、微调。
+    "requirement.analysis",
+    "requirement.analysis-stop",
+    "requirement.prototype",
+    "requirement.prototype-message",
+    "requirement.review",
+    "requirement.review-stop",
+    "requirement.testing",
+    "requirement.testing-stop",
+    "requirement.fine-tuning",
+    "requirement.fine-tuning-stop",
+    # 任务窗口里的辅助会话：测试用例与微调，各自带一条只读的会话读取。
+    "task.testing",
+    "task.testing-stop",
+    "task.testing-session",
+    "task.fine-tuning",
+    "task.fine-tuning-stop",
+    "task.fine-tuning-session",
     "task.execute",
     "task.execute-batch",
     "task.execute-sequence",
@@ -72,6 +95,7 @@ COMMAND_CAPABILITIES = frozenset({
     "task.planning-session",
     "task.planning-stop",
     "requirement.usage",
+    "requirement.session",
     "task.stop",
     "task.stop-all",
     "git.status",
@@ -96,8 +120,12 @@ COMMAND_CAPABILITIES = frozenset({
 READ_ONLY_COMMAND_CAPABILITIES = frozenset({
     "task.session",
     "task.planning-session",
+    "task.testing-session",
+    "task.fine-tuning-session",
     # 只查用量：读会话表和本机的会话缓存，不动工作目录，也不起回合。
     "requirement.usage",
+    # 只读某一块需求会话的正文，同样不起回合。
+    "requirement.session",
     "git.status",
     "git.branches",
     "git.changes",
@@ -106,6 +134,101 @@ READ_ONLY_COMMAND_CAPABILITIES = frozenset({
     "git.merge-preview",
     "git.workspace-check",
 })
+
+
+# 需求窗口里每个入口的会话正文由各自的桥接方法读。这张表是常量：命令带来的分块名
+# 必须先在这里查到才会拿到方法名，远程命令碰不到表以外的任何属性。
+#
+# 拆解不在表里 —— 它在移动端是能接着聊的整屏会话，读正文走 task.planning-session。
+REQUIREMENT_SESSION_READERS = {
+    "analysis": "requirement_analysis",
+    "prototype": "requirement_prototype_conversation",
+    "review": "requirement_review",
+    "testing": "requirement_testing",
+    "fineTuning": "requirement_fine_tuning",
+}
+
+# 需求窗口与任务窗口里的辅助会话。发起、停止、读快照三个动作形状完全一样，只有本机
+# 方法不同 —— 做成表而不是十几段一样的分支，新增一条通道只是多一行。
+#
+# 这些通道在本机桥接里早就有了，一直没接出远程命令：手机上因此走不完一条需求，
+# 拆解和执行做得了，评审、测试、微调必须回电脑。
+REQUIREMENT_CHANNELS: dict[str, dict[str, str]] = {
+    "analysis": {
+        "send": "send_requirement_analysis", "stop": "stop_requirement_analysis",
+        "read": "requirement_analysis", "identity": "_requirement_analysis_identity", "label": "需求分析",
+    },
+    "prototype": {
+        # 原型只有「生成」和「继续聊」，没有单独的停止入口。
+        "send": "send_requirement_prototype_message", "generate": "generate_requirement_prototype",
+        "read": "requirement_prototype_conversation", "identity": "_requirement_prototype_identity", "label": "需求原型",
+    },
+    "review": {
+        "send": "send_requirement_review", "stop": "stop_requirement_review",
+        "read": "requirement_review", "identity": "_requirement_review_identity", "label": "需求评审",
+    },
+    "testing": {
+        "send": "send_requirement_testing", "stop": "stop_requirement_testing",
+        "read": "requirement_testing", "identity": "_requirement_testing_identity", "label": "需求总体测试",
+    },
+    "fineTuning": {
+        "send": "send_requirement_fine_tuning", "stop": "stop_requirement_fine_tuning",
+        "read": "requirement_fine_tuning", "identity": "_requirement_fine_tuning_identity", "label": "需求微调",
+    },
+}
+
+TASK_CHANNELS: dict[str, dict[str, str]] = {
+    "testing": {
+        "send": "generate_task_testing_cases", "stop": "stop_task_testing_cases",
+        "read": "task_testing_cases_conversation", "identity": "_task_testing_cases_identity", "label": "任务测试用例",
+    },
+    "fineTuning": {
+        "send": "send_task_fine_tuning", "stop": "stop_task_fine_tuning",
+        "read": "task_fine_tuning_conversation", "identity": "_task_fine_tuning_identity", "label": "任务微调",
+    },
+}
+
+# 命令类型 -> (需求侧还是任务侧, 通道键, 动作)
+CHANNEL_COMMANDS: dict[str, tuple[str, str, str]] = {
+    "requirement.analysis": ("requirement", "analysis", "send"),
+    "requirement.analysis-stop": ("requirement", "analysis", "stop"),
+    "requirement.prototype": ("requirement", "prototype", "generate"),
+    "requirement.prototype-message": ("requirement", "prototype", "send"),
+    "requirement.review": ("requirement", "review", "send"),
+    "requirement.review-stop": ("requirement", "review", "stop"),
+    "requirement.testing": ("requirement", "testing", "send"),
+    "requirement.testing-stop": ("requirement", "testing", "stop"),
+    "requirement.fine-tuning": ("requirement", "fineTuning", "send"),
+    "requirement.fine-tuning-stop": ("requirement", "fineTuning", "stop"),
+    "task.testing": ("task", "testing", "send"),
+    "task.testing-stop": ("task", "testing", "stop"),
+    "task.testing-session": ("task", "testing", "read"),
+    "task.fine-tuning": ("task", "fineTuning", "send"),
+    "task.fine-tuning-stop": ("task", "fineTuning", "stop"),
+    "task.fine-tuning-session": ("task", "fineTuning", "read"),
+}
+
+
+def live_snapshot_command(command_type: str) -> bool:
+    """这条命令跑着的时候，正文值不值得顺着活动流回传。
+
+    发起一轮会话的命令都算：拆解、任务对话，以及需求与任务窗口里那几条辅助会话。
+    停止和只读快照不算 —— 它们本来就是一问一答。
+    """
+    if command_type in LIVE_SNAPSHOT_COMMANDS:
+        return True
+    route = CHANNEL_COMMANDS.get(command_type)
+    return bool(route) and route[2] in {"send", "generate"}
+
+
+def channel_of(command_type: str) -> tuple[dict[str, str], str, str] | None:
+    """命令类型对应的通道定义、作用域和动作；不是通道命令时回 None。"""
+    route = CHANNEL_COMMANDS.get(command_type)
+    if route is None:
+        return None
+    scope, channel_key, action = route
+    channels = REQUIREMENT_CHANNELS if scope == "requirement" else TASK_CHANNELS
+    return channels[channel_key], scope, action
 
 
 def command_api_url(value: str = "") -> str:
@@ -304,6 +427,10 @@ class CommandReporter:
             str(command.get("commandType") or "").strip().lower(), DEFAULT_COMMAND_TEXT_LIMIT,
         )
         self._last_report_at = 0.0
+        # 正文按增量回传：记住这一轮已经发过的条目，避免每拍把整轮重发一遍。
+        self.live_published_at = 0.0
+        self.live_turn_id = ""
+        self.live_items: dict[str, str] = {}
 
     @property
     def command_id(self) -> str:
@@ -548,6 +675,8 @@ class RemoteCommandWorker:
             # 业务访谈自己按轮次回传会话快照，服务端读的是最近一条活动。
             # 这里再插一条通用进度会把那份快照顶掉，让访谈界面回退成空白。
             return
+        if live_snapshot_command(command_type) and self._relay_live_turn(reporter, mapping, command_type):
+            return
         input_value = reporter.command.get("input") if isinstance(reporter.command.get("input"), dict) else {}
         item_key = str(input_value.get("itemKey") or "").strip()
         if command_type.startswith("task.") and item_key:
@@ -562,6 +691,93 @@ class RemoteCommandWorker:
                 })
                 return
         reporter.report("Worker 正在执行本机操作", 10, {"commandType": command_type})
+
+    def _relay_live_turn(self, reporter: CommandReporter, mapping: dict[str, Any], command_type: str) -> bool:
+        """把正在跑的这一轮正文顺着活动流回传。
+
+        手机端原先每隔几秒单独发一条 task.session / task.planning-session，只为把
+        Worker 手边就有的同一段文字取回来：一分钟十几条命令、十几次领取、十几行结果。
+        回合本身已经在按节奏上报活动，正文跟着一起走就够了。
+
+        只回传增量 —— 新出现的条目和正在长的那一条。整轮正文每拍重发一遍，会在服务端
+        的事件表里堆出几十份几乎一样的内容。
+
+        读不到会话不算错：回合刚起步时本机还没有任何正文，这时候退回通用进度行即可。
+        """
+        now = time.monotonic()
+        if now - reporter.live_published_at < LIVE_SNAPSHOT_SECONDS:
+            # 还没到下一拍，但这条命令归本函数管：不要再落一行通用进度。
+            return True
+        try:
+            snapshot = self._read_live_snapshot(reporter, mapping, command_type)
+        except Exception:
+            # 会话文件可能正被执行器改写，这一拍读不到就等下一拍。
+            reporter.live_published_at = now
+            return True
+        turn = _active_turn(snapshot)
+        if turn is None:
+            return False
+        turn_id = str(turn.get("id") or "")
+        if turn_id != reporter.live_turn_id:
+            # 换了一轮就从头发：界面上那一轮是新的，之前的指纹不作数。
+            reporter.live_turn_id = turn_id
+            reporter.live_items = {}
+        items = [item for item in turn.get("items") or [] if isinstance(item, dict)]
+        delta = []
+        for index, item in enumerate(items):
+            key = str(item.get("id") or f"index-{index}")
+            fingerprint = json.dumps(item, ensure_ascii=False, sort_keys=True)
+            if reporter.live_items.get(key) == fingerprint:
+                continue
+            reporter.live_items[key] = fingerprint
+            delta.append(item)
+        reporter.live_published_at = now
+        if not delta:
+            # 模型思考期间正文可以几十秒不变，没有新内容就不写这一行事件。
+            return True
+        live = {
+            "threadId": str(snapshot.get("threadId") or ""),
+            "turnId": turn_id,
+            "status": str(turn.get("status") or ""),
+            "createdAt": str(turn.get("createdAt") or ""),
+            "active": bool(snapshot.get("active", True)),
+            "executorType": str(snapshot.get("executorType") or ""),
+            "items": _bounded_live_items(delta),
+        }
+        if isinstance(turn.get("usage"), dict):
+            live["usage"] = turn["usage"]
+        if isinstance(snapshot.get("context"), dict):
+            live["context"] = snapshot["context"]
+        reporter.report("执行电脑正在处理这一轮", 50, {"live": live}, force=True)
+        return True
+
+    def _read_live_snapshot(self, reporter: CommandReporter, mapping: dict[str, Any], command_type: str) -> dict[str, Any]:
+        value = reporter.command.get("input") if isinstance(reporter.command.get("input"), dict) else {}
+        program_id = program_id_of(reporter.command.get("programId"))
+        bridge = self.bridge.for_workspace(mapping["workspace"])
+        # 业务线优先取命令自己的：等待回合完成的几个循环只带了工作目录，取不到就
+        # 会一路抛异常，实时正文表面上接上了、实际一条都发不出去。
+        biz_line = str(mapping.get("bizLine") or reporter.command.get("bizLine") or "")
+        config = {**reporter.config, "_project_id": program_id, "_biz_line": biz_line}
+        provider = str(value.get("provider") or "codex")
+        # 线程一律交给本机判定：跑着的那一轮就在当前会话里，界面传来的 threadId
+        # 可能还是上一条会话的。
+        route = channel_of(command_type)
+        if route is not None:
+            channel, scope, _action = route
+            key = str(value.get("requirementKey") or "") if scope == "requirement" else str(value.get("itemKey") or "")
+            return self._read_channel_session(bridge, channel, config, program_id, key, "", provider)
+        if command_type == "task.planning":
+            return bridge.planning(
+                program_id,
+                selected_thread_id="",
+                config=config,
+                requirement_key=str(value.get("requirementKey") or ""),
+                provider=provider,
+            )
+        return bridge.conversation(
+            program_id, str(value.get("itemKey") or ""), "", config=config, provider=provider,
+        )
 
     def _dispatch(
         self,
@@ -585,7 +801,10 @@ class RemoteCommandWorker:
         }
         if command_type == "business.conversation":
             return self._dispatch_business(input_value, program_id, reporter)
-        if command_type.startswith("task."):
+        # 需求级的读取（用量、需求窗口各入口的会话）跟任务命令走同一条分发：它们要的
+        # 都是这个工作目录下的执行器会话。漏掉 requirement. 这一前缀，命令会掉进 Git
+        # 分发里被当成未知类型拒掉 —— 手机上「消耗」就是这么打不开的。
+        if command_type.startswith("task.") or command_type.startswith("requirement."):
             return self._dispatch_task(command_type, input_value, workspace_bridge, task_config, program_id, reporter)
         if command_type == "documents.cloud-sync":
             return workspace_bridge.sync_cloud_workspace(program_id, task_config)
@@ -685,9 +904,12 @@ class RemoteCommandWorker:
         program_id: int,
         reporter: CommandReporter,
     ) -> dict[str, Any]:
+        """跑一条要用到本机执行器会话的命令：任务的，以及需求级的用量和会话读取。"""
         payload = {key: item for key, item in value.items() if key != "workspace"}
         payload["programId"] = program_id
         payload["bizLine"] = config["_biz_line"]
+        if command_type in CHANNEL_COMMANDS:
+            return self._dispatch_channel(command_type, payload, bridge, config, program_id, reporter)
         if command_type == "task.execute":
             item_key = _item_key(payload)
             payload["task"] = bridge._task_detail(config, program_id, item_key)
@@ -699,6 +921,19 @@ class RemoteCommandWorker:
         if command_type == "requirement.usage":
             return bridge.requirement_usage(
                 program_id, str(payload.get("requirementKey") or ""), config=config,
+            )
+        if command_type == "requirement.session":
+            # 消耗面板列出了需求侧各块花了多少，点进来读的就是那一块的会话正文。
+            group = str(payload.get("group") or "")
+            reader = REQUIREMENT_SESSION_READERS.get(group)
+            if reader is None:
+                raise BridgeFailure(f"不支持的需求会话分块：{group or '（空）'}")
+            return getattr(bridge, reader)(
+                program_id,
+                _requirement_key(payload),
+                str(payload.get("threadId") or ""),
+                ai_provider_of(payload.get("provider") or "codex"),
+                config=config,
             )
         if command_type == "task.session":
             item_key = _item_key(payload)
@@ -806,14 +1041,78 @@ class RemoteCommandWorker:
             return bridge.merge_time_plan_branches({"programId": program_id, **value}, config=config)
         raise BridgeFailure(f"Worker 不支持远程命令类型：{command_type}")
 
-    def _wait_for_task(self, bridge: Any, config: dict[str, Any], program_id: int, item_key: str, reporter: CommandReporter) -> None:
-        identity = ("", program_id, item_key)
+    def _dispatch_channel(
+        self,
+        command_type: str,
+        payload: dict[str, Any],
+        bridge: Any,
+        config: dict[str, Any],
+        program_id: int,
+        reporter: CommandReporter,
+    ) -> dict[str, Any]:
+        """需求与任务窗口里的辅助会话：分析、原型、评审、测试、微调。
+
+        发起要等本机这一轮真的跑完再回结果，和拆解、任务对话一个规矩：命令的终态就是
+        「这一轮结束了」，手机端据此收进度条、落通知。结果里带上最终快照，界面不必为了
+        拿正文再单独读一次。
+        """
+        route = channel_of(command_type)
+        if route is None:
+            raise BridgeFailure(f"Worker 不支持远程命令类型：{command_type}")
+        channel, scope, action = route
+        key = _requirement_key(payload) if scope == "requirement" else _item_key(payload)
+        provider = ai_provider_of(payload.get("provider") or "codex")
+        if action == "read":
+            return self._read_channel_session(bridge, channel, config, program_id, key, str(payload.get("threadId") or ""), provider)
+        if action == "stop":
+            return getattr(bridge, channel["stop"])(payload, config)
+        result = getattr(bridge, channel["generate"] if action == "generate" else channel["send"])(payload, config)
+        self._wait_for_channel(bridge, channel, scope, config, program_id, key, provider, reporter)
+        if isinstance(result, dict):
+            result["session"] = self._read_channel_session(
+                bridge, channel, config, program_id, key, str(result.get("threadId") or ""), provider,
+            )
+        return result
+
+    @staticmethod
+    def _read_channel_session(
+        bridge: Any, channel: dict[str, str], config: dict[str, Any],
+        program_id: int, key: str, thread_id: str, provider: str,
+    ) -> dict[str, Any]:
+        return getattr(bridge, channel["read"])(program_id, key, thread_id, provider, config=config)
+
+    def _wait_for_channel(
+        self,
+        bridge: Any,
+        channel: dict[str, str],
+        scope: str,
+        config: dict[str, Any],
+        program_id: int,
+        key: str,
+        provider: str,
+        reporter: CommandReporter,
+    ) -> None:
+        identity_of = getattr(bridge, channel["identity"])
+        # 任务侧的会话按执行器分开存，识别键要带上 provider；需求侧不分。
+        identity = identity_of(program_id, key) if scope == "requirement" else identity_of(program_id, key, provider)
+        mapping = {"workspace": str(bridge.workspace), "bizLine": str(config.get("_biz_line") or "")}
         while True:
             with bridge.lock:
                 active = identity in bridge.active
             if not active:
                 return
-            self._relay_progress(reporter, {"workspace": str(bridge.workspace)})
+            self._relay_progress(reporter, mapping)
+            self.stop_event.wait(1)
+
+    def _wait_for_task(self, bridge: Any, config: dict[str, Any], program_id: int, item_key: str, reporter: CommandReporter) -> None:
+        identity = ("", program_id, item_key)
+        mapping = {"workspace": str(bridge.workspace), "bizLine": str(config.get("_biz_line") or "")}
+        while True:
+            with bridge.lock:
+                active = identity in bridge.active
+            if not active:
+                return
+            self._relay_progress(reporter, mapping)
             self.stop_event.wait(1)
 
     def _planning_payload(
@@ -956,6 +1255,33 @@ def _best_effort_sync(bridge: Any, program_id: int, config: dict[str, Any]) -> d
         return bridge.sync_cloud_workspace(program_id, config)
     except Exception as exc:
         return {"enabled": False, "error": _safe_text(str(exc), bridge.workspace)}
+
+
+def _active_turn(snapshot: Any) -> dict[str, Any] | None:
+    """快照里正在跑的那一轮：优先按 activeTurnId 认，认不出就取最后一轮。"""
+    if not isinstance(snapshot, dict):
+        return None
+    turns = [turn for turn in snapshot.get("turns") or [] if isinstance(turn, dict)]
+    if not turns:
+        return None
+    active_id = str(snapshot.get("activeTurnId") or "")
+    if active_id:
+        for turn in turns:
+            if str(turn.get("id") or "") == active_id:
+                return turn
+    return turns[-1]
+
+
+def _bounded_live_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """活动体在服务端有 64KB 上限，超了整条上报会失败、把回合一起带崩。
+
+    实时正文超限时留最新的几条：用户盯着的是回合的末尾，而完整正文在回合结束后
+    会由一次完整快照补齐。
+    """
+    bounded = list(items)
+    while bounded and len(json.dumps(bounded, ensure_ascii=False).encode("utf-8")) > MAX_LIVE_SNAPSHOT_BYTES:
+        bounded.pop(0)
+    return bounded
 
 
 def _safe_text(value: Any, workspace: Path | None, limit: int = 4096) -> str:

@@ -35,6 +35,14 @@ FINE_TUNING_DOCUMENT_ROOT = "fine-tuning"
 # review 报告固定写在 doc/review/<需求键>/ 下。
 REVIEW_DOCUMENT_ROOT = "review"
 
+# 聊天归档的目录树：chat/requirements/<需求键>/[task/<任务键>/]<标题>--<线程>.md。
+# 归档路径和这里的归属判断必须读同一组常量，写进去的目录才认得回来。
+CHAT_ARCHIVE_DIRECTORY_NAME = "chat"
+
+CHAT_ARCHIVE_REQUIREMENTS_DIRECTORY_NAME = "requirements"
+
+CHAT_ARCHIVE_TASK_DIRECTORY_NAME = "task"
+
 _KEY_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
 
 # 任务文档目录里的子目录到阶段的映射；没列出来的子目录仍归到这条任务的需求文档。
@@ -60,6 +68,36 @@ def _synthetic_key_tail(item_key: str) -> str:
     if not value.startswith("__"):
         return value
     return value.rsplit(":", 1)[-1].strip()
+
+
+def cloud_document_key_component(key: str) -> str:
+    """归属键拿去当目录名时的安全形式，认不了就返回空串。
+
+    目录名要能被 `CloudDocumentIndex.classify` 原样读回来，所以这里不做转义、
+    不做替换：不满足键格式就交空串，让调用方退回上一层归属，而不是造一个
+    面板认不回来的目录。
+    """
+    value = _synthetic_key_tail(key)
+    return value if _KEY_RE.fullmatch(value) else ""
+
+
+def chat_archive_owner_of(resource_kind: str, resource_key: str, requirement_key: str = "") -> tuple[str, str]:
+    """一条聊天归档的归属：任务会话归任务，需求会话归需求。
+
+    归档当时用，键直接来自正在跑的那条任务，是可信的；`CloudDocumentIndex.classify`
+    是事后照目录名反推，只认面板报过的键。两者对同一条路径的结论通常一致，任务后来被
+    删掉时会不一致：那时清单里已经没有这条任务，重传按需求归档，聊天反而还找得到。
+
+    任务键当不了目录名时归档路径停在 task/ 那一层，这里跟着退回需求，别让归属指向
+    一个路径里根本没有的目录。
+    """
+    if str(resource_kind or "") == "task":
+        task_key = cloud_document_key_component(resource_key)
+        if task_key:
+            return "task", task_key
+        resource_key = requirement_key
+    owning_requirement = cloud_document_key_component(resource_key)
+    return ("requirement", owning_requirement) if owning_requirement else ("program", "")
 
 
 class CloudDocumentIndex:
@@ -129,11 +167,17 @@ class CloudDocumentIndex:
         if not parts:
             return "program", "", ""
 
-        if parts[0] == "chat":
-            # 归档路径是 chat/requirements/<需求键>/[task/]<标题>--<线程>.md。
-            if len(parts) >= 3 and parts[1] == "requirements":
+        if parts[0] == CHAT_ARCHIVE_DIRECTORY_NAME:
+            # 归档路径是 chat/requirements/<需求键>/[task/<任务键>/]<标题>--<线程>.md。
+            if len(parts) >= 3 and parts[1] == CHAT_ARCHIVE_REQUIREMENTS_DIRECTORY_NAME:
                 kind, key = self._owner_of_key(parts[2])
                 if kind == "requirement":
+                    # 任务会话在 task/ 下多带一段任务键，归到那条任务自己的会话栏。
+                    # 旧归档没有这一段（task/ 下直接是文件），仍然归到所属需求。
+                    if len(parts) >= 6 and parts[3] == CHAT_ARCHIVE_TASK_DIRECTORY_NAME:
+                        task_kind, task_key = self._owner_of_key(parts[4])
+                        if task_kind == "task":
+                            return "task", task_key, "chat"
                     return "requirement", key, "chat"
             return "program", "", "chat"
 

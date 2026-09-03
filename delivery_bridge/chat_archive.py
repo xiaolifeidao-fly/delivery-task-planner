@@ -19,7 +19,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .cloud_documents import CloudDocumentIndex
+from .cloud_documents import (
+    CHAT_ARCHIVE_DIRECTORY_NAME,
+    CHAT_ARCHIVE_REQUIREMENTS_DIRECTORY_NAME,
+    CHAT_ARCHIVE_TASK_DIRECTORY_NAME,
+    CloudDocumentIndex,
+    cloud_document_key_component,
+)
 from .documents import DOCUMENT_SET_SUFFIXES
 from .errors import BridgeFailure
 from .attachments_text import text_without_attachment_context
@@ -29,13 +35,9 @@ from .turn_output import file_changes_of, text_from_user_item
 
 # 每一轮结束后，把面板可见的聊天正文备份到当前项目工作目录。它是可随项目
 # 共享的人工可读副本，不替代 Codex / Claude 保留的原始执行器会话。
-CHAT_ARCHIVE_DIRECTORY_NAME = "chat"
-
-# New archives are grouped by the owning requirement, so requirement and task
-# conversations for the same delivery stay together in a repository.
-CHAT_ARCHIVE_REQUIREMENTS_DIRECTORY_NAME = "requirements"
-
-CHAT_ARCHIVE_TASK_DIRECTORY_NAME = "task"
+#
+# 归档按所属需求分组，需求和任务的聊天放在一起；任务的再落一层任务键。
+# 三个目录名从 cloud_documents 引进来，写归档和判归属才不会各写各的。
 
 # 早期版本使用大写目录；只用于恢复既有记录，所有新归档一律写入 chat/。
 LEGACY_CHAT_ARCHIVE_DIRECTORY_NAME = "Chat"
@@ -103,6 +105,11 @@ def chat_archive_relative_path(
     directory = Path(CHAT_ARCHIVE_DIRECTORY_NAME) / CHAT_ARCHIVE_REQUIREMENTS_DIRECTORY_NAME / requirement_directory
     if resource_kind == "task":
         directory /= CHAT_ARCHIVE_TASK_DIRECTORY_NAME
+        # 再落一层任务键，面板才能把这条聊天认到具体任务上。标题会改、线程 id 认不出业务，
+        # 只有任务键是稳定的。键当不了目录名时不硬塞，停在 task/ 这层按需求归档。
+        task_directory = cloud_document_key_component(resource_key)
+        if task_directory:
+            directory /= task_directory
     return directory / f"{title}--{thread}.md"
 
 def visible_chat_archive_turns(turns: Any) -> list[dict[str, Any]]:

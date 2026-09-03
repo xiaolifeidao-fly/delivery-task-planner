@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import json
 import os
 import sys
 import tempfile
@@ -157,9 +158,10 @@ class RemoteWorkerTest(unittest.TestCase):
                 bridge.active.clear()
 
         with patch.object(worker, "_relay_progress", side_effect=clear_active) as relay:
-            worker._wait_for_task(bridge, {"_project_id": 16}, 16, "task-a", reporter)
+            worker._wait_for_task(bridge, {"_project_id": 16, "_biz_line": "whatsapp"}, 16, "task-a", reporter)
 
-        relay.assert_called_once_with(reporter, {"workspace": "/workspace"})
+        # 业务线必须一起带下去：少了它，等待回合期间的实时正文一条都发不出去。
+        relay.assert_called_once_with(reporter, {"workspace": "/workspace", "bizLine": "whatsapp"})
 
     def test_task_conversation_downloads_server_attachment_before_local_dispatch(self):
         bridge = MagicMock()
@@ -292,6 +294,127 @@ class RemoteWorkerTest(unittest.TestCase):
         bridge.conversation.assert_called_once_with(16, "task-a", "", config={"_project_id": 16, "_biz_line": "whatsapp"}, provider="codex")
         self.assertEqual("thread-1", result["threadId"])
 
+    def test_running_turn_relays_conversation_text_as_activity_increments(self):
+        """回合跑着时正文顺着活动流走，手机端因此不必再单独发快照命令。"""
+        local = MagicMock()
+        local.conversation.return_value = {
+            "threadId": "thread-1", "activeTurnId": "turn-1", "active": True, "executorType": "codex",
+            "turns": [
+                {"id": "turn-0", "status": "completed", "items": [{"id": "old", "text": "上一轮的回复"}]},
+                {"id": "turn-1", "status": "running", "items": [{"id": "a", "text": "正在改文件"}]},
+            ],
+        }
+        root = MagicMock()
+        root.for_workspace.return_value = local
+        worker = remote_worker.RemoteCommandWorker(root, api_url="https://app.example.test", worker_id="worker-test")
+        reporter = remote_worker.CommandReporter(
+            MagicMock(), {"key": "k"},
+            {"commandId": "cmd-1", "bizLine": "whatsapp", "commandType": "task.conversation", "programId": 16,
+             "input": {"itemKey": "task-a"}},
+            "worker-test", "lease-1",
+        )
+        mapping = {"workspace": Path("/workspace"), "bizLine": "whatsapp"}
+
+        self.assertTrue(worker._relay_progress(reporter, mapping) is None)
+        first = reporter.api.request.call_args.kwargs["body"]["data"]["live"]
+        # 只带正在跑的那一轮，历史回合不重复占活动体。
+        self.assertEqual(["a"], [item["id"] for item in first["items"]])
+        self.assertEqual("turn-1", first["turnId"])
+
+        # 同一拍之内不再重复上报：节奏由 LIVE_SNAPSHOT_SECONDS 决定。
+        reporter.api.request.reset_mock()
+        worker._relay_progress(reporter, mapping)
+        reporter.api.request.assert_not_called()
+
+        # 下一拍只回传新长出来的那条，已经发过的不再重发。
+        reporter.live_published_at = 0.0
+        local.conversation.return_value["turns"][1]["items"].append({"id": "b", "text": "改完了"})
+        worker._relay_progress(reporter, mapping)
+        second = reporter.api.request.call_args.kwargs["body"]["data"]["live"]
+        self.assertEqual(["b"], [item["id"] for item in second["items"]])
+
+        # 回合刚起步、本机还没有任何正文时退回通用进度行，回合本身不受影响。
+        reporter.live_published_at = 0.0
+        reporter._last_report_at = 0.0
+        local.conversation.return_value = {"turns": []}
+        local.progress.snapshot.return_value = []
+        reporter.api.request.reset_mock()
+        worker._relay_progress(reporter, mapping)
+        self.assertNotIn("live", reporter.api.request.call_args.kwargs["body"]["data"])
+
+    def test_live_turn_items_stay_inside_the_activity_size_limit(self):
+        oversized = [{"id": f"item-{index}", "text": "改" * 4000} for index in range(20)]
+        bounded = remote_worker._bounded_live_items(oversized)
+        self.assertLess(len(bounded), len(oversized))
+        self.assertEqual("item-19", bounded[-1]["id"])
+        self.assertLessEqual(
+            len(json.dumps(bounded, ensure_ascii=False).encode("utf-8")), remote_worker.MAX_LIVE_SNAPSHOT_BYTES,
+        )
+
+    def test_requirement_channel_command_waits_for_the_local_turn_and_returns_the_snapshot(self):
+        """评审这类辅助会话和拆解一个规矩：命令跑完了，才算这一轮结束。"""
+        bridge = MagicMock()
+        bridge.workspace = Path("/workspace")
+        bridge.lock = threading.Lock()
+        bridge.send_requirement_review.return_value = {"accepted": True, "threadId": "thread-9"}
+        bridge.requirement_review.return_value = {"threadId": "thread-9", "turns": [{"id": "t1"}]}
+        bridge._requirement_review_identity.return_value = ("review", 16, "req-a")
+        bridge.active = {("review", 16, "req-a")}
+        worker = remote_worker.RemoteCommandWorker(object(), api_url="https://app.example.test", worker_id="worker-test")
+
+        def clear_active(*_args):
+            with bridge.lock:
+                bridge.active.clear()
+
+        with patch.object(worker, "_relay_progress", side_effect=clear_active):
+            result = worker._dispatch_task(
+                "requirement.review",
+                {"programId": 16, "requirementKey": "req-a", "message": "评审一下"},
+                bridge,
+                {"_project_id": 16, "_biz_line": "whatsapp"},
+                16,
+                MagicMock(),
+            )
+
+        self.assertEqual("req-a", bridge.send_requirement_review.call_args.args[0]["requirementKey"])
+        # 回合结束后把最终快照带上，手机端不必为了拿正文再单独读一次。
+        self.assertEqual("thread-9", result["session"]["threadId"])
+        bridge.requirement_review.assert_called_once_with(
+            16, "req-a", "thread-9", "codex", config={"_project_id": 16, "_biz_line": "whatsapp"},
+        )
+
+    def test_task_channel_commands_cover_send_stop_and_read(self):
+        bridge = MagicMock()
+        bridge.workspace = Path("/workspace")
+        bridge.lock = threading.Lock()
+        bridge.active = set()
+        bridge.task_fine_tuning_conversation.return_value = {"threadId": "thread-1", "turns": []}
+        worker = remote_worker.RemoteCommandWorker(object(), api_url="https://app.example.test", worker_id="worker-test")
+        config = {"_project_id": 16, "_biz_line": "whatsapp"}
+
+        worker._dispatch_task("task.fine-tuning-session", {"programId": 16, "itemKey": "task-a"}, bridge, config, 16, MagicMock())
+        bridge.task_fine_tuning_conversation.assert_called_once_with(16, "task-a", "", "codex", config=config)
+
+        worker._dispatch_task("task.testing-stop", {"programId": 16, "itemKey": "task-a"}, bridge, config, 16, MagicMock())
+        bridge.stop_task_testing_cases.assert_called_once()
+
+        # 只读的两条会话读取要走 Worker 的只读通道，否则长任务占着执行通道时读不到。
+        self.assertIn("task.fine-tuning-session", remote_worker.READ_ONLY_COMMAND_CAPABILITIES)
+        self.assertIn("task.testing-session", remote_worker.READ_ONLY_COMMAND_CAPABILITIES)
+        # 停止和只读不该被当成「有正文可流式回传」的回合。
+        self.assertTrue(remote_worker.live_snapshot_command("requirement.review"))
+        self.assertFalse(remote_worker.live_snapshot_command("requirement.review-stop"))
+        self.assertFalse(remote_worker.live_snapshot_command("task.fine-tuning-session"))
+
+    def test_every_channel_command_is_registered_as_a_capability(self):
+        """能力表漏一条，命令就会一直排在队列里没人领 —— 这种缺失只有清单能挡住。"""
+        for command_type in remote_worker.CHANNEL_COMMANDS:
+            self.assertIn(command_type, remote_worker.COMMAND_CAPABILITIES, command_type)
+            channel, scope, action = remote_worker.channel_of(command_type)
+            self.assertIn(action, {"send", "generate", "stop", "read"}, command_type)
+            self.assertIn(scope, {"requirement", "task"}, command_type)
+            self.assertIn("read", channel, command_type)
+
     def test_planning_command_is_whitelisted_and_returns_the_planning_snapshot(self):
         bridge = MagicMock()
         bridge.workspace = Path("/workspace")
@@ -339,6 +462,63 @@ class RemoteWorkerTest(unittest.TestCase):
         )
         self.assertEqual("thread-1", result["threadId"])
         self.assertLessEqual(remote_worker.READ_ONLY_COMMAND_CAPABILITIES, remote_worker.COMMAND_CAPABILITIES)
+
+    def test_requirement_commands_reach_the_session_dispatch_not_the_git_one(self):
+        """需求级命令必须从 _dispatch 就走到会话分发。
+
+        白名单里放行、_dispatch_task 里也接住了，中间那步却按 `task.` 前缀分流 ——
+        手机上「消耗」因此一直收到「Worker 不支持远程命令类型」。这条盯的是那一步。
+        """
+        bridge = MagicMock()
+        bridge.requirement_usage.return_value = {"requirementKey": "req-a", "tasks": []}
+        root = MagicMock()
+        root.for_workspace.return_value = bridge
+        worker = remote_worker.RemoteCommandWorker(root, api_url="https://app.example.test", worker_id="worker-test")
+
+        result = worker._dispatch(
+            {"programId": 16, "commandType": "requirement.usage", "input": {"requirementKey": "req-a"}},
+            {"workspace": "/workspace", "bizLine": "whatsapp"}, {}, MagicMock(),
+        )
+
+        bridge.requirement_usage.assert_called_once()
+        self.assertEqual("req-a", result["requirementKey"])
+
+    def test_requirement_session_reads_only_the_block_the_command_names(self):
+        """消耗面板点进某一块，读的就是那一块自己的会话正文。"""
+        bridge = MagicMock()
+        bridge.requirement_review.return_value = {"threadId": "thread-1", "turns": []}
+        worker = remote_worker.RemoteCommandWorker(object(), api_url="https://app.example.test", worker_id="worker-test")
+
+        result = worker._dispatch_task(
+            "requirement.session",
+            {"programId": 16, "requirementKey": "req-a", "group": "review", "threadId": "thread-1"},
+            bridge,
+            {"_project_id": 16, "_biz_line": "whatsapp"},
+            16,
+            MagicMock(),
+        )
+
+        bridge.requirement_review.assert_called_once_with(
+            16, "req-a", "thread-1", "codex", config={"_project_id": 16, "_biz_line": "whatsapp"},
+        )
+        bridge.requirement_testing.assert_not_called()
+        self.assertEqual("thread-1", result["threadId"])
+        self.assertIn("requirement.session", remote_worker.READ_ONLY_COMMAND_CAPABILITIES)
+
+    def test_requirement_session_refuses_blocks_outside_the_reader_table(self):
+        """分块名只能在常量表里查，查不到就拒 —— 命令拿不到表以外的任何桥接方法。"""
+        bridge = MagicMock()
+        worker = remote_worker.RemoteCommandWorker(object(), api_url="https://app.example.test", worker_id="worker-test")
+
+        with self.assertRaisesRegex(BridgeFailure, "不支持的需求会话分块"):
+            worker._dispatch_task(
+                "requirement.session",
+                {"programId": 16, "requirementKey": "req-a", "group": "sync_cloud_workspace"},
+                bridge,
+                {"_project_id": 16, "_biz_line": "whatsapp"},
+                16,
+                MagicMock(),
+            )
 
 
 if __name__ == "__main__":

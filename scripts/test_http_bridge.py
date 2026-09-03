@@ -2570,7 +2570,7 @@ class HttpBridgeTest(unittest.TestCase):
             {
                 "type": "result", "subtype": "success", "is_error": False, "result": "做完了",
                 "usage": {"input_tokens": 40, "cache_creation_input_tokens": 25000, "cache_read_input_tokens": 20000, "output_tokens": 210},
-                "modelUsage": {"claude-opus-5": {"contextWindow": 200000}},
+                "modelUsage": {"claude-opus-5": {"contextWindow": 1000000}},
             },
         ]
         with tempfile.TemporaryDirectory() as workspace:
@@ -2588,7 +2588,7 @@ class HttpBridgeTest(unittest.TestCase):
 
         # 后一次请求盖前一次：占用是此刻提示词的长度，不是两次相加。
         self.assertEqual(25150, turn["context"]["usedTokens"])
-        self.assertEqual(200000, turn["context"]["windowTokens"])
+        self.assertEqual(1000000, turn["context"]["windowTokens"])
         self.assertEqual("claude-opus-5", turn["context"]["model"])
 
     def test_merged_journal_turns_keep_the_recorded_usage(self):
@@ -2604,17 +2604,17 @@ class HttpBridgeTest(unittest.TestCase):
         """每个对话窗口都要能回答「上下文用了多少、还剩多少、总共多少」。"""
         payload = bridge.with_usage({
             "turns": [
-                {"id": "t1", "context": {"usedTokens": 30000, "windowTokens": 200000, "provider": "claude", "model": "claude-opus-5"}},
+                {"id": "t1", "context": {"usedTokens": 30000, "windowTokens": 1000000, "provider": "claude", "model": "claude-opus-5"}},
                 # 起标题这类回合没有读数，不能把它当成「上下文清空了」。
                 {"id": "t2"},
-                {"id": "t3", "context": {"usedTokens": 120000, "windowTokens": 200000, "provider": "claude", "model": "claude-opus-5"}},
+                {"id": "t3", "context": {"usedTokens": 120000, "windowTokens": 1000000, "provider": "claude", "model": "claude-opus-5"}},
             ],
         })
 
         self.assertEqual(120000, payload["context"]["usedTokens"])
-        self.assertEqual(80000, payload["context"]["remainingTokens"])
-        self.assertEqual(200000, payload["context"]["windowTokens"])
-        self.assertEqual(60.0, payload["context"]["usedPercent"])
+        self.assertEqual(880000, payload["context"]["remainingTokens"])
+        self.assertEqual(1000000, payload["context"]["windowTokens"])
+        self.assertEqual(12.0, payload["context"]["usedPercent"])
         # 一轮都没跑过的会话给一份零值，面板据此按当前选中的模型自己补「总共多少」。
         self.assertEqual(0, bridge.with_usage({"turns": []})["context"]["windowTokens"])
 
@@ -2659,8 +2659,8 @@ class HttpBridgeTest(unittest.TestCase):
         # 回合跑到一半时窗口只能查表；result 事件到了再用执行器报的真值覆盖。
         self.assertEqual(bridge.CLAUDE_DEFAULT_CONTEXT_WINDOW, context["windowTokens"])
         self.assertEqual(
-            200000,
-            bridge.claude_context_window({"modelUsage": {"claude-opus-5": {"contextWindow": 200000}}}, "claude-opus-5"),
+            1000000,
+            bridge.claude_context_window({"modelUsage": {"claude-opus-5": {"contextWindow": 1000000}}}, "claude-opus-5"),
         )
         # 一轮里用过小模型时按主模型取，取不到就退回最大的那个。
         self.assertEqual(
@@ -2670,6 +2670,21 @@ class HttpBridgeTest(unittest.TestCase):
                 "claude-sonnet-5": {"contextWindow": 1000000},
             }}),
         )
+
+    def test_context_window_fallback_follows_the_model_not_the_executor(self):
+        """执行器没报窗口时查的这张表：能选的档位是 1M，别再拿 haiku 的 200K 当 Claude 的默认。
+
+        实测 `claude -p --model opus|sonnet` 的 result.modelUsage[模型].contextWindow 都是
+        1000000，haiku 才是 200000——面板选不到 haiku，但起标题和子代理会用上它。
+        """
+        self.assertEqual(1_000_000, bridge.default_context_window("claude", "opus"))
+        self.assertEqual(1_000_000, bridge.default_context_window("claude", "claude-sonnet-5"))
+        # 一轮都没跑过、连模型名都还没有的新会话，也该按能选到的档位显示。
+        self.assertEqual(1_000_000, bridge.default_context_window("claude"))
+        self.assertEqual(200_000, bridge.default_context_window("claude", "claude-haiku-4-5-20251001"))
+        # 带 [1m] 标记的长上下文档位一定是 1M，不按小模型算。
+        self.assertEqual(1_000_000, bridge.default_context_window("claude", "claude-haiku-4-5[1m]"))
+        self.assertEqual(bridge.CODEX_DEFAULT_CONTEXT_WINDOW, bridge.default_context_window("codex", "gpt-5.6-terra"))
 
     def test_merged_journal_turns_keep_the_recorded_context(self):
         """上下文读数和执行过程一样只在实时流里出现，合并时不能丢。"""
@@ -3176,7 +3191,7 @@ class HttpBridgeTest(unittest.TestCase):
 
         self.assertEqual("thread-1", client.last_thread_id)
         self.assertEqual(1, len(archives))
-        self.assertEqual("chat/requirements/req-api/task/实现 API--thread-1.md", archive_relative.as_posix())
+        self.assertEqual("chat/requirements/req-api/task/task-api/实现 API--thread-1.md", archive_relative.as_posix())
         self.assertIn('requirementKey: "req-api"', content)
         self.assertIn("第一轮", content)
         self.assertIn("第二轮完成", content)
@@ -3306,6 +3321,49 @@ class HttpBridgeTest(unittest.TestCase):
             [(entry.owner_kind, entry.owner_key, entry.stage) for entry in entries],
         )
 
+    def test_cloud_sync_routes_task_chat_archives_to_the_owning_task(self):
+        """任务会话带上任务键就归到那条任务；旧归档没有这一段，仍然归所属需求。"""
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            for relative in [
+                "chat/requirements/req-api/需求拆解--thread-0.md",
+                "chat/requirements/req-api/task/task-a/实现 API--thread-1.md",
+                "chat/requirements/req-api/task/实现 API--thread-legacy.md",
+                "chat/requirements/req-api/task/task-unknown/面板没有这条--thread-2.md",
+            ]:
+                path = workspace / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("chat", encoding="utf-8")
+            index = bridge.CloudDocumentIndex(
+                [{"requirementKey": "req-api"}],
+                [{"itemKey": "task-a", "requirementKey": "req-api", "moduleKey": "core"}],
+            )
+            entries, skipped = bridge.cloud_sync_workspace_entries(workspace, {"chat"}, None, index)
+
+        self.assertEqual(0, skipped)
+        self.assertEqual(
+            {
+                "chat/requirements/req-api/需求拆解--thread-0.md": ("requirement", "req-api", "chat"),
+                "chat/requirements/req-api/task/task-a/实现 API--thread-1.md": ("task", "task-a", "chat"),
+                "chat/requirements/req-api/task/实现 API--thread-legacy.md": ("requirement", "req-api", "chat"),
+                # 面板没报过这条任务，宁可挂回需求，也不要造出一条不存在的任务分组。
+                "chat/requirements/req-api/task/task-unknown/面板没有这条--thread-2.md": ("requirement", "req-api", "chat"),
+            },
+            {entry.relative_path: (entry.owner_kind, entry.owner_key, entry.stage) for entry in entries},
+        )
+
+    def test_chat_archive_owner_trusts_the_running_task_over_the_board_listing(self):
+        """归档当时的任务键来自正在跑的任务，比事后照目录名反推可信，两者允许不一致。"""
+        path = bridge.chat_archive_relative_path(
+            "task", "task-gone", "实现 API", "thread-1", requirement_key="req-api",
+        ).as_posix()
+        self.assertEqual("chat/requirements/req-api/task/task-gone/实现 API--thread-1.md", path)
+        # 归档当时这条任务还在，聊天进它自己的会话栏。
+        self.assertEqual(("task", "task-gone"), bridge.chat_archive_owner_of("task", "task-gone", "req-api"))
+        # 任务后来被删掉，清单里已经没有它；整目录重传退回需求，聊天不会变成找不到。
+        index = bridge.CloudDocumentIndex([{"requirementKey": "req-api"}], [])
+        self.assertEqual(("requirement", "req-api", "chat"), index.classify("chat", path))
+
     def test_cloud_sync_splits_requirement_documents_by_stage(self):
         """一条需求的文档要按阶段分开：拆解、原型、评审、测试、微调各归各的。"""
         with tempfile.TemporaryDirectory() as directory:
@@ -3406,7 +3464,7 @@ class HttpBridgeTest(unittest.TestCase):
             uploaded = []
             with (
                 patch.object(executor, "_project_content_sync_settings", return_value={"gitEnabled": False, "gitChatSyncEnabled": False, "cloudSyncEnabled": True, "cloudSyncScopes": ["chat"]}),
-                patch.object(executor, "_upload_cloud_sync_file", side_effect=lambda *_args: uploaded.append(_args[3])),
+                patch.object(executor, "_upload_cloud_sync_file", side_effect=lambda *_args: uploaded.append(_args[3:])),
             ):
                 executor._archive_terminal_chat(
                     Client(), config=self.runtime_config(), program_id=1,
@@ -3417,7 +3475,9 @@ class HttpBridgeTest(unittest.TestCase):
                 )
 
             self.assertEqual(1, len(uploaded))
-            self.assertEqual("chat/requirements/req-api/task/实现 API--thread-1.md", uploaded[0])
+            self.assertEqual("chat/requirements/req-api/task/task-a/实现 API--thread-1.md", uploaded[0][0])
+            # 直传的归属要和整目录重传认出来的一致，面板上才不会跳栏。
+            self.assertEqual(("task", "task-a", "chat"), uploaded[0][-3:])
             self.assertFalse((workspace / "chat").exists())
 
     def test_attachment_store_scopes_uploads_to_the_owning_task(self):

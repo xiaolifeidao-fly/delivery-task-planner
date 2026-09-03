@@ -23,9 +23,13 @@ from typing import Any
 # 查不到真值时按模型兜底的窗口大小。这是「显示成多少」的下限，不是判据：
 # 执行器报了 modelContextWindow 就一律以它为准。
 CODEX_DEFAULT_CONTEXT_WINDOW = 272_000
-CLAUDE_DEFAULT_CONTEXT_WINDOW = 200_000
-# Claude 的长上下文档位要显式开启，模型名里带 [1m] 标记。
-CLAUDE_LONG_CONTEXT_WINDOW = 1_000_000
+# 面板上能选的两档（opus / sonnet）实测都开着 1M，所以 Claude 一侧默认按 1M 兜。
+# 实测：claude -p --model opus|sonnet 的 result.modelUsage[模型].contextWindow 都是 1000000。
+CLAUDE_DEFAULT_CONTEXT_WINDOW = 1_000_000
+# 还停在 200K 的是 haiku 这类小模型：面板选不到它，但起标题、子代理会用上。
+CLAUDE_SMALL_CONTEXT_WINDOW = 200_000
+CLAUDE_SMALL_CONTEXT_MODELS = ("haiku",)
+# 长上下文要显式开启的那些档位，模型名里带 [1m] 标记——带了就一定是 1M，不再按小模型算。
 CLAUDE_LONG_CONTEXT_MARKER = "[1m]"
 
 CONTEXT_FIELDS = ("usedTokens", "windowTokens")
@@ -41,9 +45,12 @@ def _int(value: Any) -> int:
 
 def default_context_window(provider: str, model: str = "") -> int:
     """执行器没报窗口时按模型猜一个；只用于显示，不参与任何决策。"""
-    if str(provider or "").strip().lower() == "claude":
-        return CLAUDE_LONG_CONTEXT_WINDOW if CLAUDE_LONG_CONTEXT_MARKER in str(model or "").lower() else CLAUDE_DEFAULT_CONTEXT_WINDOW
-    return CODEX_DEFAULT_CONTEXT_WINDOW
+    if str(provider or "").strip().lower() != "claude":
+        return CODEX_DEFAULT_CONTEXT_WINDOW
+    name = str(model or "").lower()
+    if CLAUDE_LONG_CONTEXT_MARKER not in name and any(small in name for small in CLAUDE_SMALL_CONTEXT_MODELS):
+        return CLAUDE_SMALL_CONTEXT_WINDOW
+    return CLAUDE_DEFAULT_CONTEXT_WINDOW
 
 
 def turn_context(used_tokens: Any, window_tokens: Any, provider: str = "", model: str = "") -> dict[str, Any]:
