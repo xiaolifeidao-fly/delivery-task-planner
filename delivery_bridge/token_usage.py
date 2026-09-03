@@ -185,7 +185,7 @@ def turns_usage_total(turns: Any) -> dict[str, Any]:
 def with_usage(payload: dict[str, Any]) -> dict[str, Any]:
     """给一份带 `turns` 的会话返回补上这条会话的用量合计和当前上下文占用。
 
-    面板每种会话（任务、需求拆解、需求原型、review、测试、微调）都有自己的返回结构，
+    面板每种会话（任务、需求分析、需求拆解、需求原型、review、测试、微调）都有自己的返回结构，
     但都带同一份 `turns`；两个数都只依赖它，所以统一在出口补，不必在每处重复写一遍。
     """
     turns = payload.get("turns")
