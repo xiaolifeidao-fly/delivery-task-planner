@@ -396,6 +396,11 @@ def git_local_branch_for_reference(workspace: Path, reference: str, remote: str)
         remote_ref = f"{remote}/{value}"
     if not valid_git_branch_name(local):
         raise BridgeFailure("远端需求分支名不合法")
+    if local != value and git_branch_exists(workspace, local):
+        # 引用写成 origin/main，而本机已经有 main：按本地分支切过去就行。再 checkout -b
+        # 一次只会撞上「分支已存在」，合并到基线分支时几乎每个工程都会栽在这里。
+        # 远端最新由调用方紧接着的 pull 负责，这里不必要求远端引用存在。
+        return local, ""
     exists = run_git(workspace, ["rev-parse", "--verify", "--quiet", f"refs/remotes/{remote_ref}"])
     if exists.returncode != 0:
         # 分支可能是别人刚推上来的，本机还没 fetch 过；先拉一次远端引用再判断。
