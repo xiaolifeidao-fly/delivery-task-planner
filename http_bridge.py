@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import errno
 import hashlib
 import json
 import mimetypes
@@ -44,6 +45,7 @@ from delivery_bridge import (
     pidfile,
     prompt_context,
     runtime,
+    thread_locks,
     turn_output,
     workspaces,
 )
@@ -204,6 +206,28 @@ def create_http_server(
     httpd.allowed_origins = allowed_origins  # type: ignore[attr-defined]
     httpd.business_workspace_root = business_root  # type: ignore[attr-defined]
     return httpd
+
+
+def port_listener_hint(port: int) -> str:
+    """端口被谁占着。查不出来就返回空串：这只是排查线索，不该反过来挡住报错。"""
+    if os.name == "nt":
+        return ""
+    lsof = shutil.which("lsof")
+    if not lsof:
+        return ""
+    try:
+        completed = subprocess.run(
+            [lsof, "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    holders = []
+    for line in (completed.stdout or "").splitlines()[1:]:
+        fields = line.split()
+        if len(fields) >= 2:
+            holders.append(f"{fields[0]}(pid {fields[1]})")
+    return "、".join(dict.fromkeys(holders))
 
 
 def schedule_bridge_restart() -> None:
@@ -1385,7 +1409,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Max-Age", "600")
 
     def json_response(self, status: int, value: dict[str, Any]) -> None:
-        raw = json.dumps(value, ensure_ascii=False).encode("utf-8")
+        # 出错应答统一在这里翻一道：Codex 的「线程已有写入者」是十几条会话接口都可能
+        # 撞上的同一把锁，翻成带线程号和持锁进程的结构，面板才给得出那个结束进程的按钮。
+        raw = json.dumps(thread_locks.enrich_failure(value), ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.cors()
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -1448,6 +1474,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
         "/v1/codex/requirement-usage": "_get_requirement_usage",
         "/v1/codex/task-fine-tuning": "_get_task_fine_tuning",
         "/v1/codex/task-testing-cases": "_get_task_testing_cases",
+        "/v1/codex/thread-writer-lock": "_get_thread_writer_lock",
         "/v1/codex/workspace/validate": "_get_workspaces",
         "/v1/codex/workspaces": "_get_workspaces",
         "/v1/plugin/info": "_get_plugin_info",
@@ -1569,6 +1596,25 @@ class BridgeHandler(BaseHTTPRequestHandler):
         if isinstance(status.get("installation"), dict):
             status["installation"]["activeRuns"] = self.bridge.active_run_count()
         self.json_response(200, status)
+        return
+
+    def _get_thread_writer_lock(self, parsed: ParseResult) -> None:
+        """这条会话线程此刻还被不被别的 Codex 进程占着。
+
+        面板拿到「线程被占用」的失败时，错误体里已经带了持锁进程；这条接口是给
+        「过一会儿再看看」用的——用户去桌面端关掉会话之后，不必再发一次消息才知道
+        锁放开了没有。
+        """
+        if not self.allowed_origin():
+            self.json_response(403, {"error": "origin not allowed"})
+            return
+        query = parse_qs(parsed.query)
+        try:
+            self.json_response(200, thread_locks.inspect((query.get("threadId") or [""])[0]))
+        except (BridgeFailure, ValueError) as exc:
+            self.json_response(400, {"error": str(exc)})
+        except Exception as exc:
+            self.json_response(500, {"error": f"读取线程写入锁失败：{exc}"})
         return
 
     def _get_workspaces(self, parsed: ParseResult) -> None:
@@ -2193,6 +2239,14 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 return
             self.handle_heartbeat()
             return
+        if path == "/v1/codex/thread-writer-lock/release":
+            # 收进程是本机维护动作，不挂在任何工作目录上，所以走不到下面那套
+            # workspace / config 的解析。
+            if not self.allowed_origin():
+                self.json_response(403, {"error": "origin not allowed"})
+                return
+            self.handle_thread_writer_lock_release()
+            return
         if path in {"/v1/plugin/update/install", "/v1/plugin/update/restart"}:
             if not self.allowed_origin():
                 self.json_response(403, {"error": "origin not allowed"})
@@ -2424,6 +2478,26 @@ class BridgeHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             self.json_response(500, {"error": f"启动 AI 工具失败：{exc}"})
 
+    def handle_thread_writer_lock_release(self) -> None:
+        """结束占着某条线程写入锁的执行器。
+
+        这是面板上那个按钮唯一的落点：桥接自己从不主动收进程，必须有人在面板上看清了
+        持锁进程是谁、点过确认才走到这里。桌面端 Codex 正开着的那条会话不在此列——
+        thread_locks 会挡下来，回一句让用户自己去桌面端关。
+        """
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            if length < 0 or length > 8 * 1024:
+                raise BridgeFailure("请求体大小无效")
+            payload = json.loads(self.rfile.read(length)) if length else {}
+            if not isinstance(payload, dict):
+                raise BridgeFailure("请求体必须是 JSON 对象")
+            self.json_response(200, thread_locks.release(str(payload.get("threadId") or "")))
+        except (BridgeFailure, json.JSONDecodeError, ValueError) as exc:
+            self.json_response(400, {"error": str(exc)})
+        except Exception as exc:
+            self.json_response(500, {"error": f"释放线程写入锁失败：{exc}"})
+
     def handle_heartbeat(self) -> None:
         """控制台每分钟送一次当前账号的 token 和 user_id，插件存下来当作凭证来源。
 
@@ -2579,13 +2653,26 @@ def main() -> None:
         workspace = placeholder_workspace()
     business_workspace_root = Path(args.business_workspace_root).expanduser().resolve()
     origins = set(args.allow_origin or ["*"])
-    httpd = create_http_server(
-        args.host,
-        args.port,
-        workspace,
-        origins,
-        business_workspace_root=business_workspace_root,
-    )
+    try:
+        httpd = create_http_server(
+            args.host,
+            args.port,
+            workspace,
+            origins,
+            business_workspace_root=business_workspace_root,
+        )
+    except OSError as exc:
+        if exc.errno != errno.EADDRINUSE:
+            raise
+        # LaunchAgent / systemd / Windows 服务都开着自动重启，这里再抛一整段 socket 栈，
+        # 几小时就能把日志堆成几 MB，而面板那头只看得到「连不上桥接」，很容易被当成插件没装。
+        # 所以只留一行，把占端口的进程点名说清楚。
+        holder = port_listener_hint(args.port)
+        raise SystemExit(
+            f"桥接端口 {args.host}:{args.port} 已被占用"
+            + (f"，占用者：{holder}" if holder else "")
+            + f"。请先释放这个端口再让桥接起来（面板固定连 127.0.0.1:{DEFAULT_PORT}，改端口不管用）。"
+        ) from exc
     threading.Thread(target=httpd.bridge.reconcile_forever, daemon=True).start()  # type: ignore[attr-defined]
     remote_worker = RemoteCommandWorker(httpd.bridge, api_url=args.command_api_url)  # type: ignore[attr-defined]
     httpd.remote_worker = remote_worker  # type: ignore[attr-defined]

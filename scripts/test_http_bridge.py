@@ -6,6 +6,7 @@ import collections
 import io
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -6448,6 +6449,48 @@ class GitBranchTest(unittest.TestCase):
         with self.assertRaises(bridge.BridgeFailure):
             bridge.git_prepare_branch(self.workspace, "main", "discard")
 
+    def test_checkout_reference_switches_to_an_existing_local_branch(self):
+        """目标写成 origin/main、本机又已经有 main 时，直接切过去就行。
+
+        以前这里会走 `checkout -b main --track origin/main`，撞上「分支已存在」，
+        「合并到分支」在每个克隆过基线分支的工程上都会栽在第一步。
+        """
+        self.add_origin()
+        subprocess.run(
+            ["git", "-C", str(self.workspace), "push", "-q", "-u", "origin", "main"],
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(self.workspace), "checkout", "-q", "-b", "feature/issue_req-1"],
+            check=True, capture_output=True,
+        )
+        self.assertEqual(
+            ("main", ""), bridge.git_local_branch_for_reference(self.workspace, "origin/main", "origin"),
+        )
+        local, _ = bridge.git_checkout_reference(self.workspace, "origin/main", "origin")
+        self.assertEqual("main", local)
+        self.assertEqual("main", bridge.git_current_branch(self.workspace))
+
+    def test_checkout_reference_creates_a_tracking_branch_when_only_the_remote_has_it(self):
+        """本机没有这条分支时，仍要从远端建一条受跟踪的本地分支。"""
+        self.add_origin()
+        subprocess.run(
+            ["git", "-C", str(self.workspace), "push", "-q", "-u", "origin", "main"],
+            check=True, capture_output=True,
+        )
+        for args in (
+            ["checkout", "-q", "-b", "feature/issue_req-1"],
+            ["branch", "-q", "-D", "main"],
+        ):
+            subprocess.run(["git", "-C", str(self.workspace), *args], check=True, capture_output=True)
+        local, _ = bridge.git_checkout_reference(self.workspace, "origin/main", "origin")
+        self.assertEqual("main", local)
+        upstream = subprocess.run(
+            ["git", "-C", str(self.workspace), "rev-parse", "--abbrev-ref", "main@{upstream}"],
+            capture_output=True, text=True,
+        ).stdout.strip()
+        self.assertEqual("origin/main", upstream)
+
     def add_origin(self) -> Path:
         remote = Path(tempfile.mkdtemp())
         self.addCleanup(lambda: __import__("shutil").rmtree(remote, ignore_errors=True))
@@ -7050,6 +7093,204 @@ class GitBranchTest(unittest.TestCase):
             "programId": 1,
             "task": {"itemKey": "T-1", "title": "任务", "phase": "development"},
         }))
+
+
+class BridgeStartupTest(unittest.TestCase):
+    """桥接起不来的时候，日志里得留下能直接接着查的一行。"""
+
+    def test_port_already_in_use_names_the_holder_instead_of_dumping_a_socket_traceback(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as squatter:
+            squatter.bind(("127.0.0.1", 0))
+            squatter.listen(1)
+            port = squatter.getsockname()[1]
+            argv = ["http_bridge.py", "--host", "127.0.0.1", "--port", str(port), "--command-api-url", "off"]
+            with patch.object(sys, "argv", argv), patch.object(bridge.pidfile, "track_current_process"):
+                with self.assertRaises(SystemExit) as caught:
+                    bridge.main()
+        message = str(caught.exception)
+        self.assertIn(f"127.0.0.1:{port} 已被占用", message)
+        # 面板连的是固定端口，提示里要给的是它，而不是这次试着绑的那个。
+        self.assertIn(str(bridge.DEFAULT_PORT), message)
+
+
+class ThreadWriterLockTest(unittest.TestCase):
+    """线程写入锁：认出占用、查清是谁、只在允许的时候收掉。
+
+    Codex 对每条线程只准一个写入者，续聊时抢不到锁只回一句英文。面板要给出「结束占用
+    进程」这个按钮，靠的就是这一层把那句话翻成线程号 + 持锁进程；翻错了按钮要么不出现，
+    要么指着一个不该动的进程，所以这里连来路判定的每种形状都钉住。
+    """
+
+    def test_busy_thread_id_reads_the_thread_out_of_the_app_server_sentence(self):
+        message = "thread 01a06528-fb0d-7da2-9d9b-c047f9498f4e already has an active writer"
+        self.assertEqual("01a06528-fb0d-7da2-9d9b-c047f9498f4e", bridge.thread_locks.busy_thread_id(message))
+
+    def test_busy_thread_id_ignores_every_other_failure(self):
+        for message in ["缺少任务标识", "等待 Codex 响应超时", "thread not found", ""]:
+            self.assertEqual("", bridge.thread_locks.busy_thread_id(message))
+
+    def test_thread_id_from_the_browser_cannot_walk_out_of_the_lock_directory(self):
+        for value in ["../../etc/passwd", "a/b", "", "线程", "x" * 200]:
+            with self.assertRaises(bridge.BridgeFailure):
+                bridge.thread_locks.valid_thread_id(value)
+
+    def test_bridge_spawned_app_servers_are_killable_even_when_they_run_the_desktop_binary(self):
+        # provision_codex_cli 在 macOS 上会直接用桌面版资源目录里的 codex，所以来路不能
+        # 按可执行文件路径判——这条如果判成 desktop，孤儿进程就永远收不掉。
+        kind, killable = bridge.thread_locks._classify(
+            "/Applications/ChatGPT.app/Contents/Resources/codex app-server -c mcp_servers.foo.enabled=false",
+            ["/opt/homebrew/bin/python3 http_bridge.py"],
+        )
+        self.assertEqual(("bridge", True), (kind, killable))
+
+    def test_desktop_app_servers_are_recognised_by_argument_or_by_ancestry(self):
+        by_argument = bridge.thread_locks._classify(
+            "/Applications/ChatGPT.app/Contents/Resources/codex -c features.code_mode_host=true app-server --analytics-default-enabled",
+            [],
+        )
+        # 进程被重新挂到 init 名下时父进程链就断了，只剩参数这一层凭据。
+        by_ancestry = bridge.thread_locks._classify(
+            "/Applications/ChatGPT.app/Contents/Resources/codex app-server",
+            ["/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"],
+        )
+        self.assertEqual(("desktop", False), by_argument)
+        self.assertEqual(("desktop", False), by_ancestry)
+
+    def test_a_process_that_is_not_an_app_server_is_never_offered_for_killing(self):
+        self.assertEqual(("unknown", False), bridge.thread_locks._classify("/usr/bin/vim x.lock", []))
+
+    def test_enrich_failure_turns_the_english_sentence_into_something_the_panel_can_act_on(self):
+        holder = {"pid": 4321, "kind": "bridge", "killable": True, "label": "任务面板拉起的 Codex 执行器", "command": "codex app-server"}
+        message = "thread 01a06528-fb0d-7da2-9d9b-c047f9498f4e already has an active writer"
+
+        with patch.object(bridge.thread_locks, "holder_of", return_value=holder):
+            enriched = bridge.thread_locks.enrich_failure({"error": message})
+
+        self.assertEqual("thread_writer_busy", enriched["code"])
+        self.assertEqual("01a06528-fb0d-7da2-9d9b-c047f9498f4e", enriched["threadId"])
+        self.assertEqual(holder, enriched["holder"])
+        # 原话留一份好对 Codex 那边的日志，展示给用户的换成中文。
+        self.assertEqual(message, enriched["detail"])
+        self.assertIn("4321", enriched["error"])
+
+    def test_enrich_failure_leaves_every_other_response_untouched(self):
+        for value in [{"error": "缺少任务标识"}, {"accepted": True}, {"error": 42}]:
+            self.assertEqual(value, bridge.thread_locks.enrich_failure(value))
+
+    def test_failed_responses_are_enriched_on_the_wire(self):
+        # 翻译挂在应答出口上，十几条会话接口才不用各自记得处理这一种失败。
+        handler = object.__new__(bridge.BridgeHandler)
+        handler.wfile = io.BytesIO()
+        handler.send_response = lambda status: None
+        handler.send_header = lambda name, value: None
+        handler.end_headers = lambda: None
+        handler.headers = Message()
+
+        with patch.object(bridge.thread_locks, "holder_of", return_value=None):
+            handler.json_response(400, {"error": "thread 01a06528-fb0d-7da2-9d9b-c047f9498f4e already has an active writer"})
+
+        body = json.loads(handler.wfile.getvalue().decode("utf-8"))
+        self.assertEqual("thread_writer_busy", body["code"])
+        self.assertEqual("01a06528-fb0d-7da2-9d9b-c047f9498f4e", body["threadId"])
+
+    def test_release_refuses_to_close_the_desktop_app(self):
+        holder = {"pid": 55909, "kind": "desktop", "killable": False, "label": "Codex 桌面端", "command": "codex app-server"}
+
+        with (
+            patch.object(bridge.thread_locks, "holder_of", return_value=holder),
+            patch.object(bridge.thread_locks, "_terminate") as terminate,
+        ):
+            with self.assertRaises(bridge.BridgeFailure) as caught:
+                bridge.thread_locks.release("01a06528-fb0d-7da2-9d9b-c047f9498f4e")
+
+        terminate.assert_not_called()
+        self.assertIn("桌面端", str(caught.exception))
+
+    def test_release_closes_a_bridge_orphan_and_confirms_the_lock_went_free(self):
+        holder = {"pid": 4321, "kind": "bridge", "killable": True, "label": "任务面板拉起的 Codex 执行器", "command": "codex app-server"}
+
+        with (
+            patch.object(bridge.thread_locks, "holder_of", side_effect=[holder, None]),
+            patch.object(bridge.thread_locks, "_terminate") as terminate,
+        ):
+            result = bridge.thread_locks.release("01a06528-fb0d-7da2-9d9b-c047f9498f4e")
+
+        terminate.assert_called_once_with(4321)
+        self.assertTrue(result["released"])
+        self.assertIn("4321", result["message"])
+
+    def test_release_reports_a_lock_that_nobody_holds_any_more(self):
+        with (
+            patch.object(bridge.thread_locks, "holder_of", return_value=None),
+            patch.object(bridge.thread_locks, "_terminate") as terminate,
+        ):
+            result = bridge.thread_locks.release("01a06528-fb0d-7da2-9d9b-c047f9498f4e")
+
+        terminate.assert_not_called()
+        self.assertTrue(result["released"])
+        self.assertIsNone(result["holder"])
+
+    def test_a_desktop_holder_wins_over_any_other_process_on_the_same_lock(self):
+        # 子进程会继承父进程打开的文件描述符，一把锁上挂着好几个 pid 是常态。挑错了
+        # 就可能把「不能收」的桌面端报成「可以收」的执行器。
+        desktop = {"pid": 55909, "kind": "desktop", "killable": False, "label": "Codex 桌面端", "command": "codex app-server"}
+        orphan = {"pid": 4321, "kind": "bridge", "killable": True, "label": "执行器", "command": "codex app-server"}
+        stray = {"pid": 4322, "kind": "unknown", "killable": False, "label": "未知进程", "command": "sleep 300"}
+
+        with (
+            patch.object(bridge.thread_locks, "_lock_holder_pids", return_value=[4322, 4321, 55909]),
+            patch.object(bridge.thread_locks.Path, "exists", return_value=True),
+            patch.object(bridge.thread_locks, "_describe", side_effect=lambda pid: {4322: stray, 4321: orphan, 55909: desktop}[pid]),
+        ):
+            self.assertEqual(desktop, bridge.thread_locks.holder_of("01a06528-fb0d-7da2-9d9b-c047f9498f4e"))
+
+    def test_release_fails_loudly_when_a_child_still_holds_the_lock(self):
+        holder = {"pid": 4321, "kind": "bridge", "killable": True, "label": "执行器", "command": "codex app-server"}
+        child = {"pid": 4322, "kind": "unknown", "killable": False, "label": "未知进程", "command": "sleep 300"}
+
+        with (
+            patch.object(bridge.thread_locks, "holder_of", side_effect=[holder, child]),
+            patch.object(bridge.thread_locks, "_terminate"),
+        ):
+            with self.assertRaises(bridge.BridgeFailure) as caught:
+                bridge.thread_locks.release("01a06528-fb0d-7da2-9d9b-c047f9498f4e")
+
+        self.assertIn("4322", str(caught.exception))
+
+    def test_release_fails_loudly_when_the_process_survives_the_signal(self):
+        holder = {"pid": 4321, "kind": "bridge", "killable": True, "label": "任务面板拉起的 Codex 执行器", "command": "codex app-server"}
+
+        with (
+            patch.object(bridge.thread_locks, "holder_of", side_effect=[holder, holder]),
+            patch.object(bridge.thread_locks, "_terminate"),
+        ):
+            with self.assertRaises(bridge.BridgeFailure):
+                bridge.thread_locks.release("01a06528-fb0d-7da2-9d9b-c047f9498f4e")
+
+    def test_lock_endpoints_are_reachable_and_carry_the_holder(self):
+        handler = object.__new__(bridge.BridgeHandler)
+        handler.server = SimpleNamespace(allowed_origins={"*"}, bridge=unittest.mock.MagicMock())
+        handler.headers = Message()
+        responses = []
+        handler.json_response = lambda status, value: responses.append((status, value))
+        holder = {"pid": 4321, "kind": "bridge", "killable": True, "label": "执行器", "command": "codex app-server"}
+
+        with patch.object(bridge.thread_locks, "holder_of", return_value=holder):
+            handler.path = "/v1/codex/thread-writer-lock?threadId=01a06528-fb0d-7da2-9d9b-c047f9498f4e"
+            handler.do_GET()
+
+        payload = json.dumps({"threadId": "01a06528-fb0d-7da2-9d9b-c047f9498f4e"}).encode("utf-8")
+        handler.headers = Message()
+        handler.headers["Content-Type"] = "application/json"
+        handler.headers["Content-Length"] = str(len(payload))
+        handler.rfile = io.BytesIO(payload)
+        handler.path = "/v1/codex/thread-writer-lock/release"
+        with patch.object(bridge.thread_locks, "release", return_value={"released": True}) as release:
+            handler.do_POST()
+
+        self.assertEqual((200, {"threadId": "01a06528-fb0d-7da2-9d9b-c047f9498f4e", "busy": True, "holder": holder}), responses[0])
+        release.assert_called_once_with("01a06528-fb0d-7da2-9d9b-c047f9498f4e")
+        self.assertEqual((200, {"released": True}), responses[1])
 
 
 if __name__ == "__main__":
